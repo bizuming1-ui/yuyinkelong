@@ -15,6 +15,14 @@
 // 3) 上传密钥，必须和 Kaggle 脚本里的 API_KEY 一致
 #define API_KEY "radar-key"
 
+// 3.5) 【v4 新增·自动发现网址】Kaggle 每次运行，trycloudflare 网址都会变；以前必须改 SERVER_URL 再重新烧录。
+//      现在 Kaggle 脚本会把最新网址发布到公共汇合点 https://ntfy.sh/<RADAR_TOPIC>，
+//      ESP32 联网后自动读取最新网址并上传——只要填好 WIFI_SSID/WIFI_PASS，之后每次 Kaggle 重开都不用再烧录。
+//      RADAR_TOPIC 相当于“暗号”，必须和 Kaggle 脚本里的 RADAR_TOPIC 一致（默认两边已经一致；想更私密就两边一起改成你自己的随机字符串）。
+//      设为 "" 则关闭自动发现，只用上面的 SERVER_URL。
+#define RADAR_TOPIC "wradar-bzm-5f2k9q7d"
+#define TOPIC_REFRESH_MS 300000   // 每 5 分钟重新读取一次最新网址（上传连续失败 3 次也会立刻重读）
+
 // ------------------ 以下一般不用改 ------------------
 // 本节点在世界坐标中的位置(米)。单节点保持 0,0；多个 ESP32 做三边定位时分别填写，+Y 方向视为正北。
 #define NODE_X 0.0f
