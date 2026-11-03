@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v3（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v4（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -27,6 +27,7 @@ WiFi 雷达 · Kaggle 单文件服务端 v3（ESP32-S3 -> Kaggle T4x2 GPU -> 全
 import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections, random, glob
 from urllib.parse import urlparse
 
+TOPIC = os.environ.get("RADAR_TOPIC", "wradar-bzm-5f2k9q7d")   # 汇合点暗号：必须与固件 config.h 的 RADAR_TOPIC 一致（默认已一致）
 API_KEY = os.environ.get("RADAR_KEY", "radar-key")        # 必须与 ESP32 config.h 里的 API_KEY 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
 USE_TUNNEL = os.environ.get("RADAR_NO_TUNNEL", "") != "1"
@@ -40,12 +41,12 @@ PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
 
 
-VERSION = "3.0"
+VERSION = "4.0"
 EVENTS = collections.deque(maxlen=4000)
 EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
 _ECHO = {}
 _EVT_N = [0]
-TUNNEL = {"state": "未启动", "url": "", "attempts": 0, "probe": ""}
+TUNNEL = {"state": "未启动", "url": "", "attempts": 0, "probe": "", "topic": TOPIC, "published": 0, "publish_err": "", "provider": ""}
 
 
 def evt(level, cat, msg, echo=False, t=None):
@@ -142,7 +143,9 @@ button.pri:hover{filter:brightness(1.1)}
 #actbox{right:360px;bottom:14px;width:300px;padding:8px 12px}
 #actbox .t{display:flex;justify-content:space-between;color:var(--dim);font-size:12px}
 #actC{width:100%;height:44px;display:block}
-#wait{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(560px,92vw);text-align:center;z-index:6;padding:22px 26px}
+#wait{position:fixed;left:50%;top:14px;transform:translateX(-50%);width:min(680px,92vw);text-align:center;z-index:6;padding:12px 20px;background:rgba(8,16,26,.82)}
+#wait .spin{transform:scale(.6);margin:-6px auto -10px}
+#wait .diag{font-size:12px;line-height:1.55}
 #wait h2{margin:10px 0 6px;font-size:19px}
 #wait p{margin:4px 0;color:#a9c4d6}
 #wait code{background:#0c1a2c;padding:1px 6px;border-radius:5px;color:var(--cy)}
@@ -281,7 +284,8 @@ setInterval(function () {      // 浏览器日志同步到服务器（Kaggle 输
 }, 3000);
 
 function envInfo() {
-  var gl = 'WebGL✗'; try { var c0 = document.createElement('canvas'); if (c0.getContext('webgl') || c0.getContext('experimental-webgl')) gl = 'WebGL✓'; } catch (e) {}
+  if (!envInfo.gl) { envInfo.gl = 'WebGL✗'; try { var c0 = document.createElement('canvas'); var gx = c0.getContext('webgl') || c0.getContext('experimental-webgl'); if (gx) { envInfo.gl = 'WebGL✓'; var le = gx.getExtension('WEBGL_lose_context'); if (le) le.loseContext(); } } catch (e) {} }
+  var gl = envInfo.gl;
   var pol = ''; try { var fp = document.featurePolicy || document.permissionsPolicy; if (fp && fp.allowsFeature) pol = fp.allowsFeature('serial') ? 'serial 权限=允许' : 'serial 权限=被禁止'; } catch (e2) {}
   return { ua: navigator.userAgent, secure: !!window.isSecureContext, serial: 'serial' in navigator, iframe: INFRAME, gl: gl, policy: pol, screen: (window.innerWidth || 0) + 'x' + (window.innerHeight || 0) + '@' + (window.devicePixelRatio || 1), url: String(location.href).slice(0, 160), lang: navigator.language };
 }
@@ -303,6 +307,16 @@ function diagChecks() {
   else if (v.ok === null) add('srv', '后端服务器', 'wait', '检测中…');
   else if (v.ok) add('srv', '后端服务器', 'ok', '/api/health 正常 ' + (v.ms != null ? v.ms + 'ms' : '') + (v.info ? ' · 已收 ' + (v.info.frames || 0) + ' 帧 · 运行 ' + (v.info.uptime || 0) + 's' : ''));
   else add('srv', '后端服务器', 'bad', '/api/health 无响应：' + v.err, '确认 Kaggle 的 Cell 还在运行；网址是否是最新一次运行输出的');
+  // 3b 自动发现汇合点 + ESP32 WiFi 直传
+  if (!SIM && v.ok && v.diag) {
+    var dtun = v.diag.tunnel || {}, dn = v.diag.nodes || {}, wl = Object.keys(dn).filter(function (k) { return String(dn[k].src || '').indexOf('WiFi') >= 0; });
+    if (dtun.published) add('rdv', '自动发现汇合点', 'ok', '网址已发布到 ntfy.sh/' + dtun.topic + '（' + Math.round(Date.now() / 1000 - dtun.published) + 's 前）；ESP32 联网后会自动读取');
+    else if (dtun.publish_err) add('rdv', '自动发现汇合点', 'warn', '发布失败：' + dtun.publish_err, 'ESP32 将只能用 config.h 的 SERVER_URL；可改用 USB 直连');
+    else add('rdv', '自动发现汇合点', 'wait', '隧道建立后自动发布到 ntfy.sh/' + (dtun.topic || ''));
+    if (wl.length) add('wlink', 'ESP32 WiFi 直传', 'ok', wl.map(function (k) { return k + ' ' + dn[k].frames + ' 帧 · ' + (dn[k].age != null ? dn[k].age + 's 前' : ''); }).join('；'));
+    else if (Object.keys(dn).length) add('wlink', 'ESP32 WiFi 直传', 'wait', '数据来自网页 USB 转发；ESP32 自己的 WiFi 直传尚未出现');
+    else add('wlink', 'ESP32 WiFi 直传', 'wait', '服务器从未收到过任何 ESP32 数据', 'ESP32 串口应依次出现 [wifi] connected → [topic] ✅ 发现 Kaggle 最新网址 → [upload] HTTP 200；哪一步缺失就是卡在哪一步（config.h 的 WIFI_SSID/PASS 要填 2.4GHz）');
+  }
   // 4 USB 串口
   var serMsg;
   if (SIM) add('ser', 'USB 串口', 'ok', '模拟器：虚拟串口');
@@ -878,8 +892,9 @@ setInterval(function () {
   if (frameCount === 0 && !SIM) {
     var dd = diagChecks(), pick = null;
     dd.checks.forEach(function (c) { if (!pick && (c.st === 'bad')) pick = c; });
-    $('diag').innerHTML = dd.checks.filter(function (c) { return c.id === 'env' || c.id === 'srv' || c.id === 'ser' || c.id === 'fw' || c.id === 'data'; }).map(function (c) { return '<div>' + ICN[c.st] + ' ' + esc(c.name) + '：' + esc(c.msg) + '</div>'; }).join('') + '<div style="color:#7f9db3">ESP32 联网困难时请点“USB 直连”，由电脑转发。完整诊断请点“🩺 检测日志”。</div>';
+    $('diag').innerHTML = dd.checks.filter(function (c) { return c.id === 'env' || c.id === 'srv' || c.id === 'rdv' || c.id === 'wlink' || c.id === 'ser' || c.id === 'fw' || c.id === 'data'; }).map(function (c) { return '<div>' + ICN[c.st] + ' ' + esc(c.name) + '：' + esc(c.msg) + '</div>'; }).join('') + '<div style="color:#7f9db3">ESP32 联网困难时请点“USB 直连”，由电脑转发。完整诊断请点“🩺 检测日志”。</div>';
     if (pick) { $('wT').textContent = '卡住了：' + pick.name; $('wM').textContent = pick.msg + (pick.hint ? ' —— ' + pick.hint : ''); }
+    else if (!DG.ser.open) { $('wT').textContent = (GEO ? '真实世界已加载 · ' : '') + '等待 ESP32 数据…'; $('wM').innerHTML = '方式 A（最稳）：点 <b>🔌 USB 直连 ESP32</b>。方式 B：ESP32 已在 config.h 填好 WiFi，会自动读取汇合点上的 Kaggle 网址并上传（约 10~30 秒）。'; }
     else if (DG.ser.open) { $('wT').textContent = '等待 ESP32 上传数据…'; $('wM').textContent = DG.ser.hbInfo ? '固件在线（状态 ' + DG.ser.hbInfo.st + '），正在做第一轮扫描…' : '串口已打开，等待固件输出…'; }
   }
 }, 500);
@@ -932,6 +947,37 @@ async function loadGeo() {
     toast('✅ ' + j.label + ' · ' + j.buildings.length + ' 栋建筑 · ' + j.roads.length + ' 条道路（定位精度约 ' + Math.round(j.accuracy || 0) + ' m，可用 ◀▶▲▼ 对齐）', 9000);
   } catch (e) { toast('定位失败：' + e); }
 }
+
+/* ================= 自动加载真实世界（不必等 ESP32）================= */
+async function applyGeo(j, how) {
+  GEO = j; GEOFF = { x: 0, y: 0 }; $('nudge').style.display = 'flex'; S.buildings = true; sync();
+  dlog('OK', 'geo', '真实街区已加载：' + (how || '') + ' · ' + j.buildings.length + ' 栋建筑 · ' + j.roads.length + ' 条道路');
+}
+async function autoGeo() {
+  if (SIM || GEO || DG.geoTried) return; DG.geoTried = true;
+  var lat = null, lon = null, how = '';
+  try {
+    var pos = await new Promise(function (res, rej) { if (!navigator.geolocation) return rej(new Error('无定位 API')); navigator.geolocation.getCurrentPosition(res, rej, { timeout: 7000, maximumAge: 600000 }); });
+    lat = pos.coords.latitude; lon = pos.coords.longitude; how = '浏览器定位';
+  } catch (e) { dlog('INFO', 'geo', '浏览器定位不可用（' + (e.message || e) + '），改用 IP 粗略定位'); }
+  if (lat === null) {
+    var provs = [['https://ipwho.is/', function (x) { return x && x.success ? [x.latitude, x.longitude, x.city] : null; }], ['https://get.geojs.io/v1/ip/geo.json', function (x) { return x && x.latitude ? [+x.latitude, +x.longitude, x.city] : null; }], ['https://ipapi.co/json/', function (x) { return x && x.latitude ? [x.latitude, x.longitude, x.city] : null; }]];
+    for (var pi = 0; pi < provs.length && lat === null; pi++) {
+      try { var rr = provs[pi][1](await (await fetch(provs[pi][0], { cache: 'no-store' })).json()); if (rr) { lat = rr[0]; lon = rr[1]; how = 'IP 粗略定位(' + (rr[2] || '') + ')'; } } catch (e2) { dlog('WARN', 'geo', 'IP 定位 ' + provs[pi][0] + ' 失败：' + (e2.message || e2)); }
+    }
+  }
+  if (lat === null) return;
+  try {
+    var j = await (await fetch('api/geo?lat=' + lat + '&lon=' + lon, { cache: 'no-store' })).json();
+    if (j.ok && !DG.geoRefined) { await applyGeo(j, how); toast('✅ 真实世界已加载（' + how + '）；ESP32 数据到达后会用 WiFi 定位自动校准', 7000); }
+    else if (!j.ok) dlog('WARN', 'geo', '街区加载失败：' + j.error);
+  } catch (e3) { dlog('WARN', 'geo', '街区加载失败：' + (e3.message || e3)); }
+}
+setInterval(async function () {   // ESP32 数据到达后，用 beaconDB 的 WiFi 定位校准真实位置
+  if (SIM || mode === 'demo' || DG.geoRefined || frameCount < 2 || APS.size < 3) return; DG.geoRefined = true;
+  try { var j = await (await fetch('api/geo', { cache: 'no-store' })).json(); if (j.ok) { await applyGeo(j, 'WiFi 定位校准(beaconDB)'); toast('📍 已用周围 WiFi 校准真实位置', 6000); } else dlog('INFO', 'geo', 'beaconDB 未收录这些热点：' + j.error + '（保持当前位置，可点“真实街区”手动输入经纬度）'); } catch (e) {}
+}, 3000);
+if (!SIM) setTimeout(autoGeo, 600);
 
 /* ================= USB (Web Serial) 直连 ================= */
 function apiKey() { return lsGet('wradar2.key', 'radar-key'); }
@@ -1200,7 +1246,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, version=VERSION, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
+    return jsonify(ok=True, version=VERSION, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT, topic=TOPIC, published=TUNNEL.get("published", 0))
 
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
@@ -1233,6 +1279,8 @@ def ingest():
         n["frames"] += 1
         n["aps"] = len(f["aps"])
         n["ip"] = request.headers.get("CF-Connecting-IP") or request.remote_addr
+        n["src"] = src
+        n["fw"] = str(f.get("fw", ""))
         for a in f["aps"]:
             try:
                 b = str(a["b"]).upper()
@@ -1287,7 +1335,7 @@ def server_diag(n_events=80):
         "cuda": bool(torch is not None and torch.cuda.is_available()),
         "budgets": {"vram_gb": VRAM_GB, "ram_gb": RAM_GB, "disk_gb": DISK_GB, "restarts": RESTARTS},
         "series": len(SERIES), "series_maxlen": SERIES_MAXLEN, "events_file": EVT_FILE, "hist_dir": HIST_DIR,
-        "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
+        "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "src": v.get("src"), "fw": v.get("fw"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
         "solved": len(SOLVED), "motion": round(MOTION["v"], 3),
     }
     try:
@@ -1663,13 +1711,16 @@ def _banner(url):
     global PUBLIC_URL
     PUBLIC_URL = url
     TUNNEL["state"] = "已建立"
+    TUNNEL["provider"] = TUNNEL.get("provider") or "cloudflared"
     TUNNEL["url"] = url
     evt("OK", "tunnel", "公网隧道已建立：" + url)
+    threading.Thread(target=publish_url, args=(url,), daemon=True).start()
     line = "=" * 66
     print("\n" + line)
     print("🌐 全屏 3D 网站： " + url)
     print('📟 ESP32 config.h： #define SERVER_URL "%s"' % url)
     print("   或串口输入：     url %s" % url)
+    print("🛰  自动发现：     已发布到 ntfy.sh/%s —— ESP32 联网后自动读取，无需重新烧录（固件 RADAR_TOPIC 必须与之相同）" % TOPIC)
     print("🔌 最稳方案：     用电脑 Chrome/Edge 打开上面网址 -> 点【USB 连接 ESP32】")
     print("🔑 API_KEY：       %s" % API_KEY)
     print("🩺 检测日志：     网页里点【🩺 检测日志】，或打开 %s/api/diag.txt（也写入 %s）" % (url, EVT_FILE))
@@ -1680,6 +1731,30 @@ def _banner(url):
     except Exception:
         pass
     threading.Thread(target=_probe, args=(url,), daemon=True).start()
+
+
+def publish_url(url):
+    """把最新网址发布到汇合点 ntfy.sh/<TOPIC>：ESP32 会自动读取，Kaggle 重开后不用重新烧录固件。"""
+    try:
+        r = requests.post("https://ntfy.sh/" + TOPIC, data=url.encode("utf8"), headers={"Title": "wifi-radar-url", "Cache": "yes", **UA}, timeout=15)
+        if r.status_code == 200:
+            TUNNEL["published"] = int(time.time())
+            TUNNEL["publish_err"] = ""
+            evt("OK", "rendezvous", "已把网址发布到汇合点 ntfy.sh/%s（ESP32 将自动读取）" % TOPIC)
+            return True
+        TUNNEL["publish_err"] = "HTTP %d" % r.status_code
+    except Exception as e:
+        TUNNEL["publish_err"] = str(e)[:200]
+    evt("WARN", "rendezvous", "发布网址到 ntfy.sh 失败：%s（ESP32 将只能用 config.h 里的 SERVER_URL；USB 直连不受影响）" % TUNNEL["publish_err"], echo=True)
+    return False
+
+
+def publish_loop():
+    """每 4 分钟重发一次：固件只读取最近 30 分钟内的消息，所以网址始终“新鲜”。"""
+    while True:
+        time.sleep(240)
+        if PUBLIC_URL:
+            publish_url(PUBLIC_URL)
 
 
 def _probe(url):
@@ -1723,6 +1798,33 @@ def start_cloudflared():
     threading.Thread(target=runner, daemon=True).start()
 
 
+def start_ssh_tunnel():
+    """cloudflared 60 秒内没拿到网址时的备用隧道：localhost.run（需要 ssh）。"""
+    ssh = shutil.which("ssh")
+    if not ssh:
+        evt("WARN", "tunnel", "没有 ssh，无法使用备用隧道", echo=True)
+        return
+
+    def runner():
+        p = subprocess.Popen([ssh, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes",
+                              "-R", "80:127.0.0.1:%d" % PORT, "nokey@localhost.run"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in p.stdout:
+            m = re.search(r"https://[a-z0-9-]+\.lhr\.life", line)
+            if m and not PUBLIC_URL:
+                TUNNEL["provider"] = "localhost.run"
+                _banner(m.group(0))
+        evt("WARN", "tunnel", "备用隧道 localhost.run 已退出", echo=True)
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
+def tunnel_watchdog():
+    time.sleep(70)
+    if not PUBLIC_URL:
+        evt("WARN", "tunnel", "cloudflared 70 秒内没有给出网址，启动备用隧道 localhost.run", echo=True)
+        start_ssh_tunnel()
+
+
 def start_ngrok():
     _ensure("pyngrok")
     from pyngrok import ngrok
@@ -1737,7 +1839,7 @@ def main():
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
     evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
-    for fn in (motion_loop, res_loop, hist_writer):
+    for fn in (motion_loop, res_loop, hist_writer, publish_loop):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
     if USE_TUNNEL:
@@ -1745,6 +1847,7 @@ def main():
             start_ngrok()
         else:
             start_cloudflared()
+            threading.Thread(target=tunnel_watchdog, daemon=True).start()
     else:
         print("[server] 本地模式: http://127.0.0.1:%d" % PORT)
     try:
