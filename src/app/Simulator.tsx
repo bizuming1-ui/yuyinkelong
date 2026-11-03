@@ -24,7 +24,7 @@ const BOOT_LOG = [
   "entry 0x403c98d0",
   "",
   "=====================================",
-  " ESP32-S3 WiFi Radar v5.0.0  (reset: EXT_RESET)",
+  " ESP32-S3 WiFi Radar v7.0.0  (reset: EXT_RESET)",
   "=====================================",
   "[port] USB原生口=输出  UART口=输出",
   "[cfg] node=S3-DEMO01 ssid='' pass=(empty) url='' key=radar-key",
@@ -150,7 +150,7 @@ export default function Simulator() {
       if (r?.feedSerialLine) r.feedSerialLine(line);
     };
     const hello = () =>
-      feed("RADARHELLO:" + JSON.stringify({ fw: "5.0.0", csi: 1, csihz: 20, node: nodeId, chip: "ESP32-S3", rev: 0, cores: 2, flash: 8388608, psram: 0, heap: 250000, rst: "EXT_RESET", usb: 1, mirror: 1, up: 0, ssid: "", url: "" }));
+      feed("RADARHELLO:" + JSON.stringify({ fw: "7.0.0", csi: 1, csihz: 20, node: nodeId, chip: "ESP32-S3", rev: 0, cores: 2, flash: 8388608, psram: 0, heap: 250000, rst: "EXT_RESET", usb: 1, mirror: 1, up: 0, ssid: "", url: "" }));
     const tick = () => {
       const r = getRadar();
       if (!r || !r.ready) {
@@ -162,7 +162,7 @@ export default function Simulator() {
       const f = r.demoFrame();
       f.node = nodeId;
       n += 1;
-      feed("RADARHB:" + JSON.stringify({ fw: "5.0.0", node: nodeId, up: n * 2, st: "scan", cyc: n, seq: f.seq, aps: f.aps.length, scanms: 1700, ok: 0, fail: 0, http: 0, heap: 240000, wifi: 0, rssi: 0, csi: n * 30, csir: 20, csim: 1, csie: 0, csid: 0 }));
+      feed("RADARHB:" + JSON.stringify({ fw: "7.0.0", node: nodeId, up: n * 2, st: "scan", cyc: n, seq: f.seq, aps: f.aps.length, scanms: 1700, ok: 0, fail: 0, http: 0, heap: 240000, wifi: 0, rssi: 0, csi: n * 30, csir: 20, csim: 1, csie: 0, csid: 0 }));
       log(`[scan] #${f.seq} aps=${f.aps.length} scan=1710ms`);
       log(`[csi] ${n * 30} 包 · 20 包/秒 · RADARCSI 行已输出`);
       if (f.st) log(`[sniff] stations=${f.st.length}`);
