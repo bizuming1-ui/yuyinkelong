@@ -1,7 +1,18 @@
-// ESP32-S3 WiFi Radar 固件
-// 流程：上电/复位 -> 扫描周围 AP(SSID/BSSID/RSSI/信道/加密) -> 周期性嗅探周围设备
-//       -> 连接 WiFi -> HTTPS POST 到 Kaggle 的 /api/ingest -> 同时从串口输出 RADARJSON 行
-// 串口命令(115200)：help / show / ssid <x> / pass <x> / url <x> / key <x> / clear / reboot
+// ESP32-S3 WiFi Radar 固件 v3.0
+// 流程：上电/复位 -> 立刻输出 RADARHELLO -> 扫描周围 AP -> 立刻输出 RADARJSON（不等联网）
+//       -> 周期性嗅探周围设备 -> 有配置时再连接 WiFi 并 HTTPS POST 到 Kaggle 的 /api/ingest
+//
+// 输出协议（每行一条，115200，UTF-8）：
+//   RADARHELLO:{...}   设备信息（开机 + 每 10 秒 + 收到 "hello" 命令时）
+//   RADARHB:{...}      心跳（每秒，由独立任务发出：即使正在扫描/连 WiFi 也不会中断）
+//   RADARJSON:{...}    一帧扫描结果（网页 / serial_bridge.py 解析后上传）
+//   其它行             人类可读日志
+//
+// 串口输出同时走两个口（USB 原生口 + UART0），所以插哪个口都能收到：
+//   ARDUINO_USB_CDC_ON_BOOT=1 时  Serial = 原生 USB(HWCDC)，Serial0 = UART0(CH340/CP2102)
+//   ARDUINO_USB_CDC_ON_BOOT=0 时  Serial = UART0
+//
+// 串口命令：help / hello / show / ssid <x> / pass <x> / url <x> / key <x> / clear / reboot
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -9,10 +20,51 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <stdarg.h>
 #include "esp_wifi.h"
+#include "esp_system.h"
 #include "config.h"
 
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "3.0.0"
+
+#if ARDUINO_USB_CDC_ON_BOOT
+#define HAS_USB_PORT 1
+#define UART_SER Serial0
+#else
+#define HAS_USB_PORT 0
+#define UART_SER Serial
+#endif
+
+// ---------------- 双口输出 ----------------
+static SemaphoreHandle_t outMux = nullptr;
+
+static void rawWrite(const char* s, size_t n) {
+  if (!n) return;
+#if HAS_USB_PORT
+  Serial.write((const uint8_t*)s, n);
+#endif
+#if HAS_USB_PORT == 0 || MIRROR_UART_PORT
+  UART_SER.write((const uint8_t*)s, n);
+#endif
+}
+
+// 一整行原子输出（多任务不会交错）
+static void outLine(const char* prefix, const char* body) {
+  if (outMux) xSemaphoreTake(outMux, portMAX_DELAY);
+  rawWrite(prefix, strlen(prefix));
+  rawWrite(body, strlen(body));
+  rawWrite("\n", 1);
+  if (outMux) xSemaphoreGive(outMux);
+}
+
+static void logf(const char* fmt, ...) {
+  char b[400];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(b, sizeof(b), fmt, ap);
+  va_end(ap);
+  outLine("", b);
+}
 
 // ---------------- 嗅探到的周围设备 ----------------
 struct Sta {
@@ -32,6 +84,28 @@ static String cfgSsid, cfgPass, cfgUrl, cfgKey;
 static String nodeId;
 static uint32_t seqNo = 0, cycleNo = 0;
 static uint32_t okCount = 0, failCount = 0;
+static volatile const char* gState = "boot";
+static volatile int gLastAps = -1;
+static volatile int gLastHttp = 0;
+static volatile uint32_t gScanMs = 0;
+static bool wifiTried = false;
+static uint32_t lastWifiTry = 0;
+static uint32_t lastHello = 0;
+
+static const char* resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT_RESET";
+    case ESP_RST_SW: return "SW_RESET";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    default: return "OTHER";
+  }
+}
 
 // ---------------- 状态灯(板载 RGB，没有就忽略) ----------------
 static void led(uint8_t r, uint8_t g, uint8_t b) {
@@ -74,35 +148,67 @@ static void loadConfig() {
 }
 
 static void showConfig() {
-  Serial.printf("[cfg] node=%s ssid='%s' pass=%s url='%s' key=%s\n", nodeId.c_str(), cfgSsid.c_str(),
-                cfgPass.length() ? "****" : "(empty)", cfgUrl.c_str(), cfgKey.c_str());
+  logf("[cfg] node=%s ssid='%s' pass=%s url='%s' key=%s", nodeId.c_str(), cfgSsid.c_str(),
+       cfgPass.length() ? "****" : "(empty)", cfgUrl.c_str(), cfgKey.c_str());
+}
+
+static void sendHello() {
+  JsonDocument d;
+  d["fw"] = FW_VERSION;
+  d["node"] = nodeId;
+  d["chip"] = ESP.getChipModel();
+  d["rev"] = ESP.getChipRevision();
+  d["cores"] = ESP.getChipCores();
+  d["flash"] = ESP.getFlashChipSize();
+  d["psram"] = ESP.getPsramSize();
+  d["heap"] = ESP.getFreeHeap();
+  d["mac"] = WiFi.macAddress();
+  d["rst"] = resetReason();
+  d["usb"] = HAS_USB_PORT;
+  d["mirror"] = (HAS_USB_PORT == 0 || MIRROR_UART_PORT) ? 1 : 0;
+  d["up"] = millis() / 1000;
+  d["ssid"] = cfgSsid;
+  d["url"] = cfgUrl;
+  d["sdk"] = ESP.getSdkVersion();
+  String out;
+  serializeJson(d, out);
+  outLine("RADARHELLO:", out.c_str());
+  lastHello = millis();
+}
+
+static String lineBuf;
+static void feedChar(char c) {
+  if (c == '\r') return;
+  if (c != '\n') {
+    if (lineBuf.length() < 200) lineBuf += c;
+    return;
+  }
+  lineBuf.trim();
+  String cmd = lineBuf, arg = "";
+  int sp = lineBuf.indexOf(' ');
+  if (sp > 0) { cmd = lineBuf.substring(0, sp); arg = lineBuf.substring(sp + 1); arg.trim(); }
+  cmd.toLowerCase();
+  if (cmd == "ssid") { prefs.putString("ssid", arg); cfgSsid = arg; wifiTried = false; logf("[cfg] ssid saved"); }
+  else if (cmd == "pass") { prefs.putString("pass", arg); cfgPass = arg; wifiTried = false; logf("[cfg] pass saved"); }
+  else if (cmd == "url") {
+    while (arg.endsWith("/")) arg.remove(arg.length() - 1);
+    prefs.putString("url", arg); cfgUrl = arg; logf("[cfg] url saved");
+  }
+  else if (cmd == "key") { prefs.putString("key", arg); cfgKey = arg; logf("[cfg] key saved"); }
+  else if (cmd == "clear") { prefs.clear(); logf("[cfg] cleared, rebooting"); delay(300); ESP.restart(); }
+  else if (cmd == "reboot") { ESP.restart(); }
+  else if (cmd == "show") { showConfig(); }
+  else if (cmd == "hello") { sendHello(); }
+  else if (cmd == "help") { logf("[cmd] hello | show | ssid <x> | pass <x> | url <x> | key <x> | clear | reboot"); }
+  else if (cmd.length()) { logf("[cmd] unknown '%s', type help", cmd.c_str()); }
+  lineBuf = "";
 }
 
 static void handleSerial() {
-  static String line;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c != '\n') { if (line.length() < 200) line += c; continue; }
-    line.trim();
-    String cmd = line, arg = "";
-    int sp = line.indexOf(' ');
-    if (sp > 0) { cmd = line.substring(0, sp); arg = line.substring(sp + 1); arg.trim(); }
-    cmd.toLowerCase();
-    if (cmd == "ssid") { prefs.putString("ssid", arg); cfgSsid = arg; Serial.println("[cfg] ssid saved"); }
-    else if (cmd == "pass") { prefs.putString("pass", arg); cfgPass = arg; Serial.println("[cfg] pass saved"); }
-    else if (cmd == "url") {
-      while (arg.endsWith("/")) arg.remove(arg.length() - 1);
-      prefs.putString("url", arg); cfgUrl = arg; Serial.println("[cfg] url saved");
-    }
-    else if (cmd == "key") { prefs.putString("key", arg); cfgKey = arg; Serial.println("[cfg] key saved"); }
-    else if (cmd == "clear") { prefs.clear(); Serial.println("[cfg] cleared, rebooting"); delay(300); ESP.restart(); }
-    else if (cmd == "reboot") { ESP.restart(); }
-    else if (cmd == "show") { showConfig(); }
-    else if (cmd == "help") { Serial.println("[cmd] show | ssid <x> | pass <x> | url <x> | key <x> | clear | reboot"); }
-    else if (cmd.length()) { Serial.println("[cmd] unknown, type help"); }
-    line = "";
-  }
+#if HAS_USB_PORT
+  while (Serial.available()) feedChar((char)Serial.read());
+#endif
+  while (UART_SER.available()) feedChar((char)UART_SER.read());
 }
 
 // ---------------- 混杂模式回调：只记录 "设备作为发送方" 的帧 ----------------
@@ -137,6 +243,7 @@ static void sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
     idx = staCount++;
     memcpy(stas[idx].mac, sta, 6);
     stas[idx].rssi = p->rx_ctrl.rssi;
+    stas[idx].ch = p->rx_ctrl.channel;
     stas[idx].cnt = 0;
     stas[idx].hasBssid = false;
   }
@@ -151,6 +258,7 @@ static void sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 static void sniffRound() {
+  gState = "sniff";
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_STA);
   delay(80);
@@ -175,19 +283,23 @@ static String macStr(const uint8_t* m) {
   return String(b);
 }
 
-// ---------------- WiFi 连接 / 上传 ----------------
-static bool ensureWifi(uint32_t timeoutMs) {
-  if (cfgSsid.length() == 0) return false;
+// ---------------- WiFi 连接 / 上传（不阻塞：连不上就先放弃，30 秒后再试） ----------------
+static bool wifiReady() {
+  if (cfgSsid.length() == 0 || cfgUrl.length() == 0) return false;
   if (WiFi.status() == WL_CONNECTED) return true;
+  if (wifiTried && millis() - lastWifiTry < WIFI_RETRY_MS) return false;
+  wifiTried = true;
+  lastWifiTry = millis();
+  gState = "wifi";
   WiFi.mode(WIFI_STA);
   WiFi.begin(cfgSsid.c_str(), cfgPass.c_str());
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) { delay(150); handleSerial(); }
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) { delay(100); handleSerial(); }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[wifi] connected ip=%s rssi=%d ch=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    logf("[wifi] connected ip=%s rssi=%d ch=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
     return true;
   }
-  Serial.println("[wifi] connect timeout (检查 SSID/密码，必须是 2.4GHz)");
+  logf("[wifi] connect timeout (检查 SSID/密码，必须是 2.4GHz)；%d 秒后重试，期间只做串口输出", WIFI_RETRY_MS / 1000);
   return false;
 }
 
@@ -227,7 +339,20 @@ static String buildFrame(bool includeSta, int& apCount) {
   doc["y"] = NODE_Y;
   doc["fw"] = FW_VERSION;
   JsonArray aps = doc["aps"].to<JsonArray>();
+  uint32_t t0 = millis();
   int n = WiFi.scanNetworks(false, true, false, SCAN_MS_PER_CH);
+  if (n < 0) {                    // 扫描失败（嗅探刚结束时偶发）：复位射频后重试一次
+    WiFi.scanDelete();
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    n = WiFi.scanNetworks(false, true, false, SCAN_MS_PER_CH);
+  }
+  gScanMs = millis() - t0;
+  doc["ms"] = gScanMs;
+  if (n < 0) doc["err"] = n;
   apCount = 0;
   if (n > 0) {
     for (int i = 0; i < n && apCount < MAX_APS; i++) {
@@ -259,9 +384,31 @@ static String buildFrame(bool includeSta, int& apCount) {
   return out;
 }
 
+// ---------------- 心跳任务：独立于主循环，扫描/连 WiFi 期间也每秒一行 ----------------
+static void hbTask(void*) {
+  for (;;) {
+    vTaskDelay(HEARTBEAT_MS / portTICK_PERIOD_MS);
+    char b[320];
+    snprintf(b, sizeof(b),
+             "{\"fw\":\"%s\",\"node\":\"%s\",\"up\":%lu,\"st\":\"%s\",\"cyc\":%lu,\"seq\":%lu,\"aps\":%d,\"scanms\":%lu,"
+             "\"ok\":%lu,\"fail\":%lu,\"http\":%d,\"heap\":%lu,\"wifi\":%d,\"rssi\":%d}",
+             FW_VERSION, nodeId.c_str(), (unsigned long)(millis() / 1000), (const char*)gState, (unsigned long)cycleNo,
+             (unsigned long)seqNo, (int)gLastAps, (unsigned long)gScanMs, (unsigned long)okCount, (unsigned long)failCount,
+             (int)gLastHttp, (unsigned long)ESP.getFreeHeap(), (int)WiFi.status(),
+             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+    outLine("RADARHB:", b);
+  }
+}
+
 void setup() {
-  Serial.begin(115200);
-  delay(1200);
+  outMux = xSemaphoreCreateMutex();
+#if HAS_USB_PORT
+  Serial.setTxBufferSize(8192);     // 一帧 RADARJSON 可达 6KB：给足发送缓冲，避免电脑端来不及读时丢字节
+  Serial.begin(115200);             // 原生 USB：波特率无意义
+  Serial.setTxTimeoutMs(300);       // 仅在电脑已打开串口、但读得慢时才会等待；没人读取时 HWCDC 会直接丢弃，不阻塞
+#endif
+  UART_SER.begin(SERIAL_BAUD);
+  delay(250);
   led(32, 0, 0);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
@@ -269,42 +416,48 @@ void setup() {
   mac.replace(":", "");
   nodeId = "S3-" + mac.substring(6);
   loadConfig();
-  Serial.println();
-  Serial.println("=====================================");
-  Serial.println(" ESP32-S3 WiFi Radar v" FW_VERSION);
-  Serial.println("=====================================");
+  logf("");
+  logf("=====================================");
+  logf(" ESP32-S3 WiFi Radar v%s  (reset: %s)", FW_VERSION, resetReason());
+  logf("=====================================");
+  logf("[port] USB原生口=%s  UART口=%s", HAS_USB_PORT ? "输出" : "无(未启用CDC)", (HAS_USB_PORT == 0 || MIRROR_UART_PORT) ? "输出" : "关闭");
   showConfig();
-  if (cfgSsid.length() == 0) Serial.println("[warn] 未配置 WiFi：只做串口输出(可配合 tools/serial_bridge.py 上传)");
-  else if (cfgUrl.length() == 0) Serial.println("[warn] 未配置 SERVER_URL：只做串口输出");
-  Serial.println("[boot] 开始扫描…");
+  if (cfgSsid.length() == 0) logf("[info] 未配置 WiFi：只做串口输出（网页 USB 直连 / tools/serial_bridge.py 转发）");
+  else if (cfgUrl.length() == 0) logf("[info] 未配置 SERVER_URL：只做串口输出");
+  sendHello();
+  xTaskCreatePinnedToCore(hbTask, "hb", 4096, nullptr, 1, nullptr, 0);
+  logf("[boot] 开始扫描…（第一帧约 2 秒内）");
   led(0, 0, 40);
 }
 
 void loop() {
   handleSerial();
   uint32_t t0 = millis();
-  bool doSniff = ENABLE_SNIFF && (cycleNo % SNIFF_EVERY == 0);
+  bool doSniff = ENABLE_SNIFF && cycleNo > 0 && (cycleNo % SNIFF_EVERY == 0);
   if (doSniff) sniffRound();
   int apCount = 0;
+  gState = "scan";
   led(0, 20, 40);
   String body = buildFrame(doSniff, apCount);
-  Serial.printf("[scan] #%u aps=%d%s\n", (unsigned)seqNo, apCount, doSniff ? "" : "");
-  if (doSniff) Serial.printf("[sniff] stations=%d\n", (int)staCount);
-  Serial.print("RADARJSON:");
-  Serial.println(body);
+  gLastAps = apCount;
+  gState = "emit";
+  logf("[scan] #%u aps=%d scan=%ums%s", (unsigned)seqNo, apCount, (unsigned)gScanMs, doSniff ? "" : "");
+  if (doSniff) logf("[sniff] stations=%d", (int)staCount);
+  outLine("RADARJSON:", body.c_str());   // 先从串口输出，再尝试联网：联网失败不影响 3D 显示
 
-  if (cfgSsid.length() && cfgUrl.length()) {
-    if (ensureWifi(10000)) {
-      int code = postFrame(body);
-      if (code >= 200 && code < 300) { okCount++; led(0, 40, 0); }
-      else { failCount++; led(40, 10, 0); }
-      Serial.printf("[upload] HTTP %d (ok=%u fail=%u)\n", code, (unsigned)okCount, (unsigned)failCount);
-    } else {
-      failCount++;
-      led(40, 0, 0);
-    }
+  if (millis() - lastHello > HELLO_EVERY_MS) sendHello();
+  if (wifiReady()) {
+    gState = "upload";
+    int code = postFrame(body);
+    gLastHttp = code;
+    if (code >= 200 && code < 300) { okCount++; led(0, 40, 0); }
+    else { failCount++; led(40, 10, 0); }
+    logf("[upload] HTTP %d (ok=%u fail=%u)", code, (unsigned)okCount, (unsigned)failCount);
+  } else if (cfgSsid.length() && cfgUrl.length()) {
+    led(40, 0, 0);
   }
   cycleNo++;
+  gState = "idle";
   uint32_t used = millis() - t0;
   if (used < SCAN_PERIOD_MS) {
     uint32_t until = millis() + (SCAN_PERIOD_MS - used);
