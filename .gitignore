@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.env
+.env.local
+.pio/
+.vscode/
+__pycache__/
+.shots/
+next-env.d.ts
+*.tsbuildinfo
+package-lock.json
