@@ -311,6 +311,11 @@ export default function Simulator() {
         <button onClick={() => copy(siteUrl, "url2")} className="rounded border border-slate-600 px-2 py-0.5 text-xs hover:bg-slate-700">
           {copied === "url2" ? "✓ 已复制" : "复制"}
         </button>
+        <span className="text-slate-500">· ESP32 直传地址（config.h 的 SERVER_URL 填站点根网址）：</span>
+        <code className="select-all rounded bg-[#0b1118] px-2 py-0.5 text-amber-300">{origin ? `${origin}/api/ingest` : "…"}</code>
+        <button onClick={() => copy(origin, "url3")} className="rounded border border-slate-600 px-2 py-0.5 text-xs hover:bg-slate-700">
+          {copied === "url3" ? "✓ 已复制" : "复制根网址"}
+        </button>
         <Link href="/code" className="ml-auto rounded-lg bg-cyan-400 px-3 py-1 font-semibold text-[#02141d] hover:brightness-110">
           进入复制代码界面 →
         </Link>
