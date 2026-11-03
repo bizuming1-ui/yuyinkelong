@@ -1,0 +1,972 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+WiFi 雷达 · Kaggle 单文件服务端（ESP32-S3 -> Kaggle GPU -> 全屏 3D 网站）
+=========================================================================
+用法（Kaggle Notebook，右侧 Settings 里打开 Internet，Accelerator 选 GPU T4 x2）：
+    1) 新建一个 Code Cell，把本文件全部内容粘贴进去，点运行（或保存为 .py 后 %run wifi_radar_kaggle.py）
+    2) 等待输出：
+         🌐 全屏 3D 网站： https://xxxx.trycloudflare.com
+         #define SERVER_URL "https://xxxx.trycloudflare.com"
+    3) 把网址填进 PlatformIO 工程的 firmware/include/config.h 的 SERVER_URL（或串口输入 url https://xxxx...），
+       烧录后按 ESP32 的 RESET 键，网站里就会出现你周围的 WiFi 世界。
+    Cell 必须一直保持运行；停止 Cell = 关闭网站。
+
+它做了什么：
+    - Flask 提供 /（全屏 three.js 3D 页面）、/api/ingest（ESP32 上传）、/api/frames（网页轮询）、/api/geo（真实街区）
+    - cloudflared 免费隧道把 Kaggle 内部 8000 端口发布成公网 https 网址
+    - 当 >=2 个 ESP32 节点同时看到同一个 AP 时，用 PyTorch(GPU) 并行多起点优化做三边定位
+    - /api/geo：用 beaconDB 做 WiFi 定位，再从 OpenStreetMap(Overpass) 取真实建筑和道路，显示成 3D 街区
+"""
+import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections
+
+API_KEY = "radar-key"          # 必须与 ESP32 config.h 里的 API_KEY 一致
+PORT = int(os.environ.get("RADAR_PORT", "8000"))
+API_KEY = os.environ.get("RADAR_KEY", API_KEY)
+USE_TUNNEL = os.environ.get("RADAR_NO_TUNNEL", "") != "1"
+NGROK_TOKEN = os.environ.get("NGROK_TOKEN", "")   # 可选：填了就用 ngrok 代替 cloudflared
+UA = {"User-Agent": "wifi-radar-esp32s3/1.0 (personal project)"}
+PATH_N, PATH_TX = 2.8, -40.0   # 服务端三边定位使用的路径损耗模型
+
+
+def _ensure(mod, pip=None):
+    try:
+        __import__(mod)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip or mod])
+
+
+_ensure("flask")
+_ensure("requests")
+import requests
+from flask import Flask, request, jsonify, Response
+
+HTML = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>WiFi 雷达 · ESP32-S3 3D 真实世界</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#040a12;--panel:rgba(8,18,30,.78);--line:rgba(80,200,255,.22);--txt:#cfe9f7;--dim:#7fa3b8;--acc:#2ee6a6;--warn:#ffb020;--bad:#ff4d6d}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--txt);font:13px/1.45 "Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block;outline:none}
+.glass{background:var(--panel);border:1px solid var(--line);border-radius:12px;backdrop-filter:blur(8px)}
+#title{position:fixed;left:14px;top:12px;padding:10px 14px;min-width:260px}
+#title h1{margin:0 0 4px;font-size:16px;letter-spacing:.5px;color:#fff}
+#title h1 b{color:var(--acc)}
+.chip{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--dim)}
+.chip.ok{color:#04150e;background:var(--acc);border-color:var(--acc)}
+.chip.warn{color:#241700;background:var(--warn);border-color:var(--warn)}
+.chip.bad{color:#fff;background:var(--bad);border-color:var(--bad)}
+.stats{display:flex;gap:14px;margin-top:6px}
+.stats div{font-size:11px;color:var(--dim)}
+.stats b{display:block;font-size:20px;color:#fff;font-weight:600}
+#sub{margin-top:6px;font-size:11px;color:var(--dim)}
+#side{position:fixed;right:14px;top:12px;bottom:14px;width:290px;display:flex;flex-direction:column;padding:10px}
+#side input[type=text]{width:100%;background:#0a1826;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:6px 9px;margin-bottom:8px;outline:none}
+#list{flex:1;overflow:auto;margin:0 -4px;padding:0 4px}
+.row{display:grid;grid-template-columns:10px 1fr auto;gap:8px;align-items:center;padding:6px 6px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+.row:hover{background:rgba(70,170,230,.12)}
+.row.sel{border-color:var(--acc);background:rgba(46,230,166,.1)}
+.dot{width:9px;height:9px;border-radius:50%}
+.row .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#fff}
+.row .m{font-size:11px;color:var(--dim)}
+.row .r{text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+.bar{height:3px;border-radius:2px;background:#16324a;margin-top:3px;overflow:hidden}
+.bar i{display:block;height:100%}
+#ctl{position:fixed;left:14px;bottom:14px;padding:10px 12px;width:290px}
+#ctl label{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:3px 0;color:var(--dim);font-size:12px}
+#ctl input[type=range]{width:140px}
+.btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+button{background:#0d2236;color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px}
+button:hover{background:#133452;border-color:var(--acc)}
+button.pri{background:var(--acc);color:#04150e;border-color:var(--acc);font-weight:600}
+.tg{display:flex;flex-wrap:wrap;gap:6px 12px;margin:4px 0 2px}
+.tg label{margin:0;gap:5px;justify-content:flex-start}
+#act{position:fixed;right:322px;bottom:14px;padding:8px 10px;width:250px}
+#act canvas{width:100%;height:46px;display:block}
+#act .h{display:flex;justify-content:space-between;font-size:11px;color:var(--dim)}
+#legend{position:fixed;left:322px;bottom:14px;padding:8px 12px;font-size:11px;color:var(--dim)}
+#legend span{display:inline-flex;align-items:center;gap:5px;margin-right:10px}
+#legend i{width:9px;height:9px;border-radius:50%;display:inline-block}
+#tip{position:fixed;pointer-events:none;display:none;padding:6px 9px;font-size:12px;z-index:9;max-width:260px}
+#card{position:fixed;left:14px;top:150px;width:290px;padding:10px 12px;display:none}
+#card h3{margin:0 0 6px;font-size:15px;color:#fff;word-break:break-all}
+#card table{width:100%;border-collapse:collapse}
+#card td{padding:2px 0;font-size:12px;vertical-align:top}
+#card td:first-child{color:var(--dim);width:84px}
+#wait{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:22px 28px;text-align:center;max-width:520px;z-index:5}
+#wait h2{margin:0 0 8px;font-size:18px;color:#fff}
+#wait p{margin:4px 0;color:var(--dim)}
+.spin{width:34px;height:34px;margin:0 auto 12px;border-radius:50%;border:3px solid #16324a;border-top-color:var(--acc);animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#040a12;z-index:20;text-align:center;padding:30px}
+code{background:#0a1826;padding:1px 6px;border-radius:5px;color:#9fe9ff}
+@media(max-width:900px){#side{width:210px}#act,#legend{display:none}}
+</style>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+</head>
+<body>
+<canvas id="c" tabindex="0"></canvas>
+
+<div id="title" class="glass">
+  <h1>📡 WiFi <b>RADAR</b> · 3D 真实世界</h1>
+  <span id="conn" class="chip">初始化…</span> <span id="src" class="chip">—</span>
+  <div class="stats"><div><b id="nAP">0</b>热点 AP</div><div><b id="nST">0</b>周围设备</div><div><b id="nND">0</b>节点</div><div><b id="nAct">0%</b>环境扰动</div></div>
+  <div id="sub">—</div>
+</div>
+
+<div id="card" class="glass"></div>
+
+<div id="side" class="glass">
+  <input id="q" type="text" placeholder="搜索 SSID / BSSID …">
+  <div id="list"></div>
+</div>
+
+<div id="ctl" class="glass">
+  <label>路径损耗指数 n <span><input id="sN" type="range" min="1.6" max="4.2" step="0.05"> <b id="vN"></b></span></label>
+  <label>1 米参考功率 dBm <span><input id="sT" type="range" min="-55" max="-25" step="1"> <b id="vT"></b></span></label>
+  <div class="tg">
+    <label><input type="checkbox" id="tLab"> 标签</label>
+    <label><input type="checkbox" id="tSw"> 扫描波</label>
+    <label><input type="checkbox" id="tSt"> 设备</label>
+    <label><input type="checkbox" id="tBd"> 街区底图</label>
+    <label><input type="checkbox" id="tRot"> 自动旋转</label>
+  </div>
+  <div class="btns">
+    <button id="bGeo" class="pri">🌍 定位真实世界</button>
+    <button id="bView">复位视角 (R)</button>
+    <button id="bFull">全屏 (F)</button>
+    <button id="bClr">清除手动方位</button>
+  </div>
+  <div class="btns" id="dpad" style="display:none">
+    <span style="color:var(--dim);font-size:11px;align-self:center">底图微调</span>
+    <button data-d="-5,0">◀</button><button data-d="5,0">▶</button><button data-d="0,5">▲</button><button data-d="0,-5">▼</button><button data-d="0,0">归零</button>
+  </div>
+  <div id="sub2" style="margin-top:6px;font-size:11px;color:var(--dim)">左键旋转 · 右键平移 · 滚轮缩放 · Shift+拖动 AP 校准方位</div>
+</div>
+
+<div id="legend" class="glass">
+  <span><i style="background:#ff4d6d"></i>开放</span><span><i style="background:#ff9f1c"></i>WEP</span><span><i style="background:#ffd23f"></i>WPA</span><span><i style="background:#2ee6a6"></i>WPA2/3</span><span><i style="background:#4cc9f0"></i>企业</span><span><i style="background:#ff6bd6"></i>设备</span>
+</div>
+<div id="act" class="glass"><div class="h"><span>环境扰动 (RSSI 波动)</span><span id="actV">0%</span></div><canvas id="actC" width="500" height="92"></canvas></div>
+<div id="tip" class="glass"></div>
+
+<div id="wait" class="glass">
+  <div class="spin"></div>
+  <h2 id="wTitle">等待 ESP32 上传数据…</h2>
+  <p id="wMsg">请确认 ESP32 已按下 RESET，并且 <code>config.h</code> 里的网址和密钥正确。</p>
+  <div class="btns" style="justify-content:center"><button id="bDemo" class="pri">▶ 启动演示数据</button></div>
+</div>
+<div id="err"><div><h2>⚠ 3D 引擎加载失败</h2><p id="errMsg"></p><p>需要浏览器支持 WebGL，并能访问 cdn.jsdelivr.net（three.js）。</p></div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+const Q = new URLSearchParams(location.search);
+const SIM = Q.get('sim') === '1';
+let demoOn = Q.get('demo') === '1';
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const now = () => Date.now() / 1000;
+
+// ================= 设置 =================
+const S = Object.assign({ n: 2.8, tx: -40, labels: true, sweep: true, stations: true, buildings: true, rotate: false }, JSON.parse(localStorage.getItem('wradar.settings') || '{}'));
+const OVR = JSON.parse(localStorage.getItem('wradar.bearing') || '{}');
+const saveS = () => localStorage.setItem('wradar.settings', JSON.stringify(S));
+const saveO = () => localStorage.setItem('wradar.bearing', JSON.stringify(OVR));
+
+// ================= 数据模型 =================
+const NODES = new Map(), APS = new Map(), STAS = new Map();
+let SOLVED = {}, SERVER = null, lastFrameAt = 0, frameCount = 0, mode = SIM ? 'sim' : 'live';
+
+class Kalman {
+  constructor(z) { this.x = z; this.p = 4; }
+  update(z, q = 0.35, r = 5) { this.p += q; const k = this.p / (this.p + r); this.x += k * (z - this.x); this.p *= 1 - k; return this.x; }
+}
+const rssiToDist = (rssi, ch) => clamp(Math.pow(10, ((S.tx - (ch > 14 ? 7 : 0)) - rssi) / (10 * S.n)), 0.5, 150);
+function fnv(str) { let h = 2166136261; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0) / 4294967296; }
+function groupKey(b) { const p = b.split(':'); p[0] = (parseInt(p[0], 16) & 0xfd).toString(16); return p.slice(0, 5).join(':'); }
+function hashAngle(b) { return fnv(groupKey(b)) * Math.PI * 2 + (parseInt(b.slice(-2), 16) / 255 - 0.5) * 0.16; }
+const AUTH = { 0: ['开放', 0xff4d6d], 1: ['WEP', 0xff9f1c], 2: ['WPA', 0xffd23f], 3: ['WPA2', 0x2ee6a6], 4: ['WPA/WPA2', 0x2ee6a6], 5: ['WPA2 企业', 0x4cc9f0], 6: ['WPA3', 0x2ee6a6], 7: ['WPA2/WPA3', 0x2ee6a6], 8: ['WAPI', 0x4cc9f0] };
+const authInfo = (a) => AUTH[a] || ['未知', 0x99aabb];
+const hex = (c) => '#' + c.toString(16).padStart(6, '0');
+
+function ingest(f) {
+  if (!f || !Array.isArray(f.aps)) return;
+  const t = now();
+  const id = f.node || 'node';
+  let nd = NODES.get(id);
+  if (!nd) { nd = { id, x: 0, y: 0, frames: 0 }; NODES.set(id, nd); }
+  nd.x = +f.x || 0; nd.y = +f.y || 0; nd.last = t; nd.up = f.up; nd.fw = f.fw; nd.frames++;
+  for (const a of f.aps) {
+    if (!a.b) continue;
+    const b = String(a.b).toUpperCase();
+    let ap = APS.get(b);
+    if (!ap) { ap = { bssid: b, ssid: '', obs: new Map(), px: null, py: null, pulse: 0, first: t }; APS.set(b, ap); }
+    if (a.s) ap.ssid = a.s;
+    ap.ch = a.c; ap.auth = a.a; ap.last = t;
+    if (typeof a.ang === 'number') ap.fixedAngle = a.ang;
+    let o = ap.obs.get(id);
+    if (!o) { o = { k: new Kalman(a.r), raw: [], last: 0 }; ap.obs.set(id, o); }
+    o.raw.push(a.r); if (o.raw.length > 16) o.raw.shift();
+    o.rssi = o.k.update(a.r); o.last = t; o.lastRaw = a.r;
+    ap.pulse = 1;
+  }
+  if (Array.isArray(f.st)) {
+    for (const s of f.st) {
+      const m = String(s.m).toUpperCase();
+      let st = STAS.get(m);
+      if (!st) { st = { mac: m, rssi: s.r, first: t }; STAS.set(m, st); }
+      st.rssi = st.rssi * 0.5 + s.r * 0.5; st.ch = s.c; st.cnt = s.n; st.bssid = s.b ? String(s.b).toUpperCase() : st.bssid; st.last = t; st.node = id;
+    }
+  }
+  lastFrameAt = t; frameCount++; ping();
+  $('wait').style.display = 'none';
+}
+
+function recompute(ap, t) {
+  let best = null;
+  for (const [nid, o] of ap.obs) { if (t - o.last > 25) continue; if (!best || o.rssi > best.o.rssi) best = { nid, o }; }
+  if (!best) { ap.live = false; return; }
+  ap.live = true; ap.rssi = best.o.rssi; ap.raw = best.o.lastRaw; ap.node = NODES.get(best.nid) || { x: 0, y: 0 };
+  ap.dist = rssiToDist(ap.rssi, ap.ch);
+  const r = best.o.raw;
+  if (r.length >= 5) { const m = r.reduce((a, b) => a + b, 0) / r.length; ap.sigma = Math.sqrt(r.reduce((a, b) => a + (b - m) * (b - m), 0) / r.length); } else ap.sigma = 0;
+  const sol = SOLVED[ap.bssid];
+  if (sol) { ap.tx = sol.x; ap.ty = sol.y; ap.src = '多节点三边定位'; ap.ang = Math.atan2(sol.y - ap.node.y, sol.x - ap.node.x); }
+  else {
+    let ang, src;
+    if (OVR[ap.bssid] != null) { ang = OVR[ap.bssid]; src = '手动校准'; }
+    else if (ap.fixedAngle != null) { ang = ap.fixedAngle; src = '外部给定'; }
+    else { ang = hashAngle(ap.bssid); src = '方位未知(估计)'; }
+    ap.ang = ang; ap.src = src;
+    ap.tx = ap.node.x + ap.dist * Math.cos(ang); ap.ty = ap.node.y + ap.dist * Math.sin(ang);
+  }
+}
+
+// ---- 环境扰动指数：所有可见 AP 的 RSSI 标准差均值，相对慢基线的增量 ----
+let actShort = 0, actBase = null, act = 0; const actHist = [];
+setInterval(() => {
+  const v = []; for (const ap of APS.values()) if (ap.live && ap.rssi > -85 && ap.sigma > 0) v.push(ap.sigma);
+  if (v.length < 2) { act *= 0.9; } else {
+    const m = v.reduce((a, b) => a + b, 0) / v.length;
+    actShort = actShort ? actShort * 0.6 + m * 0.4 : m;
+    actBase = actBase == null ? actShort : actBase + (actShort > actBase ? 0.004 : 0.06) * (actShort - actBase);
+    act = clamp((actShort - actBase) / 1.6, 0, 1);
+  }
+  actHist.push(act); if (actHist.length > 120) actHist.shift();
+  $('actV').textContent = Math.round(act * 100) + '%'; $('nAct').textContent = Math.round(act * 100) + '%';
+  drawAct();
+}, 500);
+function drawAct() {
+  const c = $('actC'), g = c.getContext('2d'); g.clearRect(0, 0, c.width, c.height);
+  g.strokeStyle = 'rgba(80,200,255,.15)'; g.beginPath(); g.moveTo(0, c.height - 1); g.lineTo(c.width, c.height - 1); g.stroke();
+  g.beginPath(); actHist.forEach((a, i) => { const x = (i / 119) * c.width, y = c.height - 4 - a * (c.height - 10); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.strokeStyle = act > 0.5 ? '#ff4d6d' : '#2ee6a6'; g.lineWidth = 2; g.stroke();
+}
+
+// ================= Three.js 场景 =================
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas: $('c'), antialias: true, powerPreference: 'high-performance' });
+} catch (e) { $('err').style.display = 'flex'; $('errMsg').textContent = String(e); throw e; }
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x040a12);
+scene.fog = new THREE.FogExp2(0x040a12, 0.0042);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 1200);
+const HOME = { p: new THREE.Vector3(0, 30, 38), t: new THREE.Vector3(0, 0, 0) };
+camera.position.copy(HOME.p);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.07; controls.maxPolarAngle = Math.PI / 2 - 0.015;
+controls.minDistance = 3; controls.maxDistance = 320; controls.target.copy(HOME.t);
+let focusT = null; controls.addEventListener('start', () => { focusT = null; });
+
+scene.add(new THREE.AmbientLight(0x7aa0c8, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1); sun.position.set(40, 80, 30); scene.add(sun);
+
+// 地面 / 网格 / 距离环
+const ground = new THREE.Mesh(new THREE.CircleGeometry(170, 96), new THREE.MeshBasicMaterial({ color: 0x07131f }));
+ground.rotation.x = -Math.PI / 2; ground.position.y = -0.05; scene.add(ground);
+const grid = new THREE.GridHelper(340, 68, 0x0f4a66, 0x0a2535); grid.material.transparent = true; grid.material.opacity = 0.55; scene.add(grid);
+function textSprite(lines, color = '#cfe9f7', w = 512, h = 160, bg = true) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, depthTest: false }));
+  sp.userData = { c, tex, w, h, color, bg, key: '' }; sp.renderOrder = 10;
+  setSprite(sp, lines); return sp;
+}
+function setSprite(sp, lines, color) {
+  const u = sp.userData, key = lines.join('|') + (color || u.color); if (key === u.key) return; u.key = key;
+  const g = u.c.getContext('2d'); g.clearRect(0, 0, u.w, u.h);
+  if (u.bg) { g.fillStyle = 'rgba(4,12,22,.72)'; g.strokeStyle = color || u.color; g.lineWidth = 3; g.beginPath(); g.roundRect(4, 4, u.w - 8, u.h - 8, 22); g.fill(); g.stroke(); }
+  g.textAlign = 'center'; g.fillStyle = '#fff'; g.font = 'bold 54px "Segoe UI","Microsoft YaHei",sans-serif';
+  g.fillText(lines[0], u.w / 2, lines.length > 1 ? u.h * 0.46 : u.h * 0.62, u.w - 30);
+  if (lines[1]) { g.fillStyle = color || u.color; g.font = '40px "Segoe UI","Microsoft YaHei",sans-serif'; g.fillText(lines[1], u.w / 2, u.h * 0.82, u.w - 30); }
+  u.tex.needsUpdate = true;
+}
+for (const r of [5, 10, 20, 40, 80, 150]) {
+  const ring = new THREE.Mesh(new THREE.RingGeometry(r - 0.07, r + 0.07, 160), new THREE.MeshBasicMaterial({ color: 0x1fa5d6, transparent: true, opacity: r <= 40 ? 0.55 : 0.3, side: THREE.DoubleSide }));
+  ring.rotation.x = -Math.PI / 2; scene.add(ring);
+  const lb = textSprite([r + ' m'], '#58c6ee', 256, 90, false); lb.position.set(r * 0.7071, 0.4, -r * 0.7071); lb.scale.set(Math.max(3, r * 0.14), Math.max(3, r * 0.14) * 90 / 256, 1); scene.add(lb);
+}
+{
+  const pts = []; for (let a = 0; a < 12; a++) { const t = (a / 12) * Math.PI * 2; pts.push(0, 0.01, 0, Math.cos(t) * 150, 0.01, Math.sin(t) * 150); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x0f5f80, transparent: true, opacity: 0.35 })));
+  const nl = textSprite(['N 北'], '#ff6b6b', 256, 90, false); nl.position.set(0, 1, -158); nl.scale.set(12, 4.2, 1); scene.add(nl);
+}
+// 扫描波
+const sweepTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 512; const g = c.getContext('2d');
+  if (g.createConicGradient) { const cg = g.createConicGradient(0, 256, 256); cg.addColorStop(0, 'rgba(46,230,166,.6)'); cg.addColorStop(0.0001, 'rgba(46,230,166,0)'); cg.addColorStop(0.7, 'rgba(46,230,166,0)'); cg.addColorStop(1, 'rgba(46,230,166,.6)'); g.fillStyle = cg; }
+  else { g.fillStyle = 'rgba(46,230,166,.15)'; }
+  g.beginPath(); g.arc(256, 256, 255, 0, Math.PI * 2); g.fill();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+})();
+const sweep = new THREE.Group();
+const sweepMesh = new THREE.Mesh(new THREE.PlaneGeometry(160, 160), new THREE.MeshBasicMaterial({ map: sweepTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide }));
+sweepMesh.rotation.x = -Math.PI / 2; sweepMesh.position.y = 0.03; sweep.add(sweepMesh); scene.add(sweep);
+
+// 扩散环(每次收到数据一次) + 扰动涟漪
+const pings = []; for (let i = 0; i < 3; i++) { const m = new THREE.Mesh(new THREE.RingGeometry(0.97, 1, 128), new THREE.MeshBasicMaterial({ color: 0x2ee6a6, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })); m.rotation.x = -Math.PI / 2; m.position.y = 0.06; m.userData.t = 9; scene.add(m); pings.push(m); }
+let pingI = 0; function ping() { const m = pings[pingI++ % 3]; m.userData.t = 0; }
+const ripples = []; for (let i = 0; i < 3; i++) { const m = new THREE.Mesh(new THREE.RingGeometry(0.9, 1, 96), new THREE.MeshBasicMaterial({ color: 0xff4d6d, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })); m.rotation.x = -Math.PI / 2; m.position.y = 0.08; scene.add(m); ripples.push(m); }
+
+// 节点
+const nodeObjs = new Map();
+function nodeObj(nd) {
+  let o = nodeObjs.get(nd.id); if (o) return o;
+  const g = new THREE.Group();
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.4, 0.4, 24), new THREE.MeshStandardMaterial({ color: 0x0b3a52, emissive: 0x0a5f7a, emissiveIntensity: 0.8 }));
+  const tower = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.35, 3, 12), new THREE.MeshStandardMaterial({ color: 0x9fe9ff, emissive: 0x2ee6a6, emissiveIntensity: 0.6 }));
+  tower.position.y = 1.7;
+  const orb = new THREE.Mesh(new THREE.SphereGeometry(0.55, 24, 16), new THREE.MeshBasicMaterial({ color: 0x2ee6a6 })); orb.position.y = 3.5;
+  const halo = new THREE.Mesh(new THREE.SphereGeometry(1.1, 20, 12), new THREE.MeshBasicMaterial({ color: 0x2ee6a6, transparent: true, opacity: 0.18, depthWrite: false })); halo.position.y = 3.5;
+  const lb = textSprite(['ESP32-S3', nd.id], '#2ee6a6'); lb.position.y = 6; lb.scale.set(7, 2.2, 1);
+  g.add(base, tower, orb, halo, lb); scene.add(g);
+  o = { g, orb, halo, lb }; nodeObjs.set(nd.id, o); return o;
+}
+
+// AP 对象
+const apObjs = new Map(); const pickables = [];
+const matCache = {};
+function apMat(color) { return matCache[color] || (matCache[color] = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.55, roughness: 0.4, metalness: 0.2, transparent: true })); }
+function makeAp(ap) {
+  const [, col] = authInfo(ap.auth);
+  const g = new THREE.Group();
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.75, 0.18, 20), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.55 }));
+  const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.3, 1, 0.3), apMat(col).clone());
+  const head = new THREE.Mesh(new THREE.OctahedronGeometry(0.62), apMat(col).clone());
+  const pr = new THREE.Mesh(new THREE.RingGeometry(0.9, 1, 48), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false })); pr.rotation.x = -Math.PI / 2; pr.position.y = 0.1;
+  const lb = textSprite(['…']); 
+  const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(6, 3));
+  const line = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.25 })); line.frustumCulled = false;
+  g.add(base, pillar, head, pr, lb); scene.add(g); scene.add(line);
+  pillar.userData.ap = ap; head.userData.ap = ap; pickables.push(pillar, head);
+  const o = { g, base, pillar, head, pr, lb, line, col, h: 1 }; apObjs.set(ap.bssid, o); return o;
+}
+function removeAp(b) {
+  const o = apObjs.get(b); if (!o) return;
+  scene.remove(o.g, o.line);
+  [o.pillar, o.head].forEach((m) => { const i = pickables.indexOf(m); if (i >= 0) pickables.splice(i, 1); });
+  o.g.traverse((m) => { if (m.material && m.material.map) m.material.map.dispose(); if (m.material) m.material.dispose(); if (m.geometry) m.geometry.dispose(); });
+  o.line.geometry.dispose(); o.line.material.dispose(); apObjs.delete(b); APS.delete(b);
+}
+// 设备对象
+const stObjs = new Map();
+const stGeo = new THREE.SphereGeometry(0.38, 14, 10); const stMat = new THREE.MeshStandardMaterial({ color: 0xff6bd6, emissive: 0xff6bd6, emissiveIntensity: 0.7 });
+function makeSt(st) {
+  const m = new THREE.Mesh(stGeo, stMat.clone()); m.userData.st = st; scene.add(m); pickables.push(m);
+  const lg = new THREE.BufferGeometry(); lg.setAttribute('position', new THREE.Float32BufferAttribute(6, 3));
+  const line = new THREE.Line(lg, new THREE.LineDashedMaterial({ color: 0xff6bd6, transparent: true, opacity: 0.3, dashSize: 0.6, gapSize: 0.5 })); line.frustumCulled = false; scene.add(line);
+  const o = { m, line }; stObjs.set(st.mac, o); return o;
+}
+function removeSt(mac) {
+  const o = stObjs.get(mac); if (!o) return; scene.remove(o.m, o.line);
+  const i = pickables.indexOf(o.m); if (i >= 0) pickables.splice(i, 1);
+  o.m.material.dispose(); o.line.geometry.dispose(); o.line.material.dispose(); stObjs.delete(mac); STAS.delete(mac);
+}
+
+// ================= 真实世界(街区)底图 =================
+const world = new THREE.Group(); scene.add(world); let worldOff = { x: 0, y: 0 }, worldInfo = null;
+function disposeWorld() { while (world.children.length) { const c = world.children[0]; world.remove(c); if (c.geometry) c.geometry.dispose(); if (c.material) c.material.dispose(); } }
+function buildWorld(d) {
+  disposeWorld(); worldInfo = d; const geos = [];
+  for (const b of d.buildings || []) {
+    let p = b.pts; if (!p || p.length < 3) continue;
+    if (p.length > 3 && p[0][0] === p[p.length - 1][0] && p[0][1] === p[p.length - 1][1]) p = p.slice(0, -1);
+    try { const g = new THREE.ExtrudeGeometry(new THREE.Shape(p.map((q) => new THREE.Vector2(q[0], q[1]))), { depth: Math.max(2, b.h || 8), bevelEnabled: false }); g.rotateX(-Math.PI / 2); geos.push(g); } catch (e) { /* 忽略坏多边形 */ }
+  }
+  if (geos.length) {
+    const merged = mergeGeometries(geos, false);
+    if (merged) {
+      const bm = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({ color: 0x1a4466, roughness: 0.85, transparent: true, opacity: 0.38, depthWrite: false }));
+      bm.renderOrder = -2; world.add(bm);
+      const be = new THREE.LineSegments(new THREE.EdgesGeometry(merged, 35), new THREE.LineBasicMaterial({ color: 0x3fb6e8, transparent: true, opacity: 0.5, depthWrite: false }));
+      be.renderOrder = -1; world.add(be);
+    }
+    geos.forEach((g) => g.dispose());
+  }
+  const rp = []; for (const r of d.roads || []) for (let i = 0; i + 1 < r.length; i++) rp.push(r[i][0], 0.03, -r[i][1], r[i + 1][0], 0.03, -r[i + 1][1]);
+  if (rp.length) { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(rp, 3)); world.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x2a9fd0, transparent: true, opacity: 0.55 }))); }
+  world.visible = S.buildings; $('dpad').style.display = 'flex';
+  const acc = d.accuracy ? ' · 精度≈' + Math.round(d.accuracy) + 'm' : '';
+  $('sub').textContent = (d.label || '真实街区') + (d.lat ? ` (${(+d.lat).toFixed(5)}, ${(+d.lon).toFixed(5)})` : '') + acc;
+}
+function demoCity() {
+  let s = 1234567; const rnd = () => { s |= 0; s = (s + 0x6d2b79f5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const bl = [], rd = [];
+  for (let i = -4; i <= 4; i++) for (let j = -4; j <= 4; j++) {
+    const cx = i * 46 + 23, cy = j * 46 + 23;
+    for (let k = 0; k < 4; k++) {
+      const w = 9 + rnd() * 8, d = 9 + rnd() * 8, ox = (k % 2 ? 1 : -1) * (6 + w / 2), oy = (k > 1 ? 1 : -1) * (6 + d / 2); const x = cx + ox, y = cy + oy;
+      if (Math.hypot(x, y) < 42 || rnd() < 0.15) continue;
+      bl.push({ h: 5 + rnd() * rnd() * 30, pts: [[x - w / 2, y - d / 2], [x + w / 2, y - d / 2], [x + w / 2, y + d / 2], [x - w / 2, y + d / 2]] });
+    }
+  }
+  for (let i = -5; i <= 4; i++) { rd.push([[i * 46, -210], [i * 46, 210]]); rd.push([[-210, i * 46], [210, i * 46]]); }
+  return { buildings: bl, roads: rd, label: '模拟街区(演示数据，非真实地图)' };
+}
+async function locateWorld(manual) {
+  const btn = $('bGeo'); btn.disabled = true; btn.textContent = '定位中…';
+  try {
+    if (demoOn || SIM) { buildWorld(demoCity()); return; }
+    let url = 'api/geo'; if (manual) url += '?lat=' + manual[0] + '&lon=' + manual[1];
+    const r = await fetch(url, { cache: 'no-store' }); const j = await r.json();
+    if (!j.ok) {
+      const v = prompt((j.error || '自动定位失败') + '\n\n请手动输入你所在位置的 纬度,经度（可在地图软件长按取点）：', '');
+      if (v) { const p = v.split(/[,，\s]+/).map(Number); if (p.length >= 2 && isFinite(p[0]) && isFinite(p[1])) { btn.disabled = false; btn.textContent = '🌍 定位真实世界'; return locateWorld(p); } }
+      return;
+    }
+    buildWorld(j);
+  } catch (e) { alert('街区加载失败：' + e); }
+  finally { btn.disabled = false; btn.textContent = '🌍 定位真实世界'; }
+}
+
+// ================= 每帧同步 =================
+const tmpV = new THREE.Vector3();
+function labelScale(sp, pos, base) { const d = camera.position.distanceTo(pos); const s = clamp(d * 0.09, 2.6, 13) * base; sp.scale.set(s, s * (sp.userData.h / sp.userData.w), 1); }
+let selected = null, lastT = performance.now(), lastList = 0, cardAt = 0;
+function sync(dt, t) {
+  for (const nd of NODES.values()) {
+    const o = nodeObj(nd); o.g.position.set(nd.x, 0, -nd.y);
+    const alive = t - nd.last < 8; o.orb.material.color.setHex(alive ? 0x2ee6a6 : 0xffb020);
+    o.halo.scale.setScalar(1 + 0.25 * Math.sin(t * 4)); o.lb.visible = S.labels; labelScale(o.lb, o.g.position, 0.9);
+  }
+  for (const ap of [...APS.values()]) {
+    recompute(ap, t);
+    if (t - ap.last > 60) { removeAp(ap.bssid); continue; }
+    const o = apObjs.get(ap.bssid) || makeAp(ap);
+    if (!ap.live) { o.g.visible = false; o.line.visible = false; continue; }
+    o.g.visible = true; o.line.visible = true;
+    if (ap.px == null) { ap.px = ap.tx; ap.py = ap.ty; }
+    const k = 1 - Math.exp(-dt * 4); ap.px += (ap.tx - ap.px) * k; ap.py += (ap.ty - ap.py) * k;
+    const age = t - ap.last, fade = age > 12 ? clamp(1 - (age - 12) / 18, 0.15, 1) : 1;
+    const targetH = 0.6 + clamp((ap.rssi + 95) / 65, 0, 1) * 9; o.h += (targetH - o.h) * k;
+    o.g.position.set(ap.px, 0, -ap.py);
+    o.pillar.scale.y = o.h; o.pillar.position.y = o.h / 2 + 0.1; o.head.position.y = o.h + 0.75; o.head.rotation.y += dt * 1.2;
+    o.pillar.material.opacity = o.head.material.opacity = 0.95 * fade; o.base.material.opacity = 0.55 * fade;
+    const sel = selected === ap.bssid; o.head.scale.setScalar(sel ? 1.5 : 1); o.head.material.emissiveIntensity = sel ? 1.4 : 0.55 + ap.pulse * 0.8;
+    ap.pulse = Math.max(0, ap.pulse - dt * 1.3); o.pr.material.opacity = ap.pulse * 0.7 * fade; o.pr.scale.setScalar(1 + (1 - ap.pulse) * 3);
+    const p = o.line.geometry.attributes.position; const nx = ap.node.x, ny = ap.node.y;
+    p.setXYZ(0, nx, 3.5, -ny); p.setXYZ(1, ap.px, o.h + 0.75, -ap.py); p.needsUpdate = true; o.line.material.opacity = 0.08 + clamp((ap.rssi + 95) / 65, 0, 1) * 0.3 * fade;
+    o.lb.visible = S.labels || sel;
+    if (o.lb.visible) {
+      const name = ap.ssid || '(隐藏网络)'; setSprite(o.lb, [name.length > 16 ? name.slice(0, 15) + '…' : name, Math.round(ap.rssi) + ' dBm · ' + ap.dist.toFixed(1) + ' m'], hex(o.col));
+      o.lb.position.set(0, o.h + 2.4, 0); tmpV.set(ap.px, o.h, -ap.py); labelScale(o.lb, tmpV, 1);
+    }
+  }
+  for (const st of [...STAS.values()]) {
+    if (t - st.last > 60) { removeSt(st.mac); continue; }
+    const o = stObjs.get(st.mac) || makeSt(st);
+    const vis = S.stations; o.m.visible = vis; o.line.visible = vis; if (!vis) continue;
+    const nd = NODES.get(st.node) || { x: 0, y: 0 };
+    const d = rssiToDist(st.rssi, st.ch || 6); const a = fnv(st.mac) * Math.PI * 2;
+    const tx = nd.x + d * Math.cos(a), ty = nd.y + d * Math.sin(a);
+    if (st.px == null) { st.px = tx; st.py = ty; } const k = 1 - Math.exp(-dt * 3); st.px += (tx - st.px) * k; st.py += (ty - st.py) * k;
+    st.dist = d; o.m.position.set(st.px, 0.6 + 0.2 * Math.sin(t * 2 + a * 5), -st.py);
+    const ap = st.bssid ? APS.get(st.bssid) : null; const p = o.line.geometry.attributes.position;
+    if (ap && ap.px != null && ap.live) { p.setXYZ(0, st.px, 0.6, -st.py); p.setXYZ(1, ap.px, 0.8, -ap.py); o.line.visible = true; o.line.computeLineDistances(); } else { p.setXYZ(0, 0, 0, 0); p.setXYZ(1, 0, 0, 0); }
+    p.needsUpdate = true; o.m.material.opacity = 1;
+  }
+  // 扩散环
+  for (const m of pings) { const u = m.userData; if (u.t < 2.2) { u.t += dt; const r = 2 + u.t * 28; m.scale.setScalar(r); m.material.opacity = Math.max(0, 0.5 * (1 - u.t / 2.2)); } else m.material.opacity = 0; }
+  ripples.forEach((m, i) => { const ph = ((t * 0.55 + i / 3) % 1); m.scale.setScalar(2 + ph * 22); m.material.opacity = act * 0.7 * (1 - ph); });
+  sweep.visible = S.sweep; sweep.rotation.y = -t * 1.1;
+}
+
+// ================= 交互 =================
+const ray = new THREE.Raycaster(); const mouse = new THREE.Vector2(); const gplane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+let hoverQ = false, mx = 0, my = 0, dragAp = null;
+function pick() {
+  mouse.set((mx / innerWidth) * 2 - 1, -(my / innerHeight) * 2 + 1); ray.setFromCamera(mouse, camera);
+  const hit = ray.intersectObjects(pickables.filter((m) => m.visible && m.parent && m.parent.visible !== false), false)[0]; return hit ? hit.object : null;
+}
+renderer.domElement.addEventListener('pointermove', (e) => {
+  mx = e.clientX; my = e.clientY;
+  if (dragAp) { mouse.set((mx / innerWidth) * 2 - 1, -(my / innerHeight) * 2 + 1); ray.setFromCamera(mouse, camera); const p = new THREE.Vector3(); if (ray.ray.intersectPlane(gplane, p)) { const nd = dragAp.node || { x: 0, y: 0 }; OVR[dragAp.bssid] = Math.atan2(-p.z - nd.y, p.x - nd.x); } return; }
+  if (hoverQ) return; hoverQ = true;
+  requestAnimationFrame(() => {
+    hoverQ = false; const o = pick(); const tip = $('tip');
+    if (!o) { tip.style.display = 'none'; renderer.domElement.style.cursor = 'default'; return; }
+    renderer.domElement.style.cursor = 'pointer';
+    const a = o.userData.ap, s = o.userData.st;
+    tip.innerHTML = a ? `<b>${esc(a.ssid || '(隐藏网络)')}</b><br>${esc(a.bssid)}<br>${Math.round(a.rssi)} dBm · ≈${a.dist.toFixed(1)} m · CH${a.ch}` : `<b>周围设备</b><br>${esc(s.mac)}<br>${Math.round(s.rssi)} dBm · ≈${(s.dist || 0).toFixed(1)} m${(parseInt(s.mac.slice(0, 2), 16) & 2) ? '<br>随机化 MAC(手机)' : ''}`;
+    tip.style.left = Math.min(mx + 14, innerWidth - 280) + 'px'; tip.style.top = my + 14 + 'px'; tip.style.display = 'block';
+  });
+});
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (e.shiftKey) { mx = e.clientX; my = e.clientY; const o = pick(); if (o && o.userData.ap) { dragAp = o.userData.ap; controls.enabled = false; select(dragAp.bssid); e.preventDefault(); } }
+});
+addEventListener('pointerup', () => { if (dragAp) { saveO(); dragAp = null; controls.enabled = true; } });
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', (e) => { downAt = [e.clientX, e.clientY]; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 4) return; mx = e.clientX; my = e.clientY; const o = pick();
+  if (o && o.userData.ap) select(o.userData.ap.bssid, true); else if (!o) select(null);
+});
+function select(b, focus) {
+  selected = b; renderCard(); renderList(true);
+  if (b && focus) { const o = apObjs.get(b); if (o) focusT = new THREE.Vector3(o.g.position.x, 2, o.g.position.z); }
+}
+function renderCard() {
+  const c = $('card'); const ap = selected && APS.get(selected); if (!ap) { c.style.display = 'none'; return; }
+  const [an] = authInfo(ap.auth);
+  c.innerHTML = `<h3>${esc(ap.ssid || '(隐藏网络)')}</h3><table>
+  <tr><td>BSSID</td><td>${esc(ap.bssid)}</td></tr><tr><td>信道/频段</td><td>CH ${ap.ch} · ${ap.ch > 14 ? '5' : '2.4'} GHz</td></tr><tr><td>加密</td><td>${an}</td></tr>
+  <tr><td>RSSI</td><td>${ap.rssi.toFixed(1)} dBm（滤波）/ ${ap.raw} dBm（原始）</td></tr><tr><td>估算距离</td><td>${ap.dist.toFixed(1)} m（误差通常 ±30~50%）</td></tr>
+  <tr><td>方位来源</td><td>${ap.src}</td></tr><tr><td>RSSI 波动 σ</td><td>${(ap.sigma || 0).toFixed(2)} dB</td></tr>
+  <tr><td>首次/最近</td><td>${Math.round(now() - ap.first)}s / ${(now() - ap.last).toFixed(1)}s 前</td></tr></table>
+  <div class="btns"><button id="cClose">关闭</button><button id="cRst">清除该 AP 方位校准</button></div>`;
+  c.style.display = 'block'; $('cClose').onclick = () => select(null); $('cRst').onclick = () => { delete OVR[ap.bssid]; saveO(); };
+}
+function renderList(force) {
+  const t = performance.now(); if (!force && t - lastList < 600) return; lastList = t;
+  const q = $('q').value.trim().toLowerCase();
+  const arr = [...APS.values()].filter((a) => a.live && (!q || (a.ssid || '').toLowerCase().includes(q) || a.bssid.toLowerCase().includes(q))).sort((a, b) => b.rssi - a.rssi);
+  $('list').innerHTML = arr.map((a) => {
+    const col = hex(authInfo(a.auth)[1]), pct = clamp((a.rssi + 95) / 65, 0, 1) * 100;
+    return `<div class="row ${a.bssid === selected ? 'sel' : ''}" data-b="${a.bssid}"><span class="dot" style="background:${col}"></span><div><div class="n">${esc(a.ssid || '(隐藏网络)')}</div><div class="m">${a.bssid.slice(-8)} · CH${a.ch}</div><div class="bar"><i style="width:${pct}%;background:${col}"></i></div></div><div class="r">${Math.round(a.rssi)}<div class="m">${a.dist.toFixed(1)}m</div></div></div>`;
+  }).join('') || '<div class="m" style="padding:12px">暂无数据</div>';
+}
+$('list').addEventListener('click', (e) => { const r = e.target.closest('.row'); if (r) select(r.dataset.b, true); });
+$('q').addEventListener('input', () => renderList(true));
+
+// ================= 控件 =================
+function bindSlider(id, vid, key, fmt) { const el = $(id); el.value = S[key]; $(vid).textContent = fmt(S[key]); el.oninput = () => { S[key] = +el.value; $(vid).textContent = fmt(S[key]); saveS(); }; }
+bindSlider('sN', 'vN', 'n', (v) => (+v).toFixed(2)); bindSlider('sT', 'vT', 'tx', (v) => v);
+for (const [id, key] of [['tLab', 'labels'], ['tSw', 'sweep'], ['tSt', 'stations'], ['tBd', 'buildings'], ['tRot', 'rotate']]) { const el = $(id); el.checked = S[key]; el.onchange = () => { S[key] = el.checked; saveS(); if (key === 'buildings') world.visible = S.buildings; if (key === 'rotate') controls.autoRotate = S.rotate; }; }
+controls.autoRotate = S.rotate; controls.autoRotateSpeed = 0.6;
+function resetView() { focusT = null; camera.position.copy(HOME.p); controls.target.copy(HOME.t); }
+$('bView').onclick = resetView;
+const toggleFull = () => { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); };
+$('bFull').onclick = toggleFull;
+$('bClr').onclick = () => { for (const k of Object.keys(OVR)) delete OVR[k]; saveO(); };
+$('bGeo').onclick = () => locateWorld();
+$('bDemo').onclick = () => startDemo();
+$('dpad').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; const [dx, dy] = b.dataset.d.split(',').map(Number); if (!dx && !dy) worldOff = { x: 0, y: 0 }; else { worldOff.x += dx; worldOff.y += dy; } world.position.set(worldOff.x, 0, -worldOff.y); });
+addEventListener('keydown', (e) => { if (e.target.tagName === 'INPUT') return; if (e.key === 'r' || e.key === 'R') resetView(); if (e.key === 'f' || e.key === 'F') toggleFull(); if (e.key === 'l' || e.key === 'L') { S.labels = !S.labels; $('tLab').checked = S.labels; saveS(); } });
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// ================= 数据来源：实时 / 外部喂入 / 演示 =================
+const DEMO_APS = (() => {
+  const L = [['HomeWiFi-2.4G', 3.2, 40, 1, 3], ['ChinaNet-7K2P', 6.5, 150, 6, 3], ['TP-LINK_A3F1', 4.1, 285, 11, 3], ['Xiaomi_5G_Guest', 9.0, 70, 6, 0], ['CMCC-Ly8N', 12.4, 200, 1, 4], ['HUAWEI-B535', 8.3, 315, 11, 6], ['Starbucks_Free', 17.5, 20, 6, 0], ['NETGEAR-Office', 21.0, 110, 1, 5], ['iPhone 热点', 5.0, 250, 6, 3], ['DIRECT-roku-92', 10.8, 345, 11, 2], ['ChinaUnicom-5A', 27.0, 170, 1, 3], ['(hidden)', 14.0, 95, 6, 3], ['Tenda_8C22', 31.0, 230, 11, 3], ['MERCURY_1F', 38.0, 300, 6, 3], ['OfficeGuest', 24.0, 135, 1, 7], ['ZTE-HomeGW', 45.0, 60, 11, 3]];
+  return L.map((r, i) => { const h = (n) => (Math.imul(i + 1, 2654435761 + n) >>> 0).toString(16).padStart(8, '0'); const m = ('A2' + h(1) + h(2)).slice(0, 12).toUpperCase().match(/../g).join(':'); return { b: m, s: r[0] === '(hidden)' ? '' : r[0], d: r[1], ang: (r[2] * Math.PI) / 180, c: r[3], a: r[4], n: 2.6 + (i % 4) * 0.15 }; });
+})();
+const DEMO_STA = Array.from({ length: 7 }, (_, i) => ({ m: ['DA', '3C', '5E', 'F2', '10', (i * 37 + 11).toString(16).toUpperCase().padStart(2, '0')].join(':'), d: 3 + i * 4.2, ang: i * 0.9 + 0.4, ap: i % 3 }));
+let demoSeq = 0, demoT0 = Date.now();
+function gauss() { return (Math.random() + Math.random() + Math.random() - 1.5) * 1.6; }
+function demoFrame() {
+  const t = (Date.now() - demoT0) / 1000; demoSeq++;
+  const walker = Math.max(0, Math.sin(t / 9 - 1.2)) > 0.55 ? 1 : 0;    // 周期性有人经过
+  const f = { v: 1, node: 'S3-DEMO01', seq: demoSeq, up: Math.round(t), x: 0, y: 0, fw: 'sim', aps: [] };
+  for (const a of DEMO_APS) { const r = Math.round(-40 - 10 * a.n * Math.log10(a.d) + gauss() * (1 + 3.2 * walker) + (a.c > 14 ? -7 : 0)); if (r > -92) f.aps.push({ b: a.b, s: a.s, r, c: a.c, a: a.a, ang: a.ang }); }
+  if (demoSeq % 4 === 1) f.st = DEMO_STA.map((s) => ({ m: s.m, r: Math.round(-40 - 28 * Math.log10(s.d) + gauss()), c: 6, n: 8, b: DEMO_APS[s.ap].b })).filter((s) => s.r > -92);
+  return f;
+}
+let demoTimer = null;
+function startDemo() { demoOn = true; $('conn').className = 'chip warn'; $('conn').textContent = '演示数据'; $('wait').style.display = 'none'; if (!demoTimer) { demoTimer = setInterval(() => ingest(demoFrame()), 1500); ingest(demoFrame()); } if (!worldInfo) locateWorld(); }
+function reset() {
+  for (const b of [...APS.keys()]) removeAp(b); for (const m of [...STAS.keys()]) removeSt(m);
+  for (const o of nodeObjs.values()) scene.remove(o.g); nodeObjs.clear(); NODES.clear(); SOLVED = {}; frameCount = 0; lastFrameAt = 0; actBase = null; actShort = 0; act = 0; select(null);
+  $('wait').style.display = 'block';
+}
+window.WifiRadar = { ingest, demoFrame, reset, setWaiting(title, msg) { $('wTitle').textContent = title; $('wMsg').innerHTML = msg; }, locate: locateWorld };
+addEventListener('message', (e) => { const d = e.data || {}; if (d.type === 'frame') ingest(d.frame); else if (d.type === 'reset') reset(); else if (d.type === 'waiting') window.WifiRadar.setWaiting(d.title, d.msg); });
+
+// 轮询服务器(Kaggle)
+let since = 0, failN = 0;
+async function poll() {
+  try {
+    const r = await fetch('api/frames?since=' + since, { cache: 'no-store' }); if (!r.ok) throw new Error(r.status);
+    const j = await r.json(); failN = 0; SERVER = j.status || null;
+    if (j.seq < since) since = 0;
+    for (const f of j.frames || []) ingest(f);
+    since = j.seq; SOLVED = j.solved || {};
+  } catch (e) { failN++; }
+  setTimeout(poll, 1000);
+}
+if (!SIM) {
+  if (demoOn) startDemo(); else poll();
+  $('bDemo').style.display = '';
+} else { $('bDemo').style.display = 'none'; window.WifiRadar.setWaiting('ESP32 模拟器未运行', '请在左侧虚拟开发板上按下 <b>RESET</b> 键，雷达将开始扫描。'); }
+
+function status() {
+  const t = now(); const chip = $('conn'), src = $('src');
+  if (demoOn && demoTimer) { chip.className = 'chip warn'; chip.textContent = '演示数据'; src.textContent = '模拟'; }
+  else if (SIM) { const ok = frameCount && t - lastFrameAt < 8; chip.className = 'chip ' + (ok ? 'ok' : 'warn'); chip.textContent = ok ? '模拟 ESP32 运行中' : '模拟器待机'; src.textContent = '浏览器模拟'; }
+  else if (frameCount && t - lastFrameAt < 8) { chip.className = 'chip ok'; chip.textContent = '实时 · ' + (t - lastFrameAt).toFixed(1) + 's 前'; src.textContent = '真实 ESP32'; }
+  else if (frameCount) { chip.className = 'chip bad'; chip.textContent = '数据中断 ' + Math.round(t - lastFrameAt) + 's'; src.textContent = '真实 ESP32'; }
+  else { chip.className = 'chip'; chip.textContent = failN > 3 ? '服务器无响应' : '等待 ESP32'; src.textContent = '—'; if (failN > 3 && !SIM) window.WifiRadar.setWaiting('未连接到雷达服务器', '这个页面没有 <code>/api/frames</code> 接口。在 Kaggle 里运行脚本后再打开隧道网址；或点击下方按钮预览演示数据。'); }
+  $('nAP').textContent = [...APS.values()].filter((a) => a.live).length; $('nST').textContent = STAS.size; $('nND').textContent = NODES.size;
+  if (SERVER && SERVER.gpu && !worldInfo) $('sub').textContent = 'GPU: ' + (SERVER.gpu.length ? SERVER.gpu.join(' + ') : '无(CPU)') + ' · 已接收 ' + (SERVER.frames || 0) + ' 帧';
+  else if (!worldInfo && !SERVER) $('sub').textContent = '点击「定位真实世界」叠加真实街区底图';
+}
+setInterval(status, 500);
+
+(function loop() {
+  const tn = performance.now(), dt = Math.min(0.1, (tn - lastT) / 1000); lastT = tn;
+  sync(dt, now());
+  if (focusT) { controls.target.lerp(focusT, 0.08); if (controls.target.distanceTo(focusT) < 0.05) focusT = null; }
+  controls.update(); renderList(false);
+  if (selected && tn - cardAt > 800) { cardAt = tn; renderCard(); }
+  renderer.render(scene, camera); requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+'''
+
+app = Flask(__name__)
+LOCK = threading.Lock()
+FRAMES = collections.deque(maxlen=400)
+SEQ = 0
+NODES = {}
+SOLVED = {}
+T0 = time.time()
+PUBLIC_URL = ""
+GPU_NAMES = []
+_last_solve = 0.0
+
+try:
+    import torch
+    GPU_NAMES = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+except Exception:
+    torch = None
+
+
+@app.after_request
+def _cors(r):
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    r.headers["Access-Control-Allow-Headers"] = "*"
+    r.headers["Cache-Control"] = "no-store"
+    return r
+
+
+@app.get("/")
+def index():
+    return Response(HTML, mimetype="text/html")
+
+
+@app.get("/api/health")
+def health():
+    return jsonify(ok=True, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES)
+
+
+@app.post("/api/ingest")
+def ingest():
+    global SEQ
+    key = request.headers.get("X-Key") or request.args.get("key")
+    if key != API_KEY:
+        return jsonify(ok=False, error="bad key"), 401
+    f = request.get_json(force=True, silent=True)
+    if not isinstance(f, dict) or not isinstance(f.get("aps"), list):
+        return jsonify(ok=False, error="bad frame"), 400
+    t = time.time()
+    with LOCK:
+        SEQ += 1
+        f["_seq"] = SEQ
+        FRAMES.append(f)
+        nid = str(f.get("node", "node"))
+        n = NODES.setdefault(nid, {"frames": 0, "obs": {}})
+        n["x"] = float(f.get("x") or 0)
+        n["y"] = float(f.get("y") or 0)
+        n["last"] = t
+        n["frames"] += 1
+        n["aps"] = len(f["aps"])
+        n["ip"] = request.headers.get("CF-Connecting-IP") or request.remote_addr
+        for a in f["aps"]:
+            try:
+                b = str(a["b"]).upper()
+                r = float(a["r"])
+                old = n["obs"].get(b)
+                n["obs"][b] = {"r": r if old is None else old["r"] * 0.7 + r * 0.3, "c": int(a.get("c", 6)), "t": t}
+            except Exception:
+                continue
+        seq = SEQ
+    threading.Thread(target=solve_positions, daemon=True).start()
+    return jsonify(ok=True, seq=seq)
+
+
+@app.get("/api/frames")
+def frames():
+    try:
+        since = int(request.args.get("since", "0"))
+    except ValueError:
+        since = 0
+    with LOCK:
+        if since <= 0 or since > SEQ:
+            last = {}
+            for f in FRAMES:
+                last[f.get("node")] = f
+            out = list(last.values())
+        else:
+            out = [f for f in FRAMES if f["_seq"] > since][-60:]
+        status = {
+            "gpu": GPU_NAMES, "frames": SEQ, "uptime": int(time.time() - T0), "public": PUBLIC_URL,
+            "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(time.time() - v.get("last", 0), 1)} for k, v in NODES.items()},
+        }
+        return jsonify(seq=SEQ, frames=out, solved=SOLVED, status=status)
+
+
+# ---------------------------------------------------------------- GPU 多节点三边定位
+def _dist(rssi, ch):
+    return min(150.0, max(0.5, 10 ** (((PATH_TX - (7 if ch > 14 else 0)) - rssi) / (10 * PATH_N))))
+
+
+def multilaterate(items):
+    """items: [(bssid, [(x, y, d, w), ...])] -> {bssid: {x, y, n, res}}；torch 可用时在 GPU 上批量求解。"""
+    out = {}
+    if torch is None:
+        for b, v in items:
+            ws = sum(w for _, _, _, w in v)
+            out[b] = {"x": sum(x * w for x, _, _, w in v) / ws, "y": sum(y * w for _, y, _, w in v) / ws, "n": len(v), "res": -1}
+        return out
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    N, K, R = len(items), max(len(v) for _, v in items), 256
+    P = torch.zeros(N, K, 2)
+    D = torch.zeros(N, K)
+    W = torch.zeros(N, K)
+    for i, (_, v) in enumerate(items):
+        for j, (x, y, d, w) in enumerate(v):
+            P[i, j, 0], P[i, j, 1], D[i, j], W[i, j] = x, y, d, w
+    P, D, W = P.to(dev), D.to(dev), W.to(dev)
+    cen = (P * W[..., None]).sum(1) / W.sum(1, keepdim=True).clamp(min=1e-6)
+    scale = D.max(1).values.clamp(min=2.0)
+    X = (cen[:, None, :] + torch.randn(N, R, 2, device=dev) * scale[:, None, None]).requires_grad_(True)
+    opt = torch.optim.Adam([X], lr=0.6)
+
+    def loss_fn():
+        dist = torch.sqrt(((X[:, :, None, :] - P[:, None, :, :]) ** 2).sum(-1) + 1e-6)
+        return (W[:, None, :] * (dist - D[:, None, :]) ** 2).sum(-1)
+
+    for _ in range(120):
+        opt.zero_grad()
+        loss_fn().sum().backward()
+        opt.step()
+    with torch.no_grad():
+        L = loss_fn()
+        best = L.argmin(1)
+        idx = torch.arange(N, device=dev)
+        pos = X[idx, best].cpu().tolist()
+        res = (L[idx, best] / W.sum(1).clamp(min=1e-6)).sqrt().cpu().tolist()
+    for (b, v), p, r in zip(items, pos, res):
+        px, py = p
+        uniq = {(round(x, 3), round(y, 3)) for x, y, _, _ in v}
+        if len(uniq) == 2:   # 两个节点存在镜像歧义：固定解在 A->B 连线左侧，避免来回跳动
+            (ax, ay), (bx, by) = sorted(uniq)
+            dx, dy = bx - ax, by - ay
+            if dx * (py - ay) - dy * (px - ax) < 0:
+                ln = math.hypot(dx, dy) or 1.0
+                ux, uy = dx / ln, dy / ln
+                t = (px - ax) * ux + (py - ay) * uy
+                px, py = 2 * (ax + ux * t) - px, 2 * (ay + uy * t) - py
+        out[b] = {"x": round(px, 2), "y": round(py, 2), "n": len(v), "res": round(r, 2)}
+    return out
+
+
+def solve_positions():
+    global SOLVED, _last_solve
+    t = time.time()
+    if t - _last_solve < 1.0:
+        return
+    with LOCK:
+        fresh = {k: v for k, v in NODES.items() if t - v.get("last", 0) < 20}
+        if len(fresh) < 2:
+            SOLVED = {}
+            return
+        _last_solve = t
+        per = {}
+        for nid, n in fresh.items():
+            for b, o in n["obs"].items():
+                if t - o["t"] < 20:
+                    d = _dist(o["r"], o["c"])
+                    per.setdefault(b, []).append((n["x"], n["y"], d, 1.0 / (1.0 + d / 5.0)))
+    items = [(b, v) for b, v in per.items() if len(v) >= 2]
+    if not items:
+        return
+    try:
+        res = multilaterate(items)
+        with LOCK:
+            SOLVED = res
+    except Exception as e:
+        print("[solve] error:", e)
+
+
+# ---------------------------------------------------------------- 真实世界：beaconDB 定位 + OSM 建筑
+GEO_CACHE = {}
+OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
+
+
+def wifi_geolocate():
+    with LOCK:
+        best = {}
+        for n in NODES.values():
+            for b, o in n["obs"].items():
+                if int(b[:2], 16) & 2:        # 本地管理(随机化)MAC 不在数据库里
+                    continue
+                if b not in best or o["r"] > best[b]["r"]:
+                    best[b] = o
+    aps = sorted(best.items(), key=lambda kv: -kv[1]["r"])[:20]
+    if len(aps) < 2:
+        raise RuntimeError("可用于定位的 AP 少于 2 个，请等 ESP32 上传数据后再试")
+    body = {"considerIp": False, "fallbacks": {"lacf": False, "ipf": False},
+            "wifiAccessPoints": [{"macAddress": b, "signalStrength": int(o["r"]), "channel": o["c"]} for b, o in aps]}
+    r = requests.post("https://api.beacondb.net/v1/geolocate", json=body, headers=UA, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError("beaconDB 没有这些热点的位置记录(HTTP %d)，请手动输入经纬度" % r.status_code)
+    j = r.json()
+    return float(j["location"]["lat"]), float(j["location"]["lng"]), float(j.get("accuracy") or 100)
+
+
+def osm_scene(lat, lon, radius=260):
+    q = '[out:json][timeout:25];(way["building"](around:%d,%f,%f);way["highway"](around:%d,%f,%f););out geom 3000;' % (radius, lat, lon, radius, lat, lon)
+    last = None
+    for url in OVERPASS:
+        try:
+            r = requests.post(url, data={"data": q}, headers=UA, timeout=45)
+            if r.status_code == 200:
+                els = r.json().get("elements", [])
+                break
+            last = "HTTP %d" % r.status_code
+        except Exception as e:
+            last = str(e)
+    else:
+        raise RuntimeError("Overpass 不可用: %s" % last)
+    kx, ky = 111320.0 * math.cos(math.radians(lat)), 110540.0
+    buildings, roads = [], []
+    for e in els:
+        g = e.get("geometry")
+        if not g or len(g) < 2:
+            continue
+        pts = [[round((p["lon"] - lon) * kx, 1), round((p["lat"] - lat) * ky, 1)] for p in g]
+        tags = e.get("tags", {})
+        if "building" in tags:
+            h = None
+            try:
+                h = float(str(tags.get("height", "")).split()[0])
+            except Exception:
+                try:
+                    h = float(tags.get("building:levels")) * 3.2
+                except Exception:
+                    h = 6 + (e.get("id", 0) % 9) * 1.5
+            buildings.append({"h": round(h, 1), "pts": pts})
+        elif tags.get("highway") not in ("steps", "footway", "path", "corridor"):
+            roads.append(pts)
+    return buildings[:1800], roads[:1500]
+
+
+@app.get("/api/geo")
+def geo():
+    try:
+        if request.args.get("lat") and request.args.get("lon"):
+            lat, lon, acc, how = float(request.args["lat"]), float(request.args["lon"]), 0, "手动坐标"
+        else:
+            lat, lon, acc = wifi_geolocate()
+            how = "WiFi 定位(beaconDB)"
+        key = (round(lat, 3), round(lon, 3))
+        if key not in GEO_CACHE:
+            GEO_CACHE[key] = osm_scene(lat, lon)
+        b, r = GEO_CACHE[key]
+        return jsonify(ok=True, lat=lat, lon=lon, accuracy=acc, buildings=b, roads=r, label="OpenStreetMap 真实街区 · " + how)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+
+# ---------------------------------------------------------------- 隧道
+def _banner(url):
+    global PUBLIC_URL
+    PUBLIC_URL = url
+    line = "=" * 64
+    print("\n" + line)
+    print("🌐 全屏 3D 网站： " + url)
+    print('📟 ESP32 config.h： #define SERVER_URL "%s"' % url)
+    print("   或串口输入：     url %s" % url)
+    print("🔑 API_KEY：       %s" % API_KEY)
+    print(line + "\n", flush=True)
+    try:
+        from IPython.display import display, HTML as _H
+        display(_H('<a href="%s" target="_blank" style="font-size:18px">▶ 点此打开全屏 3D 世界</a>' % url))
+    except Exception:
+        pass
+
+
+def start_cloudflared():
+    exe = shutil.which("cloudflared") or "/tmp/cloudflared"
+    if not os.path.exists(exe):
+        print("[tunnel] 下载 cloudflared …")
+        urllib.request.urlretrieve("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", exe)
+        os.chmod(exe, 0o755)
+    p = subprocess.Popen([exe, "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def reader():
+        shown = False
+        for line in p.stdout:
+            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+            if m and not shown:
+                shown = True
+                _banner(m.group(0))
+    threading.Thread(target=reader, daemon=True).start()
+    return p
+
+
+def start_ngrok():
+    _ensure("pyngrok")
+    from pyngrok import ngrok
+    ngrok.set_auth_token(NGROK_TOKEN)
+    _banner(ngrok.connect(PORT, "http").public_url.replace("http://", "https://"))
+
+
+def main():
+    from werkzeug.serving import make_server
+    srv = make_server("0.0.0.0", PORT, app, threaded=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
+    if USE_TUNNEL:
+        if NGROK_TOKEN:
+            start_ngrok()
+        else:
+            start_cloudflared()
+    else:
+        print("[server] 本地模式: http://127.0.0.1:%d" % PORT)
+    try:
+        while True:
+            time.sleep(30)
+            print("[status] frames=%d nodes=%s uptime=%ds" % (SEQ, list(NODES.keys()), time.time() - T0), flush=True)
+    except KeyboardInterrupt:
+        print("stopped")
+
+
+if __name__ == "__main__" or "ipykernel" in sys.modules:
+    main()
