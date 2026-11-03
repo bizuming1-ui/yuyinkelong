@@ -1,4 +1,4 @@
-// ESP32-S3 WiFi Radar 固件 v3.0
+// ESP32-S3 WiFi Radar 固件 v4.0
 // 流程：上电/复位 -> 立刻输出 RADARHELLO -> 扫描周围 AP -> 立刻输出 RADARJSON（不等联网）
 //       -> 周期性嗅探周围设备 -> 有配置时再连接 WiFi 并 HTTPS POST 到 Kaggle 的 /api/ingest
 //
@@ -25,7 +25,7 @@
 #include "esp_system.h"
 #include "config.h"
 
-#define FW_VERSION "3.0.0"
+#define FW_VERSION "4.0.0"
 
 #if ARDUINO_USB_CDC_ON_BOOT
 #define HAS_USB_PORT 1
@@ -91,6 +91,12 @@ static volatile uint32_t gScanMs = 0;
 static bool wifiTried = false;
 static uint32_t lastWifiTry = 0;
 static uint32_t lastHello = 0;
+// v4：自动发现网址（Kaggle 把最新网址发布到 ntfy.sh/<RADAR_TOPIC>）
+static String activeUrl;            // 当前实际使用的服务器网址（来自汇合点或 config.h）
+static uint32_t lastResolve = 0;
+static bool everResolved = false;
+static int consecFail = 0;
+static volatile int gResolveCode = 0;
 
 static const char* resetReason() {
   switch (esp_reset_reason()) {
@@ -168,7 +174,9 @@ static void sendHello() {
   d["mirror"] = (HAS_USB_PORT == 0 || MIRROR_UART_PORT) ? 1 : 0;
   d["up"] = millis() / 1000;
   d["ssid"] = cfgSsid;
-  d["url"] = cfgUrl;
+  d["url"] = activeUrl.length() ? activeUrl : cfgUrl;
+  d["topic"] = RADAR_TOPIC;
+  d["wifi"] = (int)WiFi.status();
   d["sdk"] = ESP.getSdkVersion();
   String out;
   serializeJson(d, out);
@@ -259,6 +267,7 @@ static void sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 
 static void sniffRound() {
   gState = "sniff";
+  wifiTried = false;   // v4 修复：嗅探会主动断开 WiFi，结束后要立刻重连上传，不能被 30 秒重试节流挡住
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_STA);
   delay(80);
@@ -283,9 +292,12 @@ static String macStr(const uint8_t* m) {
   return String(b);
 }
 
+static bool hasTopic();
+static bool hasTarget();
+
 // ---------------- WiFi 连接 / 上传（不阻塞：连不上就先放弃，30 秒后再试） ----------------
 static bool wifiReady() {
-  if (cfgSsid.length() == 0 || cfgUrl.length() == 0) return false;
+  if (cfgSsid.length() == 0 || !hasTarget()) return false;
   if (WiFi.status() == WL_CONNECTED) return true;
   if (wifiTried && millis() - lastWifiTry < WIFI_RETRY_MS) return false;
   wifiTried = true;
@@ -297,17 +309,82 @@ static bool wifiReady() {
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_CONNECT_MS) { delay(100); handleSerial(); }
   if (WiFi.status() == WL_CONNECTED) {
     logf("[wifi] connected ip=%s rssi=%d ch=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    wifiTried = false;   // v4 修复：重试节流只针对“连接失败”；成功后（含嗅探断线后）必须能立刻重连
     return true;
   }
   logf("[wifi] connect timeout (检查 SSID/密码，必须是 2.4GHz)；%d 秒后重试，期间只做串口输出", WIFI_RETRY_MS / 1000);
   return false;
 }
 
+// ---------------- v4：从汇合点读取 Kaggle 最新网址 ----------------
+static bool hasTopic() { return strlen(RADAR_TOPIC) > 0; }
+static bool hasTarget() { return cfgUrl.length() > 0 || hasTopic(); }
+
+// 读取 ntfy.sh/<topic> 最近 30 分钟内的消息，取时间最新的一条（Kaggle 每 4 分钟重发一次，所以始终有）
+static bool resolveUrl() {
+  lastResolve = millis();
+  if (!hasTopic() || WiFi.status() != WL_CONNECTED) return false;
+  String full = String("http://ntfy.sh/") + RADAR_TOPIC + "/json?poll=1&since=30m";
+  String payload;
+  int code = -1;
+  for (int attempt = 0; attempt < 2 && code != 200; attempt++) {
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (attempt == 0) {
+      WiFiClient c;
+      if (!http.begin(c, full)) continue;
+      code = http.GET();
+      if (code == 200) payload = http.getString();
+      http.end();
+    } else {  // http 不通时改用 https
+      WiFiClientSecure sc;
+      sc.setInsecure();
+      full.replace("http://", "https://");
+      if (!http.begin(sc, full)) continue;
+      code = http.GET();
+      if (code == 200) payload = http.getString();
+      http.end();
+    }
+  }
+  gResolveCode = code;
+  if (code != 200) {
+    logf("[topic] 读取汇合点失败 HTTP %d (%s)：检查 ESP32 是否真的能上外网", code, HTTPClient::errorToString(code).c_str());
+    return false;
+  }
+  String best = "";
+  uint32_t bestT = 0;
+  int pos = 0;
+  while (pos < (int)payload.length()) {
+    int nl = payload.indexOf('\n', pos);
+    if (nl < 0) nl = payload.length();
+    String line = payload.substring(pos, nl);
+    pos = nl + 1;
+    line.trim();
+    if (line.length() < 10) continue;
+    JsonDocument d;
+    if (deserializeJson(d, line)) continue;
+    if (String((const char*)(d["event"] | "")) != "message") continue;
+    uint32_t t = d["time"] | 0;
+    String m = String((const char*)(d["message"] | ""));
+    m.trim();
+    if (m.startsWith("http") && t >= bestT) { bestT = t; best = m; }
+  }
+  while (best.endsWith("/")) best.remove(best.length() - 1);
+  if (best.length() == 0) {
+    logf("[topic] 汇合点 '%s' 里还没有 Kaggle 发布的网址：请先在 Kaggle 运行脚本（它会自动发布）", RADAR_TOPIC);
+    return false;
+  }
+  if (best != activeUrl) logf("[topic] ✅ 发现 Kaggle 最新网址：%s", best.c_str());
+  activeUrl = best;
+  everResolved = true;
+  return true;
+}
+
 static int postFrame(const String& body) {
-  String url = cfgUrl + "/api/ingest";
+  String url = activeUrl + "/api/ingest";
   HTTPClient http;
   int code = -1;
-  if (cfgUrl.startsWith("https://")) {
+  if (activeUrl.startsWith("https://")) {
     WiFiClientSecure client;
     client.setInsecure();  // 隧道证书由 Cloudflare 签发；此处不校验证书链，数据本身不含隐私密钥
     if (!http.begin(client, url)) return -1;
@@ -423,7 +500,8 @@ void setup() {
   logf("[port] USB原生口=%s  UART口=%s", HAS_USB_PORT ? "输出" : "无(未启用CDC)", (HAS_USB_PORT == 0 || MIRROR_UART_PORT) ? "输出" : "关闭");
   showConfig();
   if (cfgSsid.length() == 0) logf("[info] 未配置 WiFi：只做串口输出（网页 USB 直连 / tools/serial_bridge.py 转发）");
-  else if (cfgUrl.length() == 0) logf("[info] 未配置 SERVER_URL：只做串口输出");
+  else if (!hasTarget()) logf("[info] 未配置 SERVER_URL/RADAR_TOPIC：只做串口输出");
+  else logf("[info] 自动发现网址：汇合点 ntfy.sh/%s（Kaggle 重开后网址变化也不用重新烧录）", RADAR_TOPIC);
   sendHello();
   xTaskCreatePinnedToCore(hbTask, "hb", 4096, nullptr, 1, nullptr, 0);
   logf("[boot] 开始扫描…（第一帧约 2 秒内）");
@@ -447,13 +525,28 @@ void loop() {
 
   if (millis() - lastHello > HELLO_EVERY_MS) sendHello();
   if (wifiReady()) {
-    gState = "upload";
-    int code = postFrame(body);
-    gLastHttp = code;
-    if (code >= 200 && code < 300) { okCount++; led(0, 40, 0); }
-    else { failCount++; led(40, 10, 0); }
-    logf("[upload] HTTP %d (ok=%u fail=%u)", code, (unsigned)okCount, (unsigned)failCount);
-  } else if (cfgSsid.length() && cfgUrl.length()) {
+    // 取得服务器网址：优先用汇合点上 Kaggle 发布的最新网址，其次用 config.h 的 SERVER_URL
+    if (hasTopic() && (!everResolved ? (lastResolve == 0 || millis() - lastResolve > 15000) : (millis() - lastResolve > TOPIC_REFRESH_MS || (consecFail >= 3 && millis() - lastResolve > 20000)))) {
+      gState = "resolve";
+      bool ok = resolveUrl();
+      consecFail = 0;
+      if (!ok && activeUrl.length() == 0) activeUrl = cfgUrl;
+    }
+    if (activeUrl.length() == 0) activeUrl = cfgUrl;
+    if (activeUrl.length() == 0) {
+      logf("[upload] 没有可用的服务器网址（汇合点里还没有，config.h 的 SERVER_URL 也没填）。USB 直连不受影响");
+      gLastHttp = -100;
+    } else {
+      gState = "upload";
+      int code = postFrame(body);
+      gLastHttp = code;
+      if (code >= 200 && code < 300) { okCount++; consecFail = 0; led(0, 40, 0); }
+      else { failCount++; consecFail++; led(40, 10, 0); }
+      if (code >= 200 && code < 300) logf("[upload] HTTP %d ✅ -> %s (ok=%u fail=%u)", code, activeUrl.c_str(), (unsigned)okCount, (unsigned)failCount);
+      else if (code == 401) logf("[upload] HTTP 401：API_KEY 与 Kaggle 脚本不一致 (ok=%u fail=%u)", (unsigned)okCount, (unsigned)failCount);
+      else logf("[upload] HTTP %d (%s) -> %s：网址可能已过期/Kaggle 已停，将重新读取汇合点 (ok=%u fail=%u)", code, HTTPClient::errorToString(code).c_str(), activeUrl.c_str(), (unsigned)okCount, (unsigned)failCount);
+    }
+  } else if (cfgSsid.length() && hasTarget()) {
     led(40, 0, 0);
   }
   cycleNo++;
