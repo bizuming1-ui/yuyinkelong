@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v4（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v5（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -16,6 +16,7 @@ WiFi 雷达 · Kaggle 单文件服务端 v4（ESP32-S3 -> Kaggle T4x2 GPU -> 全
     - 3D 网站零依赖（自带 Canvas 3D 引擎，不再依赖任何 CDN / WebGL）。
     - /api/ingest 接收 ESP32 (WiFi 直传 或 网页 USB 转发)，/api/frames 网页轮询。
     - 多 GPU：>=2 个 ESP32 节点同时看到同一个 AP 时，用 PyTorch 在 *所有* GPU 上分片并行做三边定位（2048 起点并行优化）。
+    - v5 CSI 感知：接收 ESP32 的 CSI（RADARCSI / 上传帧 cs / api/csi），在 GPU 上做 FFT：存在/运动指数/呼吸/活动类型（/api/sense）。
     - GPU 运动检测：把所有 AP 的 RSSI 时间序列堆成矩阵，在 GPU 上计算环境扰动指数。
     - 资源预算：显存（每卡 <=RADAR_VRAM_GB，默认 12GiB 内按需）、内存（RSSI 历史 <=RADAR_RAM_GB，默认 20GiB 上限）、
       磁盘（历史记录 JSONL 写到 /kaggle/temp，<=RADAR_DISK_GB，默认 45GiB，自动滚动删除最旧文件）。
@@ -41,7 +42,7 @@ PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
 
 
-VERSION = "4.0"
+VERSION = "5.0"
 EVENTS = collections.deque(maxlen=4000)
 EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
 _ECHO = {}
@@ -178,6 +179,7 @@ def ingest():
                 continue
         seq = SEQ
         nframes = n["frames"]
+        ncsi = csi_from_frame(f, t, nid)
     if nframes == 1 or nframes % 20 == 0:
         evt("OK", "ingest", "收到 %s 帧 #%d：node=%s 来自 %s · AP=%d · 设备=%d · 累计 %d 帧" % (src, seq, nid, n.get("ip"), len(f["aps"]), len(f.get("st") or []), nframes), echo=(nframes == 1 or nframes % 60 == 0))
     HIST_Q.append(json.dumps({"t": round(t, 2), "f": f}, ensure_ascii=False, separators=(",", ":")))
@@ -203,7 +205,7 @@ def frames():
         out = [dict(x, age=round(now_ - x.get("_t", now_), 1)) for x in out]
         status = {
             "gpu": GPU_NAMES, "frames": SEQ, "uptime": int(time.time() - T0), "public": PUBLIC_URL,
-            "motion": round(MOTION["v"], 3), "res": RES_TEXT,
+            "motion": round(MOTION["v"], 3), "res": RES_TEXT, "sense": SENSE["v"],
             "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(time.time() - v.get("last", 0), 1)} for k, v in NODES.items()},
         }
         return jsonify(seq=SEQ, frames=out, solved=SOLVED, status=status)
@@ -220,6 +222,7 @@ def server_diag(n_events=80):
         "series": len(SERIES), "series_maxlen": SERIES_MAXLEN, "events_file": EVT_FILE, "hist_dir": HIST_DIR,
         "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "src": v.get("src"), "fw": v.get("fw"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
         "solved": len(SOLVED), "motion": round(MOTION["v"], 3),
+        "csi": dict(CSI_STAT, nodes={k: len(v) for k, v in CSI.items()}, sense=SENSE["v"]),
     }
     try:
         if torch is not None and NGPU:
@@ -444,6 +447,191 @@ def motion_loop():
             MOTION["v"] = max(0.0, min(1.0, (cur - MOTION["base"]) / 1.6))
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------- v5：CSI 感知（GPU FFT）
+CSI = {}                # node -> deque[(t, rssi, mean_amp, turbulence)]
+CSI_LAST = {}           # node -> 固件时间戳去重
+CSI_STAT = {"batches": 0, "samples": 0, "last": 0.0, "from_wifi": 0, "from_usb": 0}
+CSI_MAXLEN = 72000      # 约 1 小时 @20Hz（每条 4 个 float，几十 MB）
+SENSE = {"v": None}
+SENSE_ACT = {"empty": "无人/无明显活动", "still": "静止（呼吸级）", "moving": "小幅动作", "walking": "走动/大幅动作"}
+
+
+def _csi_dq(node):
+    dq = CSI.get(node)
+    if dq is None:
+        dq = CSI[node] = collections.deque(maxlen=CSI_MAXLEN)
+    return dq
+
+
+def csi_from_frame(f, t, nid):
+    """ESP32 WiFi 直传帧里的 cs 特征序列：[[固件ms, rssi, 平均幅度x10, 湍流x1000], ...]"""
+    cs = f.get("cs")
+    if not isinstance(cs, dict) or not isinstance(cs.get("v"), list):
+        return 0
+    try:
+        now_fw = float(cs.get("now", 0))
+    except Exception:
+        return 0
+    n = 0
+    last = CSI_LAST.get(nid, -1)
+    if cs["v"] and cs["v"][0][0] < last - 1000:
+        last = -1
+    dq = _csi_dq(nid)
+    for v in cs["v"]:
+        try:
+            fw = float(v[0])
+            if fw <= last:
+                continue
+            tt = t - (now_fw - fw) / 1000.0
+            if dq and tt <= dq[-1][0]:
+                continue
+            dq.append((tt, float(v[1]), float(v[2]) / 10.0, float(v[3]) / 1000.0))
+            last = fw
+            n += 1
+        except Exception:
+            continue
+    CSI_LAST[nid] = last
+    if n:
+        CSI_STAT["samples"] += n
+        CSI_STAT["from_wifi"] += n
+        CSI_STAT["last"] = t
+    return n
+
+
+@app.route("/api/csi", methods=["POST", "OPTIONS"])
+def csi_ingest():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    key = request.headers.get("X-Key") or request.args.get("key")
+    origin_host = urlparse(request.headers.get("Origin", "") or "").netloc
+    same = request.headers.get("Sec-Fetch-Site") == "same-origin" or (origin_host != "" and origin_host == request.host)
+    if key != API_KEY and not same:
+        return jsonify(ok=False, error="bad key"), 401
+    j = request.get_json(force=True, silent=True)
+    if not isinstance(j, dict) or not isinstance(j.get("v"), list):
+        return jsonify(ok=False, error="bad csi batch"), 400
+    node = str(j.get("node", "node"))
+    n = 0
+    with LOCK:
+        dq = _csi_dq(node)
+        for v in j["v"]:
+            try:
+                tt = float(v[0]) / 1000.0
+                if dq and tt <= dq[-1][0]:
+                    continue
+                dq.append((tt, float(v[1]), float(v[2]), float(v[3])))
+                n += 1
+            except Exception:
+                continue
+        CSI_STAT["batches"] += 1
+        CSI_STAT["samples"] += n
+        CSI_STAT["from_usb"] += n
+        CSI_STAT["last"] = time.time()
+    if CSI_STAT["batches"] == 1:
+        evt("OK", "csi", "收到第一批 CSI（网页 USB 转发）：node=%s %d 条" % (node, n), echo=True)
+    return jsonify(ok=True, n=n)
+
+
+@app.get("/api/sense")
+def api_sense():
+    return jsonify(sense=SENSE["v"], stat=CSI_STAT, nodes={k: len(v) for k, v in CSI.items()})
+
+
+def _band(x, fs, f0, f1, dev):
+    """x: 1D numpy。GPU 上做去趋势 + Hann + 补零 FFT，返回 (峰值频率, 峰值/中位数 SNR, 峰值幅度)。"""
+    import numpy as np
+    n = len(x)
+    if torch is not None:
+        t = torch.tensor(x, dtype=torch.float32, device=dev).view(1, 1, -1)
+        k = 51 if n > 120 else 11
+        trend = torch.nn.functional.avg_pool1d(t, k, 1, k // 2, count_include_pad=False)
+        y = (t - trend).view(-1)
+        y = y * torch.hann_window(n, device=dev)
+        sp = torch.fft.rfft(y, n=4096).abs().cpu().numpy() / n
+    else:
+        k = 51 if n > 120 else 11
+        tr = np.convolve(x, np.ones(k) / k, mode="same")
+        y = (x - tr) * np.hanning(n)
+        sp = np.abs(np.fft.rfft(y, n=4096)) / n
+    fr = np.fft.rfftfreq(4096, 1.0 / fs)
+    m = (fr >= f0) & (fr <= f1)
+    if not m.any():
+        return 0.0, 0.0, 0.0
+    s = sp[m]
+    i = int(s.argmax())
+    med = float(np.median(s)) or 1e-9
+    return float(fr[m][i]), float(s[i] / med), float(s[i])
+
+
+def sense_loop():
+    import numpy as np
+    floor_hist = collections.deque(maxlen=180)
+    st = {"present": False, "on": 0.0, "off": 0.0}
+    dev = torch.device("cuda:0" if NGPU else "cpu") if torch is not None else None
+    while True:
+        time.sleep(1.0)
+        try:
+            now = time.time()
+            with LOCK:
+                best = None
+                for nid, dq in CSI.items():
+                    if dq and now - dq[-1][0] < 8 and (best is None or dq[-1][0] > best[1][-1][0]):
+                        best = (nid, dq)
+                if best is None:
+                    SENSE["v"] = None
+                    continue
+                arr = np.array([x for x in list(best[1])[-1500:] if now - x[0] < 45], dtype=np.float64)
+            if len(arr) < 20:
+                continue
+            t, r, m, d = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+            age = now - t[-1]
+            w2 = t > now - 2.5
+            w1 = t > now - 1.2
+            mv = float(d[w2].mean()) if w2.any() else 0.0
+            mv1 = float(d[w1].mean()) if w1.any() else mv
+            if age < 3:
+                floor_hist.append(mv1)
+            floor = max(0.004, float(np.percentile(list(floor_hist), 20)) * 1.1) if len(floor_hist) >= 8 else 0.0
+            level = mv / floor if floor else 0.0
+            tt = np.arange(now - 6, now, 0.05)
+            dd = np.interp(tt, t, d)
+            dom, _, _ = _band(dd, 20.0, 0.5, 8.0, dev)
+            breath, snr = 0.0, 0.0
+            if t[0] < now - 26 and age < 3:
+                tm = np.arange(now - 32, now, 0.1)
+                mm = np.interp(tm, t, m)
+                bf, snr, bp = _band(mm, 10.0, 0.1, 0.55, dev)
+                if snr >= 5 and bp > 0.02:
+                    breath = bf * 60.0
+            if floor and age < 3:
+                if not st["present"] and level > 2.6:
+                    st["on"] = st["on"] or now
+                    if now - st["on"] > 0.9:
+                        st["present"], st["off"] = True, 0.0
+                elif not st["present"]:
+                    st["on"] = 0.0
+                if st["present"] and level < 1.7:
+                    st["off"] = st["off"] or now
+                    if now - st["off"] > 5:
+                        st["present"], st["on"] = False, 0.0
+                elif st["present"]:
+                    st["off"] = 0.0
+            elif age >= 3:
+                st["present"], st["on"] = False, 0.0
+            if st["present"]:
+                act = "walking" if (level >= 7 and dom >= 0.5) else "moving" if level >= 3.5 else ("still" if breath else "moving")
+            elif breath and level < 1.7:
+                act = "still"
+            else:
+                act = "empty"
+            SENSE["v"] = {"node": best[0], "n": int(len(arr)), "age": round(age, 1), "rate": round(float(w2.sum()) / 2.5, 1),
+                          "level": round(level, 2), "floor": round(floor, 4), "present": bool(st["present"] or act == "still"),
+                          "act": act, "act_txt": SENSE_ACT[act], "breath": round(breath, 1), "snr": round(snr, 2), "dom": round(dom, 2),
+                          "gpu": (GPU_NAMES[0] if NGPU else "CPU"), "t": round(now, 1)}
+        except Exception as e:
+            evt_rate("sense_err", 30, "ERR", "csi", "CSI 分析出错：%r" % (e,), echo=True)
 
 
 def _meminfo():
@@ -722,7 +910,7 @@ def main():
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
     evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
-    for fn in (motion_loop, res_loop, hist_writer, publish_loop):
+    for fn in (motion_loop, sense_loop, res_loop, hist_writer, publish_loop):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
     if USE_TUNNEL:
