@@ -23,6 +23,18 @@
 #define RADAR_TOPIC "wradar-bzm-5f2k9q7d"
 #define TOPIC_REFRESH_MS 300000   // 每 5 分钟重新读取一次最新网址（上传连续失败 3 次也会立刻重读）
 
+// 3.8) 【v5 新增·CSI 真实 WiFi 感知】人体存在 / 运动 / 呼吸 / 粗略活动 都来自 CSI（不是 RSSI）。
+//      要稳定的 CSI：必须填好上面的 WIFI_SSID/WIFI_PASS（ESP32 连路由器，对网关 ping，取回包的 CSI）。
+//      没填 WiFi 时进入被动监听（实验）：只有路由器信标是 OFDM 速率才有 CSI。
+#define ENABLE_CSI 1
+#define CSI_PING_HZ 25          // 对网关 ping 频率：越高时间分辨率越好（路由器通常撑得住 50）
+#define CSI_EMIT_HZ 20          // 串口输出/特征序列的最大 CSI 速率（包/秒）
+#define CSI_FEAT_N 128          // 上传时附带的最近特征条数（≈ 6~10 秒）
+#define CSI_QUEUE_LEN 48
+#define CSI_SCAN_PERIOD_MS 10000 // 已连路由器时，两轮 AP 扫描的间隔（扫描会打断 CSI 约 2 秒）
+#define SNIFF_EVERY_CSI 30       // 已连路由器时，每 N 轮才做一次设备嗅探（嗅探会断线）
+#define CSI_PASSIVE_MS 6000      // 没连路由器时，每轮扫描后被动监听 CSI 的时间
+
 // ------------------ 以下一般不用改 ------------------
 // 本节点在世界坐标中的位置(米)。单节点保持 0,0；多个 ESP32 做三边定位时分别填写，+Y 方向视为正北。
 #define NODE_X 0.0f
