@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v2（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v3（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -21,8 +21,11 @@ WiFi 雷达 · Kaggle 单文件服务端 v2（ESP32-S3 -> Kaggle T4x2 GPU -> 全
       磁盘（历史记录 JSONL 写到 /kaggle/temp，<=RADAR_DISK_GB，默认 45GiB，自动滚动删除最旧文件）。
     - 隧道：cloudflared 自动重试 + 公网自检；可选 ngrok（环境变量 NGROK_TOKEN）。
     - /api/geo：beaconDB WiFi 定位 + OpenStreetMap 真实街区（建筑/道路）。
+    - 全能检测：/api/diag(JSON) 与 /api/diag.txt(纯文本，可直接复制到 GitHub “检测日志”)；
+      网页端日志经 /api/clientlog 汇总到这里，同时写入 /kaggle/working/radar_diag.log（可在 Kaggle Output 下载）。
 """
 import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections, random, glob
+from urllib.parse import urlparse
 
 API_KEY = os.environ.get("RADAR_KEY", "radar-key")        # 必须与 ESP32 config.h 里的 API_KEY 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
@@ -35,6 +38,39 @@ RESTARTS = int(os.environ.get("RADAR_RESTARTS", "2048"))   # 每个 AP 的并行
 UA = {"User-Agent": "wifi-radar-esp32s3/2.0 (personal project)"}
 PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
+
+
+VERSION = "3.0"
+EVENTS = collections.deque(maxlen=4000)
+EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
+_ECHO = {}
+_EVT_N = [0]
+TUNNEL = {"state": "未启动", "url": "", "attempts": 0, "probe": ""}
+
+
+def evt(level, cat, msg, echo=False, t=None):
+    """记录一条检测事件：内存环形缓冲 + 磁盘日志文件；echo=True 时同时打印到 Notebook 输出。"""
+    e = {"t": round(t or time.time(), 3), "lv": level, "c": cat, "m": str(msg)[:700]}
+    EVENTS.append(e)
+    line = "%s %s [%s] %s" % (time.strftime("%H:%M:%S", time.localtime(e["t"])), level, cat, e["m"])
+    try:
+        _EVT_N[0] += 1
+        if _EVT_N[0] % 500 == 0 and os.path.exists(EVT_FILE) and os.path.getsize(EVT_FILE) > 64 * 1024 ** 2:
+            open(EVT_FILE, "w").close()
+        with open(EVT_FILE, "a", encoding="utf8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+    if echo:
+        print(line, flush=True)
+
+
+def evt_rate(key, secs, level, cat, msg, echo=True):
+    now = time.time()
+    if now - _ECHO.get(key, 0) < secs:
+        return
+    _ECHO[key] = now
+    evt(level, cat, msg, echo=echo)
 
 
 def _ensure(mod, pip=None):
@@ -117,6 +153,20 @@ button.pri:hover{filter:brightness(1.1)}
 #toast{position:fixed;left:50%;top:18px;transform:translateX(-50%);background:#0d2236;border:1px solid var(--cy);padding:8px 16px;border-radius:10px;z-index:20;display:none;max-width:80vw}
 #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:#02060d;z-index:30;text-align:center}
 @media(max-width:900px){#side{display:none}#actbox{right:14px}#hud{width:300px}#legend{display:none}}
+
+#dgp{display:none;position:fixed;right:360px;top:14px;bottom:14px;width:min(560px,60vw);z-index:40;flex-direction:column;padding:10px}
+#dgp h3{margin:0 0 6px;font-size:14px;display:flex;align-items:center;gap:6px}
+#dgp h3 span{flex:1}
+.dgsum{padding:6px 9px;border-radius:8px;font-size:12.5px;margin-bottom:6px;border:1px solid var(--bd);background:#0a1626;word-break:break-all}
+.dgsum.ok{border-color:rgba(46,230,166,.5);color:var(--ac)}.dgsum.wait{color:var(--cy)}.dgsum.warn{border-color:rgba(255,210,63,.5);color:#ffd23f}.dgsum.bad{border-color:rgba(255,77,109,.6);color:#ff8fa0}
+#dgChecks{max-height:34%;overflow:auto;font-size:12px}
+.ck{padding:3px 6px;border-left:3px solid #345;margin:2px 0;background:rgba(255,255,255,.02)}
+.ck b{display:block}.ck span{color:#b6cddc;word-break:break-all}.ck i{display:block;color:#ffd23f;font-style:normal;word-break:break-all}
+.ck.ok{border-color:#2ee6a6}.ck.warn{border-color:#ffd23f}.ck.bad{border-color:#ff4d6d}.ck.wait{border-color:#4cc9f0}
+#dgLog{flex:1;overflow:auto;margin-top:6px;background:#050b14;border-radius:8px;padding:6px;font:11px/1.45 Consolas,Menlo,monospace}
+#dgLog .l{white-space:pre-wrap;word-break:break-all}#dgLog u{text-decoration:none;color:#58708a}#dgLog em{font-style:normal;color:#4cc9f0}
+#dgLog .ERR{color:#ff8fa0}#dgLog .WARN{color:#ffd23f}#dgLog .OK{color:#2ee6a6}#dgLog .INFO{color:#b6cddc}
+@media(max-width:900px){#dgp{right:14px;width:calc(100% - 28px)}}
 </style>
 </head>
 <body>
@@ -147,6 +197,8 @@ button.pri:hover{filter:brightness(1.1)}
   </div>
   <div class="btns">
     <button id="bSerial" class="pri">🔌 USB 连接 ESP32</button>
+    <button id="bRst">🔁 复位 ESP32</button>
+    <button id="bDiag">🩺 检测日志</button>
     <button id="bGeo">🌍 定位真实世界</button>
     <button id="bReset">复位视角 (R)</button>
     <button id="bFS">全屏 (F)</button>
@@ -174,7 +226,13 @@ button.pri:hover{filter:brightness(1.1)}
   <h2 id="wT">等待 ESP32 上传数据…</h2>
   <p id="wM">按一下 ESP32 的 <code>RESET</code> 键。网页已用 <b>自带 3D 引擎</b> 渲染（不依赖任何 CDN）。</p>
   <div class="diag" id="diag"></div>
-  <div class="btns" style="justify-content:center"><button class="pri" id="bSerial2">🔌 USB 直连 ESP32（最稳）</button><button id="bDemo">▶ 启动演示数据</button></div>
+  <div class="btns" style="justify-content:center"><button class="pri" id="bSerial2">🔌 USB 直连 ESP32（最稳）</button><button id="bDemo">▶ 启动演示数据</button><button id="bRst2">🔁 复位 ESP32</button><button id="bDiag2">🩺 检测日志</button></div>
+</div>
+<div id="dgp" class="panel">
+  <h3><span>🩺 全能检测系统 · 实时日志</span><button id="dgCopy" class="pri">📋 复制日志</button><button id="dgDl">⬇ 下载</button><button id="dgClr">清空</button><button id="dgX">✕</button></h3>
+  <div id="dgSum" class="dgsum">检测中…</div>
+  <div id="dgChecks"></div>
+  <div id="dgLog"></div>
 </div>
 <div id="toast"></div>
 <div id="err"><div><h2>⚠ 浏览器不支持 Canvas</h2><p id="errMsg"></p></div></div>
@@ -190,6 +248,182 @@ var esc = function (s) { return String(s).replace(/[&<>"']/g, function (c) { ret
 var now = function () { return Date.now() / 1000; };
 function lsGet(k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+
+/* ================= 全能检测系统 (DIAG) ================= */
+var DG = {
+  log: [], seq: 0, t0: Date.now(), pending: [], lastKey: {},
+  ser: { supported: ('serial' in navigator), open: false, bytes: 0, lines: 0, badChars: 0, jsonOK: 0, jsonBad: 0, hb: 0, other: 0, hello: null, helloAt: 0, hbInfo: null, hbAt: 0,
+    lastLine: '', lastRaw: '', firstAt: 0, openedAt: 0, lastJsonAt: 0, resets: 0, vid: 0, pid: 0, chip: '', mode: '', rstReason: '', lastErr: '', dtrOn: false, reconnects: 0, lastApCount: -1 },
+  srv: { ok: null, ms: null, err: '', info: null, at: 0, diag: null, diagAt: 0, postOK: 0, postFail: 0, lastPost: '', pollErr: '', pollOK: 0 },
+  r: { fps: 0, err: 0, lastErr: '', last: 0, n: 0 }
+};
+var INFRAME = (function () { try { return window.parent !== window; } catch (e) { return true; } })();
+function safeJson(x) { try { return typeof x === 'string' ? x : JSON.stringify(x); } catch (e) { return String(x); } }
+function p2(n) { return (n < 10 ? '0' : '') + n; }
+function fmtT(t) { var d = new Date(t); return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds()) + '.' + ('00' + d.getMilliseconds()).slice(-3); }
+function dlog(lv, cat, msg, x) {
+  var e = { n: ++DG.seq, t: Date.now(), lv: lv, c: cat, m: String(msg) + (x !== undefined ? ' ' + safeJson(x) : '') };
+  DG.log.push(e); if (DG.log.length > 1500) DG.log.shift();
+  DG.pending.push(e); if (DG.pending.length > 400) DG.pending.shift();
+  try { if (INFRAME) window.parent.postMessage({ type: 'wradar-log', e: e }, '*'); } catch (err) {}
+  try { if (lv === 'ERR' && window.console) console.error('[radar]', cat, e.m); } catch (err2) {}
+  return e;
+}
+function dlogRate(key, ms, lv, cat, msg, x) { var t = Date.now(); if (DG.lastKey[key] && t - DG.lastKey[key] < ms) return; DG.lastKey[key] = t; dlog(lv, cat, msg, x); }
+window.addEventListener('error', function (e) { dlogRate('jserr' + (e.message || ''), 3000, 'ERR', 'js', (e.message || 'error') + ' @' + String(e.filename || '').split('/').pop() + ':' + e.lineno); });
+window.addEventListener('unhandledrejection', function (e) { dlogRate('rej', 3000, 'ERR', 'js', '未处理的 Promise 错误：' + (e.reason && e.reason.message || e.reason)); });
+setInterval(function () {      // 浏览器日志同步到服务器（Kaggle 输出里也能看到）
+  if (SIM || !DG.pending.length) return;
+  var batch = DG.pending.splice(0, 80);
+  fetch('api/clientlog', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ page: String(location.href).slice(0, 140), entries: batch.map(function (e) { return { t: e.t, lv: e.lv, c: e.c, m: e.m }; }) }) })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); })
+    .catch(function () { DG.pending = batch.concat(DG.pending).slice(-300); });
+}, 3000);
+
+function envInfo() {
+  var gl = 'WebGL✗'; try { var c0 = document.createElement('canvas'); if (c0.getContext('webgl') || c0.getContext('experimental-webgl')) gl = 'WebGL✓'; } catch (e) {}
+  var pol = ''; try { var fp = document.featurePolicy || document.permissionsPolicy; if (fp && fp.allowsFeature) pol = fp.allowsFeature('serial') ? 'serial 权限=允许' : 'serial 权限=被禁止'; } catch (e2) {}
+  return { ua: navigator.userAgent, secure: !!window.isSecureContext, serial: 'serial' in navigator, iframe: INFRAME, gl: gl, policy: pol, screen: (window.innerWidth || 0) + 'x' + (window.innerHeight || 0) + '@' + (window.devicePixelRatio || 1), url: String(location.href).slice(0, 160), lang: navigator.language };
+}
+var WLST = { 0: '空闲', 1: '找不到SSID', 3: '已连接', 4: '连接失败', 5: '连接丢失', 6: '已断开' };
+function diagChecks() {
+  var tn = Date.now(), C = [], s = DG.ser, v = DG.srv, env = envInfo();
+  function add(id, name, st, msg, hint) { C.push({ id: id, name: name, st: st, msg: msg, hint: hint || '' }); }
+  // 1 浏览器
+  if (!g) add('env', '浏览器/页面', 'bad', 'Canvas 2D 不可用');
+  else if (!env.secure && location.hostname !== 'localhost' && !SIM) add('env', '浏览器/页面', 'warn', '非 https 页面，Web Serial 会被浏览器禁用（' + env.screen + '）', '请用 Kaggle 给出的 https://….trycloudflare.com 网址打开');
+  else add('env', '浏览器/页面', 'ok', (INFRAME ? '内嵌页(iframe) · ' : '独立页 · ') + env.gl + ' · ' + env.screen + (env.policy ? ' · ' + env.policy : ''));
+  // 2 渲染
+  var since = (tn - DG.r.last) / 1000;
+  if (DG.r.err > 0 && since < 3) add('render', '3D 渲染引擎', 'warn', '运行中 ' + DG.r.fps + ' FPS，但出现过 ' + DG.r.err + ' 次绘制异常（已自动恢复）：' + DG.r.lastErr);
+  else if (DG.r.last && since < 3) add('render', '3D 渲染引擎', 'ok', DG.r.fps + ' FPS · 相机 ' + Math.round(cam.dist) + ' m');
+  else add('render', '3D 渲染引擎', DG.r.n > 0 ? 'bad' : 'wait', DG.r.n > 0 ? '渲染停滞 ' + since.toFixed(0) + ' 秒（标签页在后台时属正常）' : '启动中…');
+  // 3 服务器
+  if (SIM) add('srv', '后端服务器', 'ok', '浏览器模拟器模式（无需后端）');
+  else if (v.ok === null) add('srv', '后端服务器', 'wait', '检测中…');
+  else if (v.ok) add('srv', '后端服务器', 'ok', '/api/health 正常 ' + (v.ms != null ? v.ms + 'ms' : '') + (v.info ? ' · 已收 ' + (v.info.frames || 0) + ' 帧 · 运行 ' + (v.info.uptime || 0) + 's' : ''));
+  else add('srv', '后端服务器', 'bad', '/api/health 无响应：' + v.err, '确认 Kaggle 的 Cell 还在运行；网址是否是最新一次运行输出的');
+  // 4 USB 串口
+  var serMsg;
+  if (SIM) add('ser', 'USB 串口', 'ok', '模拟器：虚拟串口');
+  else if (!s.supported) add('ser', 'USB 串口', 'warn', '此浏览器没有 Web Serial', '请用电脑版 Chrome / Edge；或改用 ESP32 自己联网上传(WiFi)');
+  else if (!s.open) add('ser', 'USB 串口', 'wait', '未连接' + (s.lastErr ? '（上次错误：' + s.lastErr + '）' : '') + (jsonCount() > 0 ? '' : ' → 点「🔌 USB 连接 ESP32」，选择板子的串口'));
+  else {
+    var age = (tn - s.openedAt) / 1000;
+    if (s.bytes === 0) add('ser', 'USB 串口', age < 3.5 ? 'wait' : 'bad', '已打开 ' + age.toFixed(0) + ' 秒，收到 0 字节', '① 换板子上另一个 USB 口再连一次（USB 口/UART 口各试一次）② 关闭 PlatformIO 串口监视器等占用程序 ③ 确认烧录的是本项目新版固件，烧录后按 RESET ④ 换一根能传数据的 USB 线');
+    else if (s.mode === 'download') add('ser', 'USB 串口', 'bad', 'ESP32 停在下载模式（ROM 提示 waiting for download）', '松开 BOOT 键，按一下 RESET；或点「🔁 复位 ESP32」');
+    else if (s.hb + s.jsonOK === 0 && !s.hello && s.badChars > s.bytes * 0.3) add('ser', 'USB 串口', 'bad', '收到 ' + s.bytes + ' 字节但大多是乱码', '端口/波特率不对：换另一个口；固件 monitor_speed 与 SERIAL_BAUD 都应为 115200');
+    else if (s.jsonOK > 0) {
+      var st = (tn - s.lastJsonAt) / 1000;
+      if (st > 10) add('ser', 'USB 串口', 'bad', '数据中断 ' + st.toFixed(0) + ' 秒（已收 ' + s.jsonOK + ' 帧）', '检查 USB 线/供电；固件是否重启（见下方“ESP32 固件”）');
+      else add('ser', 'USB 串口', s.jsonBad > s.jsonOK * 0.2 ? 'warn' : 'ok', '已收 ' + s.jsonOK + ' 帧 · ' + s.bytes + ' 字节' + (s.jsonBad ? ' · 解析失败 ' + s.jsonBad : ''));
+    } else if (s.hb > 0 || s.hello) {
+      var hs = s.hbInfo ? s.hbInfo.st : '?';
+      add('ser', 'USB 串口', age > 12 ? 'bad' : 'wait', '固件在线（状态 ' + hs + '），等待第一轮扫描结果' + (age > 12 ? ' —— 已超过 12 秒' : ''), age > 12 ? '固件卡在 “' + hs + '”：scan=扫描异常；sniff=嗅探；wifi=连 WiFi（可把 config.h 的 WIFI_SSID 留空）' : '');
+    } else add('ser', 'USB 串口', 'bad', '收到 ' + s.bytes + ' 字节，但没有 RADAR 协议行', '多半烧录的是旧版/别的固件：用 PlatformIO 重新 Upload 本项目 firmware，再按 RESET。最近一行：' + (s.lastLine || s.lastRaw || '(无)'));
+  }
+  // 5 固件
+  if (SIM) add('fw', 'ESP32 固件', 'ok', '虚拟 ESP32-S3');
+  else if (s.hello || s.hbInfo) {
+    var h = s.hello || {}, b = s.hbInfo || {}, rst = h.rst || s.rstReason || '?', bad = /PANIC|WDT|BROWNOUT/.test(rst);
+    var low = b.heap && b.heap < 40000;
+    add('fw', 'ESP32 固件', bad || low ? 'warn' : 'ok', 'v' + (h.fw || b.fw || '?') + ' · ' + (b.node || h.node || '') + ' · ' + (h.chip || 'ESP32') + (h.rev != null ? ' r' + h.rev : '') + ' · 复位原因 ' + rst + ' · 运行 ' + (b.up != null ? b.up : '?') + 's · 状态 ' + (b.st || '?') + ' · 空闲堆 ' + (b.heap || '?') + ' · 输出口 USB=' + (h.usb ? '✓' : '✗') + ' UART=' + (h.mirror ? '✓' : '✗'),
+      bad ? '芯片异常重启（' + rst + '）：检查供电/USB 线；BROWNOUT=供电不足' : '');
+  } else if (s.open && s.bytes > 0 && s.jsonOK > 0) add('fw', 'ESP32 固件', 'warn', '旧版固件（无 HELLO/心跳），数据可用', '建议用 PlatformIO 重新 Upload 新版固件，获得完整诊断')
+  else if (s.open && s.bytes > 0) add('fw', 'ESP32 固件', 'bad', '未识别到本项目新版固件', '用 PlatformIO 重新 Upload');
+  else add('fw', 'ESP32 固件', 'wait', '尚未收到固件信息');
+  // 6 ESP32 WiFi 上传
+  var nodes = SERVER && SERVER.nodes ? SERVER.nodes : null, b2 = s.hbInfo || {}, h2 = s.hello || {};
+  if (SIM) add('wifi', 'ESP32 WiFi 上传', 'ok', '模拟器：模拟上传 HTTP 200');
+  else if (nodes && Object.keys(nodes).length) {
+    var pick = Object.keys(nodes).filter(function (k) { return nodes[k].ip; }), txt = Object.keys(nodes).map(function (k) { return k + ' 来自 ' + (nodes[k].ip || '?') + ' ' + nodes[k].age + 's 前(' + nodes[k].frames + '帧)'; }).join('；');
+    add('wifi', 'ESP32 WiFi 上传', 'ok', '服务器已收到：' + txt);
+  } else if (h2.ssid === '' && s.hello) add('wifi', 'ESP32 WiFi 上传', 'ok', '固件未配置 WiFi：仅 USB 直连模式（正常，无需联网）');
+  else if (s.hello && (b2.ok || 0) > 0) add('wifi', 'ESP32 WiFi 上传', 'ok', '固件上传成功 ' + b2.ok + ' 次');
+  else if (s.hello && (b2.fail || 0) > 0) add('wifi', 'ESP32 WiFi 上传', 'warn', '固件上传失败 ' + b2.fail + ' 次，最近 HTTP ' + b2.http + ' · WiFi ' + (WLST[b2.wifi] || b2.wifi), 'HTTP -1=网址错/Cell 已停/ESP32 没联网；401=API_KEY 不一致；WiFi 必须是 2.4GHz');
+  else if (s.hello && h2.ssid) add('wifi', 'ESP32 WiFi 上传', 'wait', '固件已配置 WiFi「' + h2.ssid + '」：' + (WLST[b2.wifi] || b2.wifi) + '（不影响 USB 直连）');
+  else add('wifi', 'ESP32 WiFi 上传', 'wait', '服务器尚无 ESP32 节点（USB 直连模式可忽略）');
+  // 7 页面转发到服务器
+  if (!SIM && jsonCount() > 0) add('relay', 'USB → 服务器转发', v.postFail > 0 && v.postOK === 0 ? 'warn' : 'ok', '成功 ' + v.postOK + ' · 失败 ' + v.postFail + (v.lastPost ? ' · 最近 ' + v.lastPost : ''), v.postFail > 0 && v.postOK === 0 ? '本地 3D 不受影响；多节点三边定位/GPU 需要服务器收到数据' : '');
+  // 8 数据
+  var nl = 0; APS.forEach(function (a) { if (a.live) nl++; });
+  if (frameCount === 0) add('data', '扫描数据', 'wait', '还没有任何数据帧');
+  else { var fa = (tn / 1000 - lastFrameAt); add('data', '扫描数据', fa > 10 ? 'bad' : (nl === 0 ? 'warn' : 'ok'), '共 ' + frameCount + ' 帧 · 实时 AP ' + nl + ' · 设备 ' + STAS.size + ' · 最近一帧 ' + fa.toFixed(1) + 's 前' + (mode === 'demo' ? ' · (演示数据)' : ''), nl === 0 ? 'ESP32 扫到 0 个 AP：天线/位置/扫描是否异常' : ''); }
+  // 9 GPU
+  if (SIM) add('gpu', 'Kaggle GPU', 'wait', '模拟器无 GPU');
+  else if (SERVER) add('gpu', 'Kaggle GPU', SERVER.gpu && SERVER.gpu.length ? 'ok' : 'warn', (SERVER.gpu && SERVER.gpu.length ? SERVER.gpu.join(' + ') : '无 GPU（CPU 模式）') + (SERVER.res ? ' · ' + SERVER.res : ''), SERVER.gpu && SERVER.gpu.length ? '' : 'Kaggle: Settings → Accelerator 选 GPU T4 x2');
+  else add('gpu', 'Kaggle GPU', 'wait', '等待服务器状态');
+  var rank = { ok: 0, wait: 1, warn: 2, bad: 3 }, lv = 'ok', first = null;
+  C.forEach(function (c) { if (rank[c.st] > rank[lv]) lv = c.st; if (!first && c.st === 'bad') first = c; });
+  if (!first) C.forEach(function (c) { if (!first && c.st === 'warn') first = c; });
+  if (!first) C.forEach(function (c) { if (!first && c.st === 'wait' && c.id !== 'gpu' && c.id !== 'wifi') first = c; });
+  // GPU 提示不影响“数据链路是否正常”的总体结论
+  var gpuC = C.filter(function (c) { return c.id === 'gpu'; })[0];
+  lv = 'ok'; C.forEach(function (c) { if (c.id === 'gpu' && c.st !== 'bad') return; if (c.id === 'wifi' && c.st === 'wait') return; if (rank[c.st] > rank[lv]) lv = c.st; });
+  if (first && first.id === 'gpu') first = null;
+  var summary = first ? first.name + '：' + first.msg : '数据链路全部正常' + (gpuC && gpuC.st === 'warn' ? '（提示：' + gpuC.msg.split(' · ')[0] + '）' : '');
+  return { checks: C, level: lv, summary: summary, advice: first ? first.hint : (gpuC && gpuC.st === 'warn' ? gpuC.hint : '') };
+}
+function jsonCount() { return DG.ser.jsonOK; }
+function buildReport() {
+  var d = diagChecks(), env = envInfo(), s = DG.ser, L = [], ic = { ok: '[OK]  ', wait: '[WAIT]', warn: '[WARN]', bad: '[BAD] ' };
+  L.push('===== WiFi RADAR 检测日志 =====');
+  L.push('生成时间: ' + new Date().toISOString() + '  页面运行: ' + Math.round((Date.now() - DG.t0) / 1000) + 's');
+  L.push('页面: ' + env.url);
+  L.push('浏览器: ' + env.ua);
+  L.push('环境: secure=' + env.secure + ' webSerial=' + env.serial + ' iframe=' + env.iframe + ' ' + env.gl + ' ' + env.screen + ' ' + env.policy);
+  L.push('总体: ' + d.level.toUpperCase() + ' —— ' + d.summary + (d.advice ? '\n建议: ' + d.advice : ''));
+  L.push('');
+  L.push('--- 检测项 ---');
+  d.checks.forEach(function (c) { L.push(ic[c.st] + ' ' + c.name + ' : ' + c.msg + (c.hint && c.st !== 'ok' ? '\n         ↳ ' + c.hint : '')); });
+  L.push('');
+  L.push('--- 串口统计 ---');
+  L.push('open=' + s.open + ' bytes=' + s.bytes + ' lines=' + s.lines + ' badChars=' + s.badChars + ' jsonOK=' + s.jsonOK + ' jsonBad=' + s.jsonBad + ' hb=' + s.hb + ' other=' + s.other + ' resets=' + s.resets + ' reconnects=' + s.reconnects + ' dtr=' + s.dtrOn + ' mode=' + (s.mode || '-'));
+  L.push('端口: ' + (s.chip || '-') + ' vid=0x' + (s.vid || 0).toString(16) + ' pid=0x' + (s.pid || 0).toString(16));
+  L.push('最近一行: ' + (s.lastLine || '-'));
+  L.push('最近原始: ' + (s.lastRaw || '-'));
+  if (s.hello) L.push('HELLO: ' + safeJson(s.hello));
+  if (s.hbInfo) L.push('HB: ' + safeJson(s.hbInfo));
+  L.push('');
+  L.push('--- 服务器 ---');
+  L.push('health=' + safeJson({ ok: DG.srv.ok, ms: DG.srv.ms, err: DG.srv.err, info: DG.srv.info }));
+  L.push('转发: ok=' + DG.srv.postOK + ' fail=' + DG.srv.postFail + ' last=' + DG.srv.lastPost + ' poll=' + (DG.srv.pollErr || 'ok'));
+  if (SERVER) L.push('status=' + safeJson(SERVER));
+  if (DG.srv.diag) L.push('server-diag=' + safeJson(DG.srv.diag).slice(0, 3000));
+  L.push('');
+  L.push('--- 最近事件 (最多 220 条) ---');
+  DG.log.slice(-220).forEach(function (e) { L.push(fmtT(e.t) + ' ' + e.lv + ' [' + e.c + '] ' + e.m); });
+  return L.join('\n');
+}
+function copyTextPlain(text) {
+  function fb() { try { var ta = document.createElement('textarea'); ta.value = text; ta.style.cssText = 'position:fixed;opacity:0'; document.body.appendChild(ta); ta.select(); var ok = document.execCommand('copy'); ta.remove(); return ok; } catch (e) { return false; } }
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return fb(); });
+  return Promise.resolve(fb());
+}
+function downloadText(name, text) { var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' })); a.download = name; document.body.appendChild(a); a.click(); setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
+var ICN = { ok: '✅', wait: '⏳', warn: '⚠️', bad: '❌' };
+function renderChecksHtml(d) { return d.checks.map(function (c) { return '<div class="ck ' + c.st + '"><b>' + ICN[c.st] + ' ' + esc(c.name) + '</b><span>' + esc(c.msg) + '</span>' + (c.hint && c.st !== 'ok' ? '<i>↳ ' + esc(c.hint) + '</i>' : '') + '</div>'; }).join(''); }
+function renderDiagPanel() {
+  var d = diagChecks();
+  $('dgSum').className = 'dgsum ' + d.level; $('dgSum').textContent = ICN[d.level] + ' ' + d.summary + (d.advice ? '  ↳ ' + d.advice : '');
+  $('dgChecks').innerHTML = renderChecksHtml(d);
+  var box = $('dgLog'), stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  box.innerHTML = DG.log.slice(-160).map(function (e) { return '<div class="l ' + e.lv + '"><u>' + fmtT(e.t) + '</u> <em>' + esc(e.c) + '</em> ' + esc(e.m) + '</div>'; }).join('');
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+var dgOpen = false;
+function toggleDiag(v) { dgOpen = v === undefined ? !dgOpen : v; $('dgp').style.display = dgOpen ? 'flex' : 'none'; if (dgOpen) renderDiagPanel(); }
+setInterval(function () { if (dgOpen) renderDiagPanel(); }, 1000);
+setInterval(function () {      // 每 2 秒把检测结果发给外层“浏览器模拟器”，由它显示在右上角
+  if (!INFRAME) return;
+  var d = diagChecks();
+  try { window.parent.postMessage({ type: 'wradar-diag', level: d.level, summary: d.summary, advice: d.advice, checks: d.checks, report: buildReport(), frames: frameCount, aps: APS.size }, '*'); } catch (e) {}
+}, 2000);
+window.addEventListener('message', function (ev) {
+  var m = ev.data; if (!m || m.type !== 'wradar-cmd') return;
+  if (m.cmd === 'serialConnect') serialConnect(false); else if (m.cmd === 'serialReset') serialReset('外层面板'); else if (m.cmd === 'demo') startDemo();
+});
+dlog('INFO', 'page', '页面启动', envInfo());
 
 /* ================= 设置 ================= */
 var S = Object.assign({ n: 2.8, tx: -40, labels: true, sweep: true, stations: true, buildings: true, heat: true, rotate: false }, lsGet('wradar2.settings', {}));
@@ -212,35 +446,45 @@ var AUTH = { 0: ['开放', '#ff4d6d'], 1: ['WEP', '#ff9f1c'], 2: ['WPA', '#ffd23
 function authInfo(a) { return AUTH[a] || ['未知', '#99aabb']; }
 
 function ingest(f, src) {
+  try { ingest2(f, src); } catch (e) { dlogRate('ingest', 2000, 'ERR', 'data', '处理数据帧出错：' + e.message + ' @' + String((e.stack || '').split('\n')[1] || '').trim()); }
+}
+function ingest2(f, src) {
   if (!f || !Array.isArray(f.aps)) return;
   var t = now(), id = f.node || 'node';
+  if (src === 'poll' && typeof f.age === 'number' && f.age > 20) return;   // 服务器缓存的旧帧不当作实时数据
   if (src === 'poll' && f.seq != null) { var k = id + ':' + f.seq; if (SEEN.has(k) && t - SEEN.get(k) < 60) return; }
   if (src === 'usb' && f.seq != null) SEEN.set(id + ':' + f.seq, t);
   if (SEEN.size > 800) { SEEN.forEach(function (v, k2) { if (t - v > 60) SEEN.delete(k2); }); }
   var nd = NODES.get(id);
-  if (!nd) { nd = { id: id, x: 0, y: 0, frames: 0 }; NODES.set(id, nd); }
+  if (!nd) { nd = { id: id, x: 0, y: 0, frames: 0 }; NODES.set(id, nd); dlog('INFO', 'data', '新节点：' + id + '（来源 ' + (src || 'wifi') + '）'); }
   nd.x = +f.x || 0; nd.y = +f.y || 0; nd.last = t; nd.fw = f.fw; nd.frames++; nd.src = src || 'wifi';
+  var good = 0;
   f.aps.forEach(function (a) {
-    if (!a.b) return;
+    if (!a || !a.b) return;
+    var r = +a.r; if (!isFinite(r)) return;
+    a.r = r; a.c = +a.c || 0; a.a = +a.a || 0;
     var b = String(a.b).toUpperCase(), ap = APS.get(b);
     if (!ap) { ap = { bssid: b, ssid: '', obs: new Map(), pulse: 0, hit: 0, first: t, live: false }; APS.set(b, ap); }
     if (a.s) ap.ssid = a.s;
     ap.ch = a.c; ap.auth = a.a; ap.last = t;
     if (typeof a.ang === 'number') ap.fixedAngle = a.ang;
     var o = ap.obs.get(id);
-    if (!o) { o = { k: new Kalman(a.r), raw: [], last: 0 }; ap.obs.set(id, o); }
-    o.raw.push(a.r); if (o.raw.length > 16) o.raw.shift();
-    o.rssi = o.k.update(a.r); o.last = t; o.lastRaw = a.r;
-    ap.pulse = 1;
+    if (!o) { o = { k: new Kalman(r), raw: [], last: 0 }; ap.obs.set(id, o); }
+    o.raw.push(r); if (o.raw.length > 16) o.raw.shift();
+    o.rssi = o.k.update(r); o.last = t; o.lastRaw = r;
+    ap.pulse = 1; good++;
   });
+  if (!good && frameCount < 3) dlogRate('zeroap', 5000, 'WARN', 'data', '这一帧没有可用 AP（ESP32 扫描到 0 个热点' + (f.err ? '，错误码 ' + f.err : '') + '）');
   if (Array.isArray(f.st)) {
-    f.st.forEach(function (s) {
-      var m = String(s.m).toUpperCase(), st = STAS.get(m);
-      if (!st) { st = { mac: m, rssi: s.r, first: t }; STAS.set(m, st); }
-      st.rssi = st.rssi * 0.5 + s.r * 0.5; st.ch = s.c; st.cnt = s.n; st.bssid = s.b ? String(s.b).toUpperCase() : st.bssid; st.last = t; st.node = id;
+    f.st.forEach(function (s2) {
+      if (!s2 || !s2.m) return;
+      var m = String(s2.m).toUpperCase(), st = STAS.get(m);
+      if (!st) { st = { mac: m, rssi: +s2.r || -80, first: t }; STAS.set(m, st); }
+      st.rssi = st.rssi * 0.5 + (+s2.r || -80) * 0.5; st.ch = s2.c; st.cnt = s2.n; st.bssid = s2.b ? String(s2.b).toUpperCase() : st.bssid; st.last = t; st.node = id;
     });
   }
   lastFrameAt = t; frameCount++; heatDirty = true;
+  if (frameCount === 1) dlog('OK', 'data', '🎉 3D 世界已收到第一帧：AP ' + good + ' 个，来源 ' + (src || 'wifi'));
   $('wait').style.display = 'none';
 }
 
@@ -502,7 +746,8 @@ function drawStations(t) {
     }
   });
 }
-function frame(tn) {
+function frameBody(tn) {
+  g.globalAlpha = 1; g.setLineDash && g.setLineDash([]);
   var dt = Math.min(0.1, (tn - lastT) / 1000); lastT = tn; var t = now();
   if (camGoal) {
     var k = 1 - Math.pow(0.001, dt);
@@ -522,8 +767,14 @@ function frame(tn) {
   drawNodes(t);
   drawStations(t);
   drawAPs(dt, t);
-  requestAnimationFrame(frame);
 }
+var fpsN = 0;
+function frame(tn) {
+  requestAnimationFrame(frame);          // 先排下一帧：任何绘制异常都不会让画面冻结
+  try { frameBody(tn); DG.r.last = Date.now(); DG.r.n++; fpsN++; }
+  catch (e) { DG.r.err++; DG.r.lastErr = e.message; dlogRate('render', 3000, 'ERR', 'render', '绘制异常（已自动恢复）：' + e.message + ' @' + String((e.stack || '').split('\n')[1] || '').trim()); }
+}
+setInterval(function () { DG.r.fps = fpsN; fpsN = 0; }, 1000);
 requestAnimationFrame(frame);
 
 /* ================= 交互 ================= */
@@ -582,7 +833,12 @@ $('sT').oninput = function () { S.tx = +this.value; heatDirty = true; sync(); sa
 $('bReset').onclick = resetView; $('bFS').onclick = toggleFS;
 $('bClr').onclick = function () { OVR = {}; lsSet('wradar2.bearing', OVR); toast('已清除手动方位'); };
 $('bDemo').onclick = startDemo; $('bDemo2').onclick = startDemo;
-$('bSerial').onclick = serialConnect; $('bSerial2').onclick = serialConnect;
+$('bSerial').onclick = serialToggle; $('bSerial2').onclick = serialToggle;
+$('bRst').onclick = function () { serialReset('手动'); }; $('bRst2').onclick = function () { serialReset('手动'); };
+$('bDiag').onclick = function () { toggleDiag(); }; $('bDiag2').onclick = function () { toggleDiag(true); }; $('dgX').onclick = function () { toggleDiag(false); };
+$('dgCopy').onclick = function () { copyTextPlain(buildReport()).then(function (ok) { toast(ok ? '✅ 检测日志已复制（可粘贴到 GitHub 的“检测日志”文件）' : '复制失败，请点“下载”'); }); };
+$('dgDl').onclick = function () { downloadText('wifi-radar-检测日志-' + Date.now() + '.txt', buildReport()); };
+$('dgClr').onclick = function () { DG.log = []; dlog('INFO', 'page', '日志已清空'); renderDiagPanel(); };
 $('bGeo').onclick = function () { loadGeo(); };
 Array.prototype.forEach.call(document.querySelectorAll('#nudge button'), function (b) { b.onclick = function () { var d = b.dataset.d.split(',').map(Number); GEOFF.x += d[0] * 5; GEOFF.y += d[1] * 5; }; });
 $('q').oninput = function () { renderList(); };
@@ -619,8 +875,12 @@ setInterval(function () {
   if (SIM) { sv.textContent = '模拟模式'; sv.className = 'chip warn'; }
   else if (srvOK === true) { sv.textContent = '服务器在线'; sv.className = 'chip ok'; } else if (srvOK === false) { sv.textContent = '服务器无响应'; sv.className = 'chip bad'; }
   renderList(); showDetail();
-  if (frameCount === 0) {
-    $('diag').innerHTML = SIM ? '' : ('<div>' + (srvOK ? '✅' : '⏳') + ' ① 网页与 3D 引擎已加载</div><div>' + (srvOK === true ? '✅' : srvOK === false ? '❌' : '⏳') + ' ② 后端 /api/health ' + (srvOK === false ? '无响应：' + esc(srvErr) : '') + '</div><div>⏳ ③ 等待 ESP32 数据：已收 0 帧' + (lastSerial ? '（串口：' + esc(lastSerial) + '）' : '') + '</div><div style="color:#7f9db3">ESP32 联网困难时请点“USB 直连”，由电脑转发。</div>');
+  if (frameCount === 0 && !SIM) {
+    var dd = diagChecks(), pick = null;
+    dd.checks.forEach(function (c) { if (!pick && (c.st === 'bad')) pick = c; });
+    $('diag').innerHTML = dd.checks.filter(function (c) { return c.id === 'env' || c.id === 'srv' || c.id === 'ser' || c.id === 'fw' || c.id === 'data'; }).map(function (c) { return '<div>' + ICN[c.st] + ' ' + esc(c.name) + '：' + esc(c.msg) + '</div>'; }).join('') + '<div style="color:#7f9db3">ESP32 联网困难时请点“USB 直连”，由电脑转发。完整诊断请点“🩺 检测日志”。</div>';
+    if (pick) { $('wT').textContent = '卡住了：' + pick.name; $('wM').textContent = pick.msg + (pick.hint ? ' —— ' + pick.hint : ''); }
+    else if (DG.ser.open) { $('wT').textContent = '等待 ESP32 上传数据…'; $('wM').textContent = DG.ser.hbInfo ? '固件在线（状态 ' + DG.ser.hbInfo.st + '），正在做第一轮扫描…' : '串口已打开，等待固件输出…'; }
   }
 }, 500);
 
@@ -630,7 +890,7 @@ async function poll() {
   if (SIM || mode === 'demo') return;
   try {
     var r = await fetch('api/frames?since=' + since, { cache: 'no-store' }); if (!r.ok) throw new Error('HTTP ' + r.status);
-    var j = await r.json(); since = j.seq || 0; SOLVED = j.solved || {}; SERVER = j.status || null;
+    var j = await r.json(); DG.srv.pollErr = ''; DG.srv.pollOK++; since = j.seq || 0; SOLVED = j.solved || {}; SERVER = j.status || null;
     (j.frames || []).forEach(function (f) { ingest(f, 'poll'); });
     srvMotion = SERVER && typeof SERVER.motion === 'number' ? SERVER.motion : null;
     if (SERVER) {
@@ -638,12 +898,21 @@ async function poll() {
       var res = SERVER.res ? ' · ' + SERVER.res : '';
       $('gpu').textContent = 'GPU: ' + gp + ' · 已接收 ' + (SERVER.frames || 0) + ' 帧' + res;
     }
-  } catch (e) { /* 健康检查负责提示 */ }
+  } catch (e) { DG.srv.pollErr = String(e.message || e); dlogRate('poll', 8000, 'WARN', 'server', '轮询 /api/frames 失败：' + DG.srv.pollErr); }
 }
 async function health() {
   if (SIM) { $('gpu').textContent = '浏览器模拟器：固件由页面虚拟（数据为演示）'; return; }
-  try { var r = await fetch('api/health', { cache: 'no-store' }); if (!r.ok) throw new Error('HTTP ' + r.status); srvOK = true; srvErr = ''; }
-  catch (e) { srvOK = false; srvErr = String(e.message || e); }
+  var t0 = performance.now();
+  try {
+    var r = await fetch('api/health', { cache: 'no-store' }); if (!r.ok) throw new Error('HTTP ' + r.status);
+    var hj = null; try { hj = await r.json(); } catch (e0) {}
+    if (srvOK !== true) dlog('OK', 'server', '后端 /api/health 正常', hj ? { frames: hj.frames, gpu: hj.gpu, uptime: hj.uptime } : undefined);
+    srvOK = true; srvErr = ''; DG.srv.ok = true; DG.srv.ms = Math.round(performance.now() - t0); DG.srv.info = hj; DG.srv.err = '';
+    if (Date.now() - DG.srv.diagAt > 10000) { DG.srv.diagAt = Date.now(); fetch('api/diag', { cache: 'no-store' }).then(function (x) { return x.json(); }).then(function (j) { DG.srv.diag = j; }).catch(function () {}); }
+  } catch (e) {
+    if (srvOK !== false) dlog('ERR', 'server', '后端 /api/health 失败：' + String(e.message || e));
+    srvOK = false; srvErr = String(e.message || e); DG.srv.ok = false; DG.srv.err = srvErr;
+  }
 }
 if (!SIM) { setInterval(poll, 1000); setInterval(health, 4000); health(); poll(); } else { $('gpu').textContent = '浏览器模拟器：固件由页面虚拟（数据为演示）'; }
 async function loadGeo() {
@@ -666,32 +935,180 @@ async function loadGeo() {
 
 /* ================= USB (Web Serial) 直连 ================= */
 function apiKey() { return lsGet('wradar2.key', 'radar-key'); }
+var SP = { port: null, token: 0, want: false, timers: [], rcTimer: null };
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function vidName(v) {
+  return v === 0x303A ? 'Espressif 原生 USB (USB-Serial/JTAG) → 板子上标 “USB” 的口' : v === 0x1A86 ? 'CH340/CH343 USB 转串口 → 板子上标 “UART/COM” 的口' : v === 0x10C4 ? 'CP210x USB 转串口 → 板子上标 “UART/COM” 的口' : v === 0x0403 ? 'FTDI 转串口' : v ? 'USB VID 0x' + v.toString(16) : '未知/虚拟串口';
+}
 async function postServer(f) {
   if (SIM) return;
+  var t = performance.now();
   try {
     var r = await fetch('api/ingest', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Key': apiKey() }, body: JSON.stringify(f) });
-    if (r.status === 401) { var k = prompt('服务器 API_KEY 不匹配，请输入 Kaggle 脚本里的 API_KEY：', apiKey()); if (k) lsSet('wradar2.key', k); }
-  } catch (e) { /* 离线也能本地显示 */ }
+    DG.srv.lastPost = 'HTTP ' + r.status + ' ' + Math.round(performance.now() - t) + 'ms';
+    if (r.ok) { DG.srv.postOK++; if (DG.srv.postOK === 1) dlog('OK', 'relay', '第一帧已转发到服务器 (' + DG.srv.lastPost + ')'); }
+    else { DG.srv.postFail++; dlogRate('post' + r.status, 6000, 'ERR', 'relay', '转发到服务器失败 HTTP ' + r.status + (r.status === 401 ? '（API_KEY 不一致）' : '') + '；本地 3D 仍正常显示'); }
+  } catch (e) { DG.srv.postFail++; DG.srv.lastPost = '异常 ' + e.message; dlogRate('postx', 6000, 'ERR', 'relay', '转发异常：' + e.message + '；本地 3D 仍正常显示'); }
+}
+function classifyLine(l) {
+  var s = DG.ser;
+  if (/waiting for download|DOWNLOAD\(USB|download mode/i.test(l)) { s.mode = 'download'; dlog('ERR', 'esp32', 'ESP32 处于下载模式：' + l.slice(0, 120)); return; }
+  var m = /rst:0x[0-9a-f]+ \(([A-Z_0-9]+)\)/i.exec(l); if (m) { s.rstReason = m[1]; if (s.mode === 'download') s.mode = ''; }
+  if (/Brownout/i.test(l)) dlog('ERR', 'esp32', '检测到欠压(Brownout)：供电不足，换 USB 线/口：' + l.slice(0, 100));
+  else if (/Guru Meditation|abort\(\)|Backtrace:|assert failed/i.test(l)) dlog('ERR', 'esp32', '固件崩溃：' + l.slice(0, 160));
+  else if (/invalid header|flash read err|No bootable app/i.test(l)) dlog('ERR', 'esp32', '启动失败（固件/分区损坏）：' + l.slice(0, 120));
+  else if (/\[wifi\]|\[upload\]|\[warn\]|\[info\]/.test(l)) dlog(/timeout|fail|HTTP (-1|4|5)/i.test(l) ? 'WARN' : 'INFO', 'esp32', l.slice(0, 200));
+  else if (s.other < 400) dlog('INFO', 'esp32', l.slice(0, 200));
 }
 function onSerialLine(l) {
-  var k = l.indexOf('RADARJSON:');
-  if (k >= 0) { try { var f = JSON.parse(l.slice(k + 10)); f.node = f.node || 'S3-USB'; ingest(f, 'usb'); postServer(f); } catch (e) {} }
-  else if (l) lastSerial = l.slice(0, 90);
+  var s = DG.ser, k;
+  if (!l) return;
+  s.lines++;
+  if ((k = l.indexOf('RADARJSON:')) >= 0) {
+    var f = null, txt = l.slice(k + 10);
+    try { f = JSON.parse(txt); } catch (e) { s.jsonBad++; dlogRate('jbad', 2000, 'ERR', 'serial', '帧 JSON 解析失败：' + e.message + ' · 长度 ' + txt.length + ' · 开头 ' + txt.slice(0, 60) + ' · 结尾 ' + txt.slice(-40) + '（可能丢字节：换 USB 线/口）'); return; }
+    if (!f || !Array.isArray(f.aps)) { s.jsonBad++; dlogRate('jbad2', 2000, 'ERR', 'serial', '帧缺少 aps 数组'); return; }
+    f.node = f.node || 'S3-USB';
+    s.jsonOK++; s.lastJsonAt = Date.now(); s.lastApCount = f.aps.length;
+    if (s.jsonOK === 1) dlog('OK', 'serial', '✅ 收到第一帧扫描数据：' + f.aps.length + ' 个 AP · 设备 ' + (f.st ? f.st.length : 0) + ' · node=' + f.node + ' · fw=' + (f.fw || '?') + ' · 扫描耗时 ' + (f.ms || '?') + 'ms');
+    else if (s.jsonOK % 10 === 0) dlog('INFO', 'serial', '帧 #' + f.seq + ' AP=' + f.aps.length + ' 设备=' + (f.st ? f.st.length : 0) + ' 累计 ' + s.jsonOK);
+    if (f.err) dlogRate('scanerr', 5000, 'WARN', 'esp32', 'ESP32 扫描返回错误码 ' + f.err);
+    ingest(f, 'usb'); postServer(f);
+  } else if ((k = l.indexOf('RADARHB:')) >= 0) {
+    try { var j = JSON.parse(l.slice(k + 8)); s.hbInfo = j; s.hbAt = Date.now(); s.hb++; if (s.hb === 1) dlog('OK', 'serial', '✅ 固件心跳已收到：fw=' + j.fw + ' node=' + j.node + ' 状态=' + j.st + ' 运行 ' + j.up + 's'); } catch (e2) { s.jsonBad++; }
+  } else if ((k = l.indexOf('RADARHELLO:')) >= 0) {
+    try { var h = JSON.parse(l.slice(k + 11)); var first = !s.hello; s.hello = h; s.helloAt = Date.now(); if (first) dlog('OK', 'serial', '✅ 固件自我介绍：v' + h.fw + ' ' + h.chip + ' r' + h.rev + ' · flash ' + Math.round((h.flash || 0) / 1048576) + 'MB · PSRAM ' + Math.round((h.psram || 0) / 1048576) + 'MB · 复位原因 ' + h.rst + ' · 输出口 USB=' + h.usb + ' UART=' + h.mirror + ' · WiFi配置=' + (h.ssid || '无')); } catch (e3) { s.jsonBad++; }
+  } else { s.other++; s.lastLine = l.slice(0, 140); classifyLine(l); }
 }
-async function serialConnect() {
-  if (!('serial' in navigator)) { toast('此浏览器不支持 Web Serial：请用电脑版 Chrome / Edge，并通过 https 或 localhost 打开本页', 8000); return; }
-  var port; try { port = await navigator.serial.requestPort(); } catch (e) { return; }
-  try { await port.open({ baudRate: 115200 }); } catch (e) { toast('串口打开失败：' + e.message + '（请关闭 PlatformIO 串口监视器等占用程序）', 8000); return; }
-  serialOn = true; mode = SIM ? 'sim' : 'live'; toast('✅ 已连接 ESP32 串口，按一下 RESET 键开始'); $('wM').textContent = '已连接 USB，正在等待第一轮扫描结果（约 2~5 秒）…';
-  var dec = new TextDecoder(), buf = '', reader = port.readable.getReader();
+async function serialWrite(str) {
+  if (!SP.port || !SP.port.writable) return false;
+  try { var w = SP.port.writable.getWriter(); try { await w.write(new TextEncoder().encode(str)); } finally { w.releaseLock(); } return true; }
+  catch (e) { dlogRate('wr', 4000, 'WARN', 'serial', '向 ESP32 写入失败：' + e.message); return false; }
+}
+async function sigs(p, o) { try { await p.setSignals(o); return true; } catch (e) { dlogRate('sig', 4000, 'WARN', 'serial', 'setSignals 失败/不支持：' + e.name + ' ' + e.message); return false; } }
+async function serialReset(why) {
+  if (!SP.port || !DG.ser.open) { toast('请先点「USB 连接 ESP32」'); return; }
+  DG.ser.resets++; DG.ser.mode = '';
+  dlog('INFO', 'serial', '复位 ESP32：RTS 低脉冲，DTR 始终为低（=正常启动，不进下载模式）· 原因：' + (why || '手动'));
+  await sigs(SP.port, { dataTerminalReady: false, requestToSend: true }); await sleep(160);
+  await sigs(SP.port, { dataTerminalReady: false, requestToSend: false });
+}
+function updateSerialBtn() {
+  var t = DG.ser.open ? '⏏ 断开 USB' : '🔌 USB 连接 ESP32';
+  $('bSerial').textContent = t; $('bSerial2').textContent = DG.ser.open ? '⏏ 断开 USB' : '🔌 USB 直连 ESP32（最稳）';
+}
+function startWatchdog(tok) {
+  SP.timers.forEach(clearTimeout); SP.timers = [];
+  function at(ms, fn) { SP.timers.push(setTimeout(function () { if (tok === SP.token && DG.ser.open) { try { fn(); } catch (e) { dlog('ERR', 'serial', '看门狗异常 ' + e.message); } } }, ms)); }
+  at(3500, function () { if (!DG.ser.bytes) { dlog('WARN', 'serial', '3.5 秒仍 0 字节：再发一次 hello 并复位一次'); serialWrite('hello\n'); serialReset('看门狗 #1'); } });
+  at(8000, function () {
+    if (!DG.ser.bytes) { dlog('WARN', 'serial', '8 秒仍 0 字节：尝试兼容模式（拉高 DTR，部分 TinyUSB-CDC 固件需要），持续 3 秒'); sigs(SP.port, { dataTerminalReady: true, requestToSend: false }); serialWrite('hello\n'); }
+  });
+  at(11500, function () {
+    if (!DG.ser.bytes) {
+      sigs(SP.port, { dataTerminalReady: false, requestToSend: false });
+      dlog('ERR', 'serial', '❌ 11 秒内串口没有任何数据。端口：' + (DG.ser.chip || '?') + '。请：换板子另一个 USB 口重连；关闭 PlatformIO 串口监视器；重新 Upload 新版固件；换数据线。');
+    } else { DG.ser.dtrOn = true; dlog('OK', 'serial', '兼容模式生效：此板需要 DTR 才输出（已保持开启）'); }
+  });
+  at(12000, function () { var s = DG.ser; if (s.bytes && s.jsonOK === 0) dlog('ERR', 'serial', '有串口数据但 12 秒内没有扫描帧。固件状态=' + (s.hbInfo ? s.hbInfo.st : '未知') + '，最近一行：' + (s.lastLine || s.lastRaw)); });
+}
+async function readLoop(port, tok) {
+  var dec = new TextDecoder('utf-8'), buf = '', s = DG.ser, fatal = false;
+  while (port.readable && tok === SP.token && !fatal) {
+    var reader = port.readable.getReader();
+    try {
+      for (;;) {
+        var rr = await reader.read(); if (rr.done) { fatal = true; break; }
+        var v = rr.value; if (!v || !v.length) continue;
+        s.bytes += v.length; if (!s.firstAt) { s.firstAt = Date.now(); dlog('OK', 'serial', '✅ 收到第一批串口数据 ' + v.length + ' 字节（串口通路正常）'); }
+        var chunk = dec.decode(v, { stream: true });
+        var bc = (chunk.match(/\uFFFD/g) || []).length; s.badChars += bc;
+        var vis = chunk.replace(/[\r\n]+/g, ' ').trim(); if (vis) s.lastRaw = vis.slice(-90);
+        buf += chunk; var i;
+        while ((i = buf.indexOf('\n')) >= 0) { var ln = buf.slice(0, i).replace(/\r$/, ''); buf = buf.slice(i + 1); try { onSerialLine(ln); } catch (e) { dlogRate('lnerr', 3000, 'ERR', 'serial', '处理串口行出错：' + e.message); } }
+        if (buf.length > 65536) { dlog('WARN', 'serial', '单行超过 64KB（无换行），已丢弃'); buf = ''; }
+      }
+    } catch (e2) {
+      s.lastErr = e2.name + ': ' + e2.message;
+      if (e2.name === 'NetworkError') { fatal = true; dlog('ERR', 'serial', '设备已断开/被拔出：' + e2.message); }
+      else dlogRate('rderr', 2000, 'WARN', 'serial', '读取错误（' + e2.name + '，可恢复）：' + e2.message);
+    } finally { try { reader.releaseLock(); } catch (e3) {} }
+  }
+  if (tok === SP.token) serialLost('读取结束');
+}
+function serialLost(why) {
+  var s = DG.ser, p = SP.port; s.open = false; serialOn = false; SP.timers.forEach(clearTimeout); SP.timers = [];
+  try { if (p) p.close().catch(function () {}); } catch (e) {}
+  updateSerialBtn();
+  if (SP.want) { dlog('WARN', 'serial', '串口中断（' + why + '），将自动重连…'); scheduleReconnect(0); } else dlog('INFO', 'serial', '串口已关闭（' + why + '）');
+}
+function scheduleReconnect(n) {
+  clearTimeout(SP.rcTimer);
+  if (!SP.want || DG.ser.open || n > 15) { if (n > 15) dlog('ERR', 'serial', '自动重连失败：请重新点「USB 连接 ESP32」'); return; }
+  SP.rcTimer = setTimeout(async function () {
+    if (!SP.want || DG.ser.open) return;
+    try {
+      var ps = await navigator.serial.getPorts(), want = null;
+      ps.forEach(function (p) { var i = p.getInfo ? p.getInfo() : {}; if (!want && i.usbVendorId === DG.ser.vid && i.usbProductId === DG.ser.pid) want = p; });
+      want = want || ps[0];
+      if (want) { DG.ser.reconnects++; var ok = await serialOpen(want, true); if (ok) return; }
+    } catch (e) { /* 继续重试 */ }
+    scheduleReconnect(n + 1);
+  }, 900);
+}
+async function serialOpen(port, quiet) {
+  var s = DG.ser, info = {}; try { info = port.getInfo ? port.getInfo() : {}; } catch (e) {}
+  s.vid = info.usbVendorId || 0; s.pid = info.usbProductId || 0; s.chip = vidName(s.vid);
+  dlog('INFO', 'serial', (quiet ? '重连' : '选中') + '串口：' + s.chip, { vid: '0x' + s.vid.toString(16), pid: '0x' + s.pid.toString(16) });
+  try { await port.open({ baudRate: 115200, bufferSize: 65536 }); }
+  catch (e2) {
+    s.lastErr = e2.name + ': ' + e2.message;
+    var why = e2.name === 'InvalidStateError' ? '该串口已被本页打开' : /busy|access|denied|NetworkError|Failed to open/i.test(e2.name + e2.message) ? '串口被别的程序占用（PlatformIO 串口监视器 / Arduino / 另一个浏览器标签）→ 先关掉它们' : '未知原因';
+    dlog('ERR', 'serial', '打开串口失败：' + s.lastErr + ' —— ' + why); if (!quiet) toast('串口打开失败：' + e2.message + '（' + why + '）', 9000); return false;
+  }
+  s.open = true; s.bytes = 0; s.lines = 0; s.badChars = 0; s.jsonOK = quiet ? s.jsonOK : 0; s.jsonBad = 0; s.hb = 0; s.other = 0; s.firstAt = 0; s.mode = ''; s.openedAt = Date.now(); s.lastRaw = ''; s.lastLine = ''; s.hello = null; s.hbInfo = null; s.lastErr = '';
+  serialOn = true; SP.port = port; SP.want = true; lsSet('wradar2.autoserial', true);
+  mode = SIM ? 'sim' : 'live';
+  var tok = ++SP.token;
+  dlog('OK', 'serial', '串口已打开 115200 8N1');
+  $('wT').textContent = '正在连接 ESP32…'; $('wM').textContent = '串口已打开，正在复位 ESP32 并等待第一帧（约 2~4 秒）…';
+  updateSerialBtn();
+  await sigs(port, { dataTerminalReady: false, requestToSend: false });
+  readLoop(port, tok);
+  await sleep(150);
+  serialWrite('hello\n');
+  await serialReset(quiet ? '重连后复位' : '连接后自动复位，让固件从头开始');
+  startWatchdog(tok);
+  return true;
+}
+async function serialConnect(auto) {
+  if (DG.ser.open) { toast('USB 已连接'); return; }
+  if (!DG.ser.supported) { dlog('ERR', 'serial', '此浏览器不支持 Web Serial（需电脑版 Chrome/Edge，https 或 localhost）'); toast('此浏览器不支持 Web Serial：请用电脑版 Chrome / Edge，并通过 https 或 localhost 打开本页', 8000); return; }
+  var port = null;
   try {
-    for (;;) {
-      var rr = await reader.read(); if (rr.done) break;
-      buf += dec.decode(rr.value, { stream: true }); var i;
-      while ((i = buf.indexOf('\n')) >= 0) { onSerialLine(buf.slice(0, i).trim()); buf = buf.slice(i + 1); }
-      if (buf.length > 30000) buf = '';
-    }
-  } catch (e) { toast('串口断开：' + e.message); } finally { try { reader.releaseLock(); await port.close(); } catch (e2) {} serialOn = false; }
+    if (auto === true) { var ps = await navigator.serial.getPorts(); port = ps[0]; }
+    if (!port) port = await navigator.serial.requestPort();
+  } catch (e) {
+    var msg = e.name + ': ' + e.message;
+    if (e.name === 'NotFoundError') dlog('WARN', 'serial', '未选择串口（对话框里没有任何设备？确认 USB 已插好、驱动正常；或你点了取消）');
+    else if (e.name === 'SecurityError') { dlog('ERR', 'serial', '被浏览器权限策略拒绝：' + msg + ' —— 若本页嵌在 iframe 里，外层必须给 iframe 加 allow="serial"；也可点“新标签打开”'); toast('Web Serial 被权限策略禁止：请点“新标签打开”后再连接', 9000); }
+    else dlog('ERR', 'serial', '请求串口失败：' + msg);
+    return;
+  }
+  await serialOpen(port, false);
+}
+async function serialDisconnect() {
+  SP.want = false; lsSet('wradar2.autoserial', false); SP.token++; clearTimeout(SP.rcTimer);
+  SP.timers.forEach(clearTimeout); SP.timers = [];
+  var p = SP.port; DG.ser.open = false; serialOn = false;
+  try { if (p) { if (p.readable && p.readable.locked) { /* reader 会在 token 变化后自然结束 */ } await p.close(); } } catch (e) { try { await sleep(200); await p.close(); } catch (e2) {} }
+  dlog('INFO', 'serial', '已手动断开串口'); updateSerialBtn();
+}
+function serialToggle() { if (DG.ser.open) serialDisconnect(); else serialConnect(false); }
+if ('serial' in navigator) {
+  navigator.serial.addEventListener('disconnect', function () { dlog('WARN', 'serial', '浏览器报告：USB 设备已拔出/断开'); });
+  navigator.serial.addEventListener('connect', function () { dlog('INFO', 'serial', '浏览器报告：检测到 USB 串口设备接入'); if (SP.want && !DG.ser.open) scheduleReconnect(0); });
+  if (!SIM && lsGet('wradar2.autoserial', false)) setTimeout(function () { navigator.serial.getPorts().then(function (ps) { if (ps.length) { dlog('INFO', 'serial', '发现已授权的串口，自动连接…'); serialConnect(true); } }).catch(function () {}); }, 900);
 }
 
 /* ================= 演示数据 ================= */
@@ -732,8 +1149,8 @@ function reset() {
 }
 function setWaiting(title, msg) { $('wT').textContent = title; $('wM').textContent = msg; $('wait').style.display = frameCount ? 'none' : 'block'; }
 
-window.WifiRadar = { ingest: function (f) { ingest(f, 'sim'); }, demoFrame: demoFrame, reset: reset, setWaiting: setWaiting, loadDemoWorld: loadDemoWorld, ready: true, frames: function () { return frameCount; }, aps: function () { return APS.size; } };
-if (SIM) { $('bDemo').style.display = 'none'; $('bDemo2').style.display = 'none'; $('bSerial').style.display = 'none'; $('bSerial2').style.display = 'none'; loadDemoWorld(); setWaiting('等待 ESP32 启动…', '在左侧虚拟开发板上按下 RESET 键（或按键盘 R）。'); }
+window.WifiRadar = { feedSerialLine: function (l) { onSerialLine(l); }, diag: function () { return diagChecks(); }, report: buildReport, log: dlog, ingest: function (f) { ingest(f, 'sim'); }, demoFrame: demoFrame, reset: reset, setWaiting: setWaiting, loadDemoWorld: loadDemoWorld, ready: true, frames: function () { return frameCount; }, aps: function () { return APS.size; } };
+if (SIM) { $('bDemo').style.display = 'none'; $('bDemo2').style.display = 'none'; $('bSerial').style.display = 'none'; $('bSerial2').style.display = 'none'; $('bRst').style.display = 'none'; $('bRst2').style.display = 'none'; loadDemoWorld(); setWaiting('等待 ESP32 启动…', '在左侧虚拟开发板上按下 RESET 键（或按键盘 R）。'); }
 if (Q.get('demo') === '1') startDemo();
 sync(); window.__radarReady = true;
 })();
@@ -783,7 +1200,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
+    return jsonify(ok=True, version=VERSION, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
 
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
@@ -792,15 +1209,21 @@ def ingest():
     if request.method == "OPTIONS":
         return ("", 204)
     key = request.headers.get("X-Key") or request.args.get("key")
-    if key != API_KEY:
+    origin_host = urlparse(request.headers.get("Origin", "") or "").netloc
+    same = request.headers.get("Sec-Fetch-Site") == "same-origin" or (origin_host != "" and origin_host == request.host)
+    src = "网页USB转发" if same else "ESP32 WiFi直传"
+    if key != API_KEY and not same:
+        evt_rate("badkey", 5, "ERR", "ingest", "拒绝 %s 的上传：API_KEY 不一致（收到 %r，期望 %r）。请把 config.h 的 API_KEY 改成与本脚本一致" % (request.headers.get("CF-Connecting-IP") or request.remote_addr, key, API_KEY))
         return jsonify(ok=False, error="bad key"), 401
     f = request.get_json(force=True, silent=True)
     if not isinstance(f, dict) or not isinstance(f.get("aps"), list):
+        evt_rate("badframe", 5, "ERR", "ingest", "收到格式错误的数据（%s，%d 字节）：缺少 aps 数组" % (src, len(request.get_data() or b"")))
         return jsonify(ok=False, error="bad frame"), 400
     t = time.time()
     with LOCK:
         SEQ += 1
         f["_seq"] = SEQ
+        f["_t"] = t
         FRAMES.append(f)
         nid = str(f.get("node", "node"))
         n = NODES.setdefault(nid, {"frames": 0, "obs": {}})
@@ -823,6 +1246,9 @@ def ingest():
             except Exception:
                 continue
         seq = SEQ
+        nframes = n["frames"]
+    if nframes == 1 or nframes % 20 == 0:
+        evt("OK", "ingest", "收到 %s 帧 #%d：node=%s 来自 %s · AP=%d · 设备=%d · 累计 %d 帧" % (src, seq, nid, n.get("ip"), len(f["aps"]), len(f.get("st") or []), nframes), echo=(nframes == 1 or nframes % 60 == 0))
     HIST_Q.append(json.dumps({"t": round(t, 2), "f": f}, ensure_ascii=False, separators=(",", ":")))
     threading.Thread(target=solve_positions, daemon=True).start()
     return jsonify(ok=True, seq=seq)
@@ -842,12 +1268,86 @@ def frames():
             out = list(last.values())
         else:
             out = [f for f in FRAMES if f["_seq"] > since][-60:]
+        now_ = time.time()
+        out = [dict(x, age=round(now_ - x.get("_t", now_), 1)) for x in out]
         status = {
             "gpu": GPU_NAMES, "frames": SEQ, "uptime": int(time.time() - T0), "public": PUBLIC_URL,
             "motion": round(MOTION["v"], 3), "res": RES_TEXT,
             "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(time.time() - v.get("last", 0), 1)} for k, v in NODES.items()},
         }
         return jsonify(seq=SEQ, frames=out, solved=SOLVED, status=status)
+
+
+def server_diag(n_events=80):
+    now = time.time()
+    d = {
+        "version": VERSION, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "python": sys.version.split()[0], "uptime": int(now - T0),
+        "public_url": PUBLIC_URL, "tunnel": TUNNEL, "frames": SEQ, "gpu": GPU_NAMES, "res": RES_TEXT,
+        "torch": getattr(torch, "__version__", None) if torch is not None else None,
+        "cuda": bool(torch is not None and torch.cuda.is_available()),
+        "budgets": {"vram_gb": VRAM_GB, "ram_gb": RAM_GB, "disk_gb": DISK_GB, "restarts": RESTARTS},
+        "series": len(SERIES), "series_maxlen": SERIES_MAXLEN, "events_file": EVT_FILE, "hist_dir": HIST_DIR,
+        "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
+        "solved": len(SOLVED), "motion": round(MOTION["v"], 3),
+    }
+    try:
+        if torch is not None and NGPU:
+            d["gpu_mem"] = []
+            for i in range(NGPU):
+                free, total = torch.cuda.mem_get_info(i)
+                d["gpu_mem"].append({"gpu": i, "name": GPU_NAMES[i], "used_gb": round((total - free) / 1024 ** 3, 2), "total_gb": round(total / 1024 ** 3, 2)})
+    except Exception as e:
+        d["gpu_mem_err"] = str(e)
+    d["recent"] = list(EVENTS)[-n_events:]
+    return d
+
+
+@app.get("/api/diag")
+def diag():
+    return jsonify(server_diag())
+
+
+@app.get("/api/diag.txt")
+def diag_txt():
+    d = server_diag(400)
+    L = ["===== WiFi RADAR 服务端检测日志 v%s =====" % d["version"], "时间: %s  运行 %ds  Python %s  torch=%s cuda=%s" % (d["time"], d["uptime"], d["python"], d["torch"], d["cuda"]),
+         "公网地址: %s  隧道: %s" % (d["public_url"], json.dumps(d["tunnel"], ensure_ascii=False)), "GPU: %s  显存: %s" % (d["gpu"], json.dumps(d.get("gpu_mem"), ensure_ascii=False)), "资源: %s" % d["res"],
+         "预算: %s" % json.dumps(d["budgets"]), "总帧数: %d  节点: %s" % (d["frames"], json.dumps(d["nodes"], ensure_ascii=False)), "", "--- 事件 ---"]
+    for e in d["recent"]:
+        L.append("%s %s [%s] %s" % (time.strftime("%H:%M:%S", time.localtime(e["t"])), e["lv"], e["c"], e["m"]))
+    return Response("\n".join(L), mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/api/clientlog", methods=["POST", "OPTIONS"])
+def clientlog():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    j = request.get_json(force=True, silent=True) or {}
+    for e in (j.get("entries") or [])[:100]:
+        try:
+            lv = str(e.get("lv", "INFO"))[:5]
+            m = str(e.get("m", ""))
+            evt(lv, "web/" + str(e.get("c", ""))[:12], m, echo=False, t=float(e.get("t", 0)) / 1000.0 or None)
+            if lv == "ERR":
+                evt_rate("web:" + m[:50], 15, "ERR", "web", m[:300])
+        except Exception:
+            continue
+    return jsonify(ok=True)
+
+
+@app.route("/api/reset", methods=["POST", "OPTIONS"])
+def reset_state():
+    global SEQ, SOLVED
+    if request.method == "OPTIONS":
+        return ("", 204)
+    with LOCK:
+        FRAMES.clear()
+        NODES.clear()
+        SERIES.clear()
+        SOLVED = {}
+        SEQ = 0
+    evt("INFO", "server", "已清空帧缓存/节点/历史序列（/api/reset）", echo=True)
+    return jsonify(ok=True)
 
 
 @app.get("/api/stats")
@@ -1162,6 +1662,9 @@ def geo():
 def _banner(url):
     global PUBLIC_URL
     PUBLIC_URL = url
+    TUNNEL["state"] = "已建立"
+    TUNNEL["url"] = url
+    evt("OK", "tunnel", "公网隧道已建立：" + url)
     line = "=" * 66
     print("\n" + line)
     print("🌐 全屏 3D 网站： " + url)
@@ -1169,6 +1672,7 @@ def _banner(url):
     print("   或串口输入：     url %s" % url)
     print("🔌 最稳方案：     用电脑 Chrome/Edge 打开上面网址 -> 点【USB 连接 ESP32】")
     print("🔑 API_KEY：       %s" % API_KEY)
+    print("🩺 检测日志：     网页里点【🩺 检测日志】，或打开 %s/api/diag.txt（也写入 %s）" % (url, EVT_FILE))
     print(line + "\n", flush=True)
     try:
         from IPython.display import display, HTML as _H
@@ -1183,11 +1687,14 @@ def _probe(url):
         try:
             r = requests.get(url + "/api/health", timeout=8, headers=UA)
             if r.status_code == 200:
-                print("[tunnel] ✅ 公网自检通过：%s/api/health" % url, flush=True)
+                TUNNEL["probe"] = "通过"
+                evt("OK", "tunnel", "公网自检通过：%s/api/health" % url, echo=True)
                 return
         except Exception:
             pass
         time.sleep(4)
+    TUNNEL["probe"] = "未通过"
+    evt("WARN", "tunnel", "公网自检 15 次均未通过")
     print("[tunnel] ⚠ 公网自检未通过（隧道可能还在生效，或被网络拦截）。可稍后刷新，或设置 NGROK_TOKEN 改用 ngrok。", flush=True)
 
 
@@ -1208,7 +1715,9 @@ def start_cloudflared():
                 if m and not shown:
                     shown = True
                     _banner(m.group(0))
-            print("[tunnel] cloudflared 退出，第 %d 次重试…" % attempt, flush=True)
+            TUNNEL["state"] = "重试中"
+            TUNNEL["attempts"] = attempt
+            evt("WARN", "tunnel", "cloudflared 退出，第 %d 次重试…" % attempt, echo=True)
             time.sleep(3)
 
     threading.Thread(target=runner, daemon=True).start()
@@ -1227,6 +1736,7 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
+    evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
     for fn in (motion_loop, res_loop, hist_writer):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
