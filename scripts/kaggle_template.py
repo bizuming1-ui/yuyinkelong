@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v3（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v4（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -27,6 +27,7 @@ WiFi 雷达 · Kaggle 单文件服务端 v3（ESP32-S3 -> Kaggle T4x2 GPU -> 全
 import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections, random, glob
 from urllib.parse import urlparse
 
+TOPIC = os.environ.get("RADAR_TOPIC", "wradar-bzm-5f2k9q7d")   # 汇合点暗号：必须与固件 config.h 的 RADAR_TOPIC 一致（默认已一致）
 API_KEY = os.environ.get("RADAR_KEY", "radar-key")        # 必须与 ESP32 config.h 里的 API_KEY 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
 USE_TUNNEL = os.environ.get("RADAR_NO_TUNNEL", "") != "1"
@@ -40,12 +41,12 @@ PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
 
 
-VERSION = "3.0"
+VERSION = "4.0"
 EVENTS = collections.deque(maxlen=4000)
 EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
 _ECHO = {}
 _EVT_N = [0]
-TUNNEL = {"state": "未启动", "url": "", "attempts": 0, "probe": ""}
+TUNNEL = {"state": "未启动", "url": "", "attempts": 0, "probe": "", "topic": TOPIC, "published": 0, "publish_err": "", "provider": ""}
 
 
 def evt(level, cat, msg, echo=False, t=None):
@@ -128,7 +129,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, version=VERSION, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
+    return jsonify(ok=True, version=VERSION, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT, topic=TOPIC, published=TUNNEL.get("published", 0))
 
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
@@ -161,6 +162,8 @@ def ingest():
         n["frames"] += 1
         n["aps"] = len(f["aps"])
         n["ip"] = request.headers.get("CF-Connecting-IP") or request.remote_addr
+        n["src"] = src
+        n["fw"] = str(f.get("fw", ""))
         for a in f["aps"]:
             try:
                 b = str(a["b"]).upper()
@@ -215,7 +218,7 @@ def server_diag(n_events=80):
         "cuda": bool(torch is not None and torch.cuda.is_available()),
         "budgets": {"vram_gb": VRAM_GB, "ram_gb": RAM_GB, "disk_gb": DISK_GB, "restarts": RESTARTS},
         "series": len(SERIES), "series_maxlen": SERIES_MAXLEN, "events_file": EVT_FILE, "hist_dir": HIST_DIR,
-        "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
+        "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "src": v.get("src"), "fw": v.get("fw"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
         "solved": len(SOLVED), "motion": round(MOTION["v"], 3),
     }
     try:
@@ -591,13 +594,16 @@ def _banner(url):
     global PUBLIC_URL
     PUBLIC_URL = url
     TUNNEL["state"] = "已建立"
+    TUNNEL["provider"] = TUNNEL.get("provider") or "cloudflared"
     TUNNEL["url"] = url
     evt("OK", "tunnel", "公网隧道已建立：" + url)
+    threading.Thread(target=publish_url, args=(url,), daemon=True).start()
     line = "=" * 66
     print("\n" + line)
     print("🌐 全屏 3D 网站： " + url)
     print('📟 ESP32 config.h： #define SERVER_URL "%s"' % url)
     print("   或串口输入：     url %s" % url)
+    print("🛰  自动发现：     已发布到 ntfy.sh/%s —— ESP32 联网后自动读取，无需重新烧录（固件 RADAR_TOPIC 必须与之相同）" % TOPIC)
     print("🔌 最稳方案：     用电脑 Chrome/Edge 打开上面网址 -> 点【USB 连接 ESP32】")
     print("🔑 API_KEY：       %s" % API_KEY)
     print("🩺 检测日志：     网页里点【🩺 检测日志】，或打开 %s/api/diag.txt（也写入 %s）" % (url, EVT_FILE))
@@ -608,6 +614,30 @@ def _banner(url):
     except Exception:
         pass
     threading.Thread(target=_probe, args=(url,), daemon=True).start()
+
+
+def publish_url(url):
+    """把最新网址发布到汇合点 ntfy.sh/<TOPIC>：ESP32 会自动读取，Kaggle 重开后不用重新烧录固件。"""
+    try:
+        r = requests.post("https://ntfy.sh/" + TOPIC, data=url.encode("utf8"), headers={"Title": "wifi-radar-url", "Cache": "yes", **UA}, timeout=15)
+        if r.status_code == 200:
+            TUNNEL["published"] = int(time.time())
+            TUNNEL["publish_err"] = ""
+            evt("OK", "rendezvous", "已把网址发布到汇合点 ntfy.sh/%s（ESP32 将自动读取）" % TOPIC)
+            return True
+        TUNNEL["publish_err"] = "HTTP %d" % r.status_code
+    except Exception as e:
+        TUNNEL["publish_err"] = str(e)[:200]
+    evt("WARN", "rendezvous", "发布网址到 ntfy.sh 失败：%s（ESP32 将只能用 config.h 里的 SERVER_URL；USB 直连不受影响）" % TUNNEL["publish_err"], echo=True)
+    return False
+
+
+def publish_loop():
+    """每 4 分钟重发一次：固件只读取最近 30 分钟内的消息，所以网址始终“新鲜”。"""
+    while True:
+        time.sleep(240)
+        if PUBLIC_URL:
+            publish_url(PUBLIC_URL)
 
 
 def _probe(url):
@@ -651,6 +681,33 @@ def start_cloudflared():
     threading.Thread(target=runner, daemon=True).start()
 
 
+def start_ssh_tunnel():
+    """cloudflared 60 秒内没拿到网址时的备用隧道：localhost.run（需要 ssh）。"""
+    ssh = shutil.which("ssh")
+    if not ssh:
+        evt("WARN", "tunnel", "没有 ssh，无法使用备用隧道", echo=True)
+        return
+
+    def runner():
+        p = subprocess.Popen([ssh, "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes",
+                              "-R", "80:127.0.0.1:%d" % PORT, "nokey@localhost.run"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in p.stdout:
+            m = re.search(r"https://[a-z0-9-]+\.lhr\.life", line)
+            if m and not PUBLIC_URL:
+                TUNNEL["provider"] = "localhost.run"
+                _banner(m.group(0))
+        evt("WARN", "tunnel", "备用隧道 localhost.run 已退出", echo=True)
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
+def tunnel_watchdog():
+    time.sleep(70)
+    if not PUBLIC_URL:
+        evt("WARN", "tunnel", "cloudflared 70 秒内没有给出网址，启动备用隧道 localhost.run", echo=True)
+        start_ssh_tunnel()
+
+
 def start_ngrok():
     _ensure("pyngrok")
     from pyngrok import ngrok
@@ -665,7 +722,7 @@ def main():
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
     evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
-    for fn in (motion_loop, res_loop, hist_writer):
+    for fn in (motion_loop, res_loop, hist_writer, publish_loop):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
     if USE_TUNNEL:
@@ -673,6 +730,7 @@ def main():
             start_ngrok()
         else:
             start_cloudflared()
+            threading.Thread(target=tunnel_watchdog, daemon=True).start()
     else:
         print("[server] 本地模式: http://127.0.0.1:%d" % PORT)
     try:
