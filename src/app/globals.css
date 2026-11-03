@@ -1,1 +1,21 @@
 @import "tailwindcss";
+
+html,
+body {
+  margin: 0;
+  background: #070b13;
+  color-scheme: dark;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a3a52 transparent;
+}
+
+input[type="range"] {
+  accent-color: #38e8ff;
+}
+
+input[type="checkbox"] {
+  accent-color: #38e8ff;
+}
