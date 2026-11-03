@@ -3,14 +3,14 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "WiFi RADAR · 浏览器模拟器",
-  description: "ESP32-S3 WiFi 雷达：3D 真实世界 + 浏览器模拟器 + 全能检测日志 + 复制代码界面",
+  title: "ESP32-S3 双节点 WiFi CSI 雷达 · 浏览器模拟器",
+  description: "ESP-NOW 全信道跳频 + 双向相位标定 + 重叠子载波拼接 + Kaggle GPU 主机端 + 3D 距离-时间可视化",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="zh-CN">
-      <body className="bg-[#0b1118] text-slate-200 antialiased">{children}</body>
+      <body className="bg-[#070b13] text-slate-100 antialiased">{children}</body>
     </html>
   );
 }
