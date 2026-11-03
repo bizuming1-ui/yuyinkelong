@@ -66,9 +66,10 @@ export async function GET() {
     }
     files.push({ path: p, content, lines: content.split("\n").length - (content.endsWith("\n") ? 1 : 0) });
   }
+  const pioOrder = ["firmware/platformio.ini", "firmware/include/config.h", "firmware/src/main.cpp"];
   return Response.json({
     files,
     kaggle: KAGGLE,
-    pio: files.filter((f) => f.path.startsWith("firmware/") && !f.path.endsWith(".gitignore")).map((f) => f.path),
+    pio: pioOrder.filter((p) => files.some((f) => f.path === p)),
   });
 }
