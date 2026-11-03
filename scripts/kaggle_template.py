@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v6（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v7（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -23,12 +23,20 @@ WiFi 雷达 · Kaggle 单文件服务端 v6（ESP32-S3 -> Kaggle T4x2 GPU -> 全
     - 隧道：cloudflared 自动重试 + 公网自检；可选 ngrok（环境变量 NGROK_TOKEN）。
     - /api/geo：beaconDB WiFi 定位 + OpenStreetMap 真实街区（建筑/道路）。
     - v6 GPU 大模型诊断助手：Qwen2.5（双卡 7B / 单卡 3B）读取检测日志，网页「检测日志 → 🤖 AI 分析」（/api/llm，后台加载，失败自动退回规则诊断）。
+    - v7 双 T4 吃满：Qwen2.5-14B-Instruct 4-bit(nf4) 切分到两张卡（约 10GB 显存），失败自动降级 7B fp16 → 3B → 规则；
+      HF 模型缓存放 /kaggle/temp（磁盘 57.6GiB 内，先检查余量）；GPU 上还做 Hampel 去野值 + FFT。
+    - v7 LLM「场景解说员」：只读取真实 CSI 测量(JSON)，实时生成一句中文解说（/api/scene，也显示在 3D 页面）；无人时不会让模型编造人物。
     - 全能检测：/api/diag(JSON) 与 /api/diag.txt(纯文本，可直接复制到 GitHub “检测日志”)；
       网页端日志经 /api/clientlog 汇总到这里，同时写入 /kaggle/working/radar_diag.log（可在 Kaggle Output 下载）。
 """
 import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections, random, glob
 from urllib.parse import urlparse
 
+for _hf in ("/kaggle/temp", "/tmp"):
+    if os.path.isdir(_hf):
+        os.environ.setdefault("HF_HOME", os.path.join(_hf, "hf_cache"))   # 大模型权重放大磁盘，避免占满 /kaggle/working(20GB)
+        break
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 TOPIC = os.environ.get("RADAR_TOPIC", "wradar-bzm-5f2k9q7d")   # 汇合点暗号：必须与固件 config.h 的 RADAR_TOPIC 一致（默认已一致）
 API_KEY = os.environ.get("RADAR_KEY", "radar-key")        # 必须与 ESP32 config.h 里的 API_KEY 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
@@ -43,7 +51,7 @@ PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
 
 
-VERSION = "6.0"
+VERSION = "7.0"
 EVENTS = collections.deque(maxlen=4000)
 EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
 _ECHO = {}
@@ -206,7 +214,7 @@ def frames():
         out = [dict(x, age=round(now_ - x.get("_t", now_), 1)) for x in out]
         status = {
             "gpu": GPU_NAMES, "frames": SEQ, "uptime": int(time.time() - T0), "public": PUBLIC_URL,
-            "motion": round(MOTION["v"], 3), "res": RES_TEXT, "sense": SENSE["v"],
+            "motion": round(MOTION["v"], 3), "res": RES_TEXT, "sense": SENSE["v"], "ai": ai_status(),
             "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(time.time() - v.get("last", 0), 1)} for k, v in NODES.items()},
         }
         return jsonify(seq=SEQ, frames=out, solved=SOLVED, status=status)
@@ -567,6 +575,29 @@ def _band(x, fs, f0, f1, dev):
     return float(fr[m][i]), float(s[i] / med), float(s[i])
 
 
+def _hampel(x, dev, k=7, nsig=3.0, floor=2e-3):
+    """Hampel 去野值（在 GPU 上批量算滑动中位数/MAD）：只剔除孤立尖峰，不影响持续的走动信号。"""
+    import numpy as np
+    n = len(x)
+    if n < 2 * k + 1:
+        return x
+    try:
+        if torch is not None and dev is not None:
+            t = torch.tensor(np.ascontiguousarray(x), dtype=torch.float32, device=dev)
+            w = torch.nn.functional.pad(t.view(1, 1, -1), (k // 2, k // 2), mode="replicate").view(-1).unfold(0, k, 1)
+            med = w.median(dim=1).values
+            mad = (w - med[:, None]).abs().median(dim=1).values * 1.4826
+            bad = (t - med).abs() > nsig * mad.clamp(min=floor)
+            return torch.where(bad, med, t).cpu().numpy().astype(np.float64)
+        pad = np.pad(x, (k // 2, k // 2), mode="edge")
+        w = np.lib.stride_tricks.sliding_window_view(pad, k)
+        med = np.median(w, axis=1)
+        mad = np.median(np.abs(w - med[:, None]), axis=1) * 1.4826
+        return np.where(np.abs(x - med) > nsig * np.maximum(mad, floor), med, x)
+    except Exception:
+        return x
+
+
 def sense_loop():
     import numpy as np
     floor_hist = collections.deque(maxlen=180)
@@ -588,6 +619,7 @@ def sense_loop():
             if len(arr) < 20:
                 continue
             t, r, m, d = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+            d = _hampel(d, dev)
             age = now - t[-1]
             w2 = t > now - 2.5
             w1 = t > now - 1.2
@@ -910,7 +942,7 @@ def start_ngrok():
 # 显卡分配：>=2 张 T4 时用 Qwen2.5-7B-Instruct 切分到两张卡（device_map=auto，约 15GB）；1 张用 3B；无 GPU 用规则诊断。
 # 环境变量：RADAR_LLM=off 关闭；RADAR_LLM=<HuggingFace 模型名> 指定模型。
 LLM_NAME = os.environ.get("RADAR_LLM", "auto")
-LLM = {"state": "未启动", "model": "", "err": "", "load_s": 0.0, "calls": 0, "last_ms": 0, "gpus": []}
+LLM = {"state": "未启动", "model": "", "quant": "", "err": "", "load_s": 0.0, "calls": 0, "last_ms": 0, "gpus": []}
 _LLM_OBJ = {"tok": None, "model": None}
 _LLM_LOCK = threading.Lock()
 LLM_SYS = ("你是 ESP32-S3 WiFi 雷达（CSI 人体感知 + 3D 网页）的运维诊断助手。根据用户给出的『检测日志』，用中文简洁回答：1) 当前卡在哪一步；"
@@ -936,23 +968,38 @@ def rule_advice(report):
     return "【规则诊断】\n" + "\n".join("%d. %s" % (i + 1, t) for i, t in enumerate(tips))
 
 
+def _params_b(name):
+    m = re.search(r"(\d+(?:\.\d+)?)[Bb]\b", name)
+    return float(m.group(1)) if m else 7.0
+
+
 def _llm_pick():
+    """返回 [(模型名, 量化方式)]。nf4=bitsandbytes 4-bit；fp16=半精度。"""
     if LLM_NAME.lower() in ("off", "0", "no", "none"):
         return []
+    q = os.environ.get("RADAR_LLM_QUANT", "auto").lower()
     if LLM_NAME != "auto":
-        return [LLM_NAME]
+        return [(LLM_NAME, q if q in ("nf4", "fp16") else ("nf4" if _params_b(LLM_NAME) >= 7 else "fp16"))]
     if NGPU >= 2:
-        return ["Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
+        return [("Qwen/Qwen2.5-14B-Instruct", "nf4"), ("Qwen/Qwen2.5-7B-Instruct", "fp16"), ("Qwen/Qwen2.5-3B-Instruct", "fp16")]
     if NGPU == 1:
-        return ["Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"]
+        return [("Qwen/Qwen2.5-7B-Instruct", "nf4"), ("Qwen/Qwen2.5-3B-Instruct", "fp16")]
     return []
+
+
+def _free_gb(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        return shutil.disk_usage(path).free / 1024 ** 3
+    except Exception:
+        return 999.0
 
 
 def llm_loader():
     names = _llm_pick()
     if not names or torch is None or not NGPU:
         LLM["state"] = "关闭（无 GPU 或已禁用）"
-        evt("INFO", "llm", "大模型诊断助手未启用：%s" % LLM["state"], echo=True)
+        evt("INFO", "llm", "大模型助手未启用：%s" % LLM["state"], echo=True)
         return
     try:
         _ensure("transformers")
@@ -962,13 +1009,24 @@ def llm_loader():
         LLM["state"], LLM["err"] = "依赖安装失败", repr(e)[:300]
         evt("ERR", "llm", "transformers 安装/导入失败：%r（将使用规则诊断）" % (e,), echo=True)
         return
-    for name in names:
+    for name, quant in names:
         t0 = time.time()
         try:
-            LLM["state"], LLM["model"] = "加载中", name
-            evt("INFO", "llm", "开始加载大模型 %s（首次需下载，几分钟；后台进行，不影响雷达）" % name, echo=True)
+            need = _params_b(name) * 2.15 if True else 0     # 下载 fp16 权重约 2.0GB/十亿参数
+            free = _free_gb(os.environ.get("HF_HOME", "/tmp"))
+            if free < need + 3:
+                evt("WARN", "llm", "磁盘余量 %.0fG < 需要约 %.0fG，跳过 %s" % (free, need + 3, name), echo=True)
+                continue
+            LLM["state"], LLM["model"], LLM["quant"] = "加载中", name, quant
+            evt("INFO", "llm", "开始加载 %s（%s，缓存 %s，余 %.0fG；首次需下载数分钟，后台进行不影响雷达）" % (name, quant, os.environ.get("HF_HOME"), free), echo=True)
             tok = AutoTokenizer.from_pretrained(name)
-            if "7B" in name or "8B" in name or "14B" in name:
+            if quant == "nf4":
+                _ensure("bitsandbytes")
+                from transformers import BitsAndBytesConfig
+                qc = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
+                mm = {0: "6GiB", 1: "13GiB"} if NGPU >= 2 else {0: "13GiB"}   # GPU0 少放一些，留显存给 CSI/定位计算
+                mdl = AutoModelForCausalLM.from_pretrained(name, quantization_config=qc, torch_dtype=torch.float16, device_map="auto", max_memory=mm, low_cpu_mem_usage=True)
+            elif _params_b(name) >= 6:
                 mm = {0: "9GiB", 1: "13GiB"} if NGPU >= 2 else {0: "13GiB"}
                 mdl = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="auto", max_memory=mm, low_cpu_mem_usage=True)
             else:
@@ -977,12 +1035,12 @@ def llm_loader():
             mdl.eval()
             _LLM_OBJ["tok"], _LLM_OBJ["model"] = tok, mdl
             LLM["state"], LLM["load_s"], LLM["err"] = "就绪", round(time.time() - t0, 1), ""
-            LLM["gpus"] = [{"gpu": i, "used_gb": round(torch.cuda.mem_get_info(i)[1] / 1024 ** 3 - torch.cuda.mem_get_info(i)[0] / 1024 ** 3, 2)} for i in range(NGPU)]
-            evt("OK", "llm", "✅ 大模型 %s 已就绪（用时 %.0fs，显存 %s）" % (name, LLM["load_s"], LLM["gpus"]), echo=True)
+            LLM["gpus"] = [{"gpu": i, "used_gb": round((torch.cuda.mem_get_info(i)[1] - torch.cuda.mem_get_info(i)[0]) / 1024 ** 3, 2)} for i in range(NGPU)]
+            evt("OK", "llm", "✅ 大模型 %s(%s) 已就绪（用时 %.0fs，显存 %s）" % (name, quant, LLM["load_s"], LLM["gpus"]), echo=True)
             return
         except Exception as e:
             LLM["state"], LLM["err"] = "加载失败", repr(e)[:300]
-            evt("ERR", "llm", "加载 %s 失败：%r" % (name, e), echo=True)
+            evt("ERR", "llm", "加载 %s(%s) 失败：%r —— 尝试下一个候选" % (name, quant, e), echo=True)
             _LLM_OBJ["tok"] = _LLM_OBJ["model"] = None
             try:
                 import gc
@@ -992,16 +1050,103 @@ def llm_loader():
                 pass
 
 
-def llm_answer(report):
+def llm_generate(system, user, max_new=480):
     tok, mdl = _LLM_OBJ["tok"], _LLM_OBJ["model"]
     if tok is None or mdl is None:
         return None
-    msgs = [{"role": "system", "content": LLM_SYS}, {"role": "user", "content": "以下是检测日志（可能已截断）：\n" + report[-6500:]}]
+    msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inp = tok([text], return_tensors="pt").to(next(mdl.parameters()).device)
     with torch.no_grad():
-        out = mdl.generate(**inp, max_new_tokens=480, do_sample=False, repetition_penalty=1.05)
+        out = mdl.generate(**inp, max_new_tokens=max_new, do_sample=False, repetition_penalty=1.05)
     return tok.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+
+def llm_answer(report):
+    return llm_generate(LLM_SYS, "以下是检测日志（可能已截断）：\n" + report[-6500:], 480)
+
+
+# ---------------------------------------------------------------- v7 LLM「场景解说员」
+SCENE = {"text": "", "engine": "", "t": 0.0, "ms": 0, "key": None, "n": 0}
+SCENE_SYS = ("你是 WiFi 感知系统的『场景解说员』。输入是一段 JSON，来自 ESP32 CSI 的真实测量：present=是否有人, act=活动(empty/still/moving/walking), "
+             "level=运动指数(相对基线倍数), breath=呼吸次/分(0=未检出), dom=运动主频Hz, snr=呼吸谱信噪比, rate=CSI 包速率。"
+             "请用中文写 1~2 句、不超过 50 字的现场解说，末尾加『｜可信度N%』(0~100)。严格依据 JSON，不得编造姿势/人数/位置/墙体；"
+             "单个 ESP32 只能判断存在、运动、呼吸。")
+
+
+def rule_scene(s):
+    act = s.get("act")
+    if not s.get("present") and act == "empty":
+        return "房间无人（静止空场）"
+    if act == "walking":
+        return "检测到有人在走动（运动指数 %.1f×）" % s.get("level", 0)
+    if act == "moving":
+        return "检测到有人有小幅动作（运动指数 %.1f×）" % s.get("level", 0)
+    if act == "still":
+        return "检测到有人静止%s" % ("，呼吸约 %.0f 次/分" % s["breath"] if s.get("breath") else "")
+    return "状态不明"
+
+
+def scene_key(s):
+    return (bool(s.get("present")), s.get("act"), int((s.get("breath") or 0) / 3), min(int(s.get("level") or 0), 12) // 3)
+
+
+def scene_loop():
+    while True:
+        time.sleep(2)
+        try:
+            s = SENSE["v"]
+            now = time.time()
+            if not s:
+                if SCENE["text"] and now - SCENE["t"] > 12:
+                    SCENE.update(text="", key=None, engine="")
+                continue
+            key = scene_key(s)
+            if (key == SCENE["key"] and now - SCENE["t"] < 60) or now - SCENE["t"] < 5:
+                continue
+            text, engine, ms = None, "rules", 0
+            if _LLM_OBJ["model"] is not None and (s.get("present") or s.get("act") != "empty"):
+                payload = {k: s.get(k) for k in ("present", "act", "level", "breath", "dom", "snr", "rate")}
+                t0 = time.time()
+                with _LLM_LOCK:
+                    text = llm_generate(SCENE_SYS, json.dumps(payload, ensure_ascii=False), 90)
+                ms = int((time.time() - t0) * 1000)
+                if text:
+                    engine, LLM["calls"], LLM["last_ms"] = "llm", LLM["calls"] + 1, ms
+                    text = text.replace("\n", " ")[:160]
+            if not text:
+                text = rule_scene(s)
+            SCENE.update(text=text, engine=engine, t=now, ms=ms, key=key, n=SCENE["n"] + 1)
+            if SCENE["n"] <= 3 or SCENE["n"] % 20 == 0:
+                evt("INFO", "llm", "场景解说[%s %dms]：%s" % (engine, ms, text), echo=(SCENE["n"] <= 3))
+        except Exception as e:
+            evt_rate("scene_err", 30, "ERR", "llm", "场景解说出错：%r" % (e,), echo=True)
+
+
+_AI_CACHE = {"t": 0.0, "v": None}
+
+
+def ai_status():
+    now = time.time()
+    if _AI_CACHE["v"] is not None and now - _AI_CACHE["t"] < 2:
+        return _AI_CACHE["v"]
+    vr = []
+    if torch is not None and NGPU:
+        try:
+            for i in range(NGPU):
+                free, total = torch.cuda.mem_get_info(i)
+                vr.append({"gpu": i, "used": round((total - free) / 1024 ** 3, 2), "total": round(total / 1024 ** 3, 1)})
+        except Exception:
+            pass
+    v = {"state": LLM["state"], "model": (LLM["model"] or "").split("/")[-1], "quant": LLM.get("quant", ""), "scene": SCENE["text"],
+         "engine": SCENE["engine"], "scene_ms": SCENE["ms"], "calls": LLM["calls"], "vram": vr}
+    _AI_CACHE.update(t=now, v=v)
+    return v
+
+
+@app.get("/api/scene")
+def api_scene():
+    return jsonify(ok=True, scene=SCENE["text"], engine=SCENE["engine"], ms=SCENE["ms"], n=SCENE["n"], ai=ai_status())
 
 
 @app.route("/api/llm", methods=["GET", "POST", "OPTIONS"])
@@ -1037,7 +1182,7 @@ def main():
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
     evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
-    for fn in (motion_loop, sense_loop, res_loop, hist_writer, publish_loop, llm_loader):
+    for fn in (motion_loop, sense_loop, res_loop, hist_writer, publish_loop, llm_loader, scene_loop):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
     if USE_TUNNEL:
