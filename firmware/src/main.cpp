@@ -1,4 +1,4 @@
-// ESP32-S3 WiFi Radar 固件 v4.0
+// ESP32-S3 WiFi Radar 固件 v5.0（新增 CSI 真实 WiFi 感知：RADARCSI 行）
 // 流程：上电/复位 -> 立刻输出 RADARHELLO -> 扫描周围 AP -> 立刻输出 RADARJSON（不等联网）
 //       -> 周期性嗅探周围设备 -> 有配置时再连接 WiFi 并 HTTPS POST 到 Kaggle 的 /api/ingest
 //
@@ -24,8 +24,13 @@
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "config.h"
+#if ENABLE_CSI
+#include "ping/ping_sock.h"
+#include "lwip/ip_addr.h"
+#include <math.h>
+#endif
 
-#define FW_VERSION "4.0.0"
+#define FW_VERSION "5.0.0"
 
 #if ARDUINO_USB_CDC_ON_BOOT
 #define HAS_USB_PORT 1
@@ -178,6 +183,8 @@ static void sendHello() {
   d["topic"] = RADAR_TOPIC;
   d["wifi"] = (int)WiFi.status();
   d["sdk"] = ESP.getSdkVersion();
+  d["csi"] = ENABLE_CSI;
+  d["csihz"] = CSI_EMIT_HZ;
   String out;
   serializeJson(d, out);
   outLine("RADARHELLO:", out.c_str());
@@ -265,8 +272,14 @@ static void sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   portEXIT_CRITICAL(&staMux);
 }
 
+#if ENABLE_CSI
+static void csiStopPing();
+#endif
 static void sniffRound() {
   gState = "sniff";
+#if ENABLE_CSI
+  csiStopPing();
+#endif
   wifiTried = false;   // v4 修复：嗅探会主动断开 WiFi，结束后要立刻重连上传，不能被 30 秒重试节流挡住
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_STA);
@@ -291,6 +304,190 @@ static String macStr(const uint8_t* m) {
   snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
   return String(b);
 }
+
+// ======================================================================
+//  v5：CSI（信道状态信息）—— 真正的 WiFi 感知数据源
+//  RSSI 只有 “一个数字/热点”，测不到人；CSI 是每个包 64 个子载波的幅度，人体走动/呼吸会让它抖动。
+//  两种取数方式：
+//   1) STA 模式（推荐）：ESP32 连上你的路由器，每秒对网关发 CSI_PING_HZ 次 ping，路由器的每个回包都带 CSI
+//   2) 被动模式（实验）：没配 WiFi 时，停在最强热点的信道上收它的信标帧（部分路由器信标是 11b 速率，没有 CSI）
+//  每包输出一行：RADARCSI:{"t":毫秒,"r":rssi,"c":信道,"m":平均幅度,"d":湍流(1-相邻包相关系数),"a":"64个子载波幅度(十六进制)"}
+// ======================================================================
+#if ENABLE_CSI
+struct CsiPkt { uint32_t t; int8_t rssi; uint8_t ch; uint8_t n; float m; float d; uint8_t a[64]; };
+struct CsiFeat { uint32_t t; int8_t r; uint16_t m10; uint16_t d1000; };
+static QueueHandle_t csiQ = nullptr;
+static CsiFeat csiFeat[CSI_FEAT_N];
+static volatile uint32_t csiFeatN = 0;
+static portMUX_TYPE csiMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t csiRaw = 0, csiKept = 0, csiDrop = 0;
+static uint32_t csiLastKeep = 0;
+static uint8_t csiPrev[64];
+static bool csiHasPrev = false;
+static volatile int gCsiMode = 0;        // 0 关闭 1 STA(ping 路由器) 2 被动(信标)
+static volatile int gCsiRate = 0;        // 最近 1 秒收到的 CSI 包数（未抽稀前）
+static volatile int gCsiErr = 0;         // esp_wifi_set_csi* 的错误码（0=正常）
+static bool csiCfgDone = false;
+static esp_ping_handle_t pingH = nullptr;
+static uint32_t pingGw = 0;
+static uint8_t gBestCh = 6;
+
+static void csiCb(void*, wifi_csi_info_t* info) {
+  if (!info || !info->buf || info->len < 16) return;
+  csiRaw++;
+  uint32_t ms = millis();
+  if (ms - csiLastKeep < (uint32_t)(1000 / CSI_EMIT_HZ)) return;   // 抽稀到 CSI_EMIT_HZ
+  csiLastKeep = ms;
+  CsiPkt p;
+  int n = info->len / 2;
+  if (n > 64) n = 64;
+  const int8_t* b = (const int8_t*)info->buf;
+  float sum = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+  int kc = 0, k = 0;
+  for (int i = 0; i < n; i++) {
+    float im = b[2 * i], re = b[2 * i + 1];
+    float amp = sqrtf(re * re + im * im);
+    uint8_t q = amp > 255.f ? 255 : (uint8_t)(amp + 0.5f);
+    p.a[i] = q;
+    if (q > 0) {
+      sum += q; kc++;
+      if (csiHasPrev && csiPrev[i] > 0) { float x = q, y = csiPrev[i]; sa += x; sb += y; saa += x * x; sbb += y * y; sab += x * y; k++; }
+    }
+  }
+  for (int i = n; i < 64; i++) p.a[i] = 0;
+  float d = 0;
+  if (csiHasPrev && k > 8) {
+    float cov = sab - sa * sb / k, va = saa - sa * sa / k, vb = sbb - sb * sb / k;
+    if (va > 1e-3f && vb > 1e-3f) { d = 1.f - cov / sqrtf(va * vb); if (d < 0) d = 0; if (d > 2) d = 2; }
+  }
+  memcpy(csiPrev, p.a, 64);
+  csiHasPrev = true;
+  p.t = ms; p.rssi = info->rx_ctrl.rssi; p.ch = info->rx_ctrl.channel; p.n = (uint8_t)n;
+  p.m = kc ? sum / kc : 0; p.d = d;
+  csiKept++;
+  portENTER_CRITICAL(&csiMux);
+  CsiFeat& f = csiFeat[csiFeatN % CSI_FEAT_N];
+  f.t = ms; f.r = p.rssi; f.m10 = (uint16_t)(p.m * 10.f); f.d1000 = (uint16_t)(d * 1000.f);
+  csiFeatN++;
+  portEXIT_CRITICAL(&csiMux);
+  if (csiQ && xQueueSend(csiQ, &p, 0) != pdTRUE) csiDrop++;
+}
+
+static bool csiEnable() {
+  if (!csiCfgDone) {
+    wifi_csi_config_t c;
+    memset(&c, 0, sizeof(c));
+    c.lltf_en = true;            // 只取 L-LTF：固定 64 个子载波，兼容 11g/11n 所有包
+    c.htltf_en = false;
+    c.stbc_htltf2_en = false;
+    c.ltf_merge_en = true;
+    c.channel_filter_en = false; // 关闭平滑，保留人体引起的子载波细节
+    c.manu_scale = false;
+    c.shift = 0;
+    esp_err_t e1 = esp_wifi_set_csi_config(&c);
+    esp_err_t e2 = esp_wifi_set_csi_rx_cb(csiCb, nullptr);
+    esp_err_t e3 = esp_wifi_set_csi(true);
+    gCsiErr = (e1 != ESP_OK) ? (int)e1 : (e2 != ESP_OK) ? (int)e2 : (int)e3;
+    if (gCsiErr) { logf("[csi] ❌ 启用失败 err=0x%x/0x%x/0x%x（固件的 SDK 可能没开 CONFIG_ESP32_WIFI_CSI_ENABLED）", (unsigned)e1, (unsigned)e2, (unsigned)e3); return false; }
+    csiCfgDone = true;
+    logf("[csi] ✅ CSI 已启用（L-LTF 64 子载波，≤%d 包/秒输出）", CSI_EMIT_HZ);
+  }
+  return true;
+}
+
+static void csiStopPing() {
+  if (pingH) { esp_ping_stop(pingH); esp_ping_delete_session(pingH); pingH = nullptr; pingGw = 0; }
+}
+
+// STA 已连接：对网关高频 ping，让路由器持续回包 -> 每个回包产生一条 CSI
+static void csiStartPing() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  IPAddress g = WiFi.gatewayIP();
+  uint32_t gw = (uint32_t)g;
+  if (gw == 0) return;
+  if (pingH && pingGw == gw) { gCsiMode = 1; return; }
+  csiStopPing();
+  if (!csiEnable()) return;
+  ip_addr_t target;
+  IP_ADDR4(&target, g[0], g[1], g[2], g[3]);
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  cfg.target_addr = target;
+  cfg.count = ESP_PING_COUNT_INFINITE;
+  cfg.interval_ms = 1000 / CSI_PING_HZ;
+  cfg.timeout_ms = 1000;
+  cfg.data_size = 16;
+  esp_ping_callbacks_t cbs;
+  memset(&cbs, 0, sizeof(cbs));
+  if (esp_ping_new_session(&cfg, &cbs, &pingH) == ESP_OK && esp_ping_start(pingH) == ESP_OK) {
+    pingGw = gw; gCsiMode = 1;
+    logf("[csi] ping 网关 %s @%dHz 开始：路由器每个回包都会带一条 CSI", g.toString().c_str(), CSI_PING_HZ);
+  } else { pingH = nullptr; logf("[csi] ❌ 无法启动对网关的 ping"); }
+}
+
+static void noopSniffer(void*, wifi_promiscuous_pkt_type_t) {}
+
+// 被动模式：停在最强热点的信道上收包
+static void csiPassiveBegin() {
+  csiStopPing();
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_STA);
+  delay(30);
+  if (!csiEnable()) return;
+  wifi_promiscuous_filter_t filt;
+  filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA;
+  esp_wifi_set_promiscuous_filter(&filt);
+  esp_wifi_set_promiscuous_rx_cb(&noopSniffer);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(gBestCh, WIFI_SECOND_CHAN_NONE);
+  gCsiMode = 2;
+}
+static void csiPassiveEnd() {
+  if (gCsiMode == 2) { esp_wifi_set_promiscuous(false); gCsiMode = 0; }
+}
+
+// 独立任务：把队列里的 CSI 包输出到串口
+static void csiTask(void*) {
+  CsiPkt p;
+  char line[420];
+  uint32_t rateT = millis(), rateRaw = 0;
+  for (;;) {
+    if (xQueueReceive(csiQ, &p, 200 / portTICK_PERIOD_MS) == pdTRUE) {
+      char hex[130];
+      static const char* H = "0123456789abcdef";
+      for (int i = 0; i < p.n; i++) { hex[2 * i] = H[p.a[i] >> 4]; hex[2 * i + 1] = H[p.a[i] & 15]; }
+      hex[2 * p.n] = 0;
+      snprintf(line, sizeof(line), "{\"t\":%lu,\"r\":%d,\"c\":%u,\"m\":%.1f,\"d\":%.4f,\"a\":\"%s\"}", (unsigned long)p.t, (int)p.rssi, (unsigned)p.ch, p.m, p.d, hex);
+      outLine("RADARCSI:", line);
+    }
+    uint32_t now = millis();
+    if (now - rateT >= 1000) { gCsiRate = (int)(csiRaw - rateRaw); rateRaw = csiRaw; rateT = now; }
+  }
+}
+
+// 把最近的 CSI 特征（≈10 秒）附加到上传的帧里：服务器/网页用同一套算法做存在/运动/呼吸检测
+static void csiAppendSeries(String& body) {
+  if (csiFeatN == 0 || body.length() < 2) return;
+  CsiFeat tmp[CSI_FEAT_N];
+  uint32_t n;
+  portENTER_CRITICAL(&csiMux);
+  n = csiFeatN;
+  memcpy(tmp, csiFeat, sizeof(tmp));
+  portEXIT_CRITICAL(&csiMux);
+  uint32_t cnt = n < CSI_FEAT_N ? n : CSI_FEAT_N, start = n - cnt;
+  body.remove(body.length() - 1);
+  body += ",\"cs\":{\"now\":";
+  body += String((unsigned long)millis());
+  body += ",\"v\":[";
+  for (uint32_t i = 0; i < cnt; i++) {
+    const CsiFeat& f = tmp[(start + i) % CSI_FEAT_N];
+    if (i) body += ",";
+    char b[48];
+    snprintf(b, sizeof(b), "[%lu,%d,%u,%u]", (unsigned long)f.t, (int)f.r, (unsigned)f.m10, (unsigned)f.d1000);
+    body += b;
+  }
+  body += "]}}";
+}
+#endif  // ENABLE_CSI
 
 static bool hasTopic();
 static bool hasTarget();
@@ -442,6 +639,9 @@ static String buildFrame(bool includeSta, int& apCount) {
       apCount++;
     }
   }
+#if ENABLE_CSI
+  { int bestR = -127; for (int i = 0; i < n; i++) if (WiFi.RSSI(i) > bestR && WiFi.channel(i) >= 1 && WiFi.channel(i) <= 14) { bestR = WiFi.RSSI(i); gBestCh = WiFi.channel(i); } }
+#endif
   WiFi.scanDelete();
   if (includeSta) {
     JsonArray st = doc["st"].to<JsonArray>();
@@ -465,14 +665,19 @@ static String buildFrame(bool includeSta, int& apCount) {
 static void hbTask(void*) {
   for (;;) {
     vTaskDelay(HEARTBEAT_MS / portTICK_PERIOD_MS);
-    char b[320];
+    char b[460];
     snprintf(b, sizeof(b),
              "{\"fw\":\"%s\",\"node\":\"%s\",\"up\":%lu,\"st\":\"%s\",\"cyc\":%lu,\"seq\":%lu,\"aps\":%d,\"scanms\":%lu,"
-             "\"ok\":%lu,\"fail\":%lu,\"http\":%d,\"heap\":%lu,\"wifi\":%d,\"rssi\":%d}",
+             "\"ok\":%lu,\"fail\":%lu,\"http\":%d,\"heap\":%lu,\"wifi\":%d,\"rssi\":%d,\"csi\":%lu,\"csir\":%d,\"csim\":%d,\"csie\":%d,\"csid\":%lu}",
              FW_VERSION, nodeId.c_str(), (unsigned long)(millis() / 1000), (const char*)gState, (unsigned long)cycleNo,
              (unsigned long)seqNo, (int)gLastAps, (unsigned long)gScanMs, (unsigned long)okCount, (unsigned long)failCount,
              (int)gLastHttp, (unsigned long)ESP.getFreeHeap(), (int)WiFi.status(),
-             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0,
+#if ENABLE_CSI
+             (unsigned long)csiRaw, (int)gCsiRate, (int)gCsiMode, (int)gCsiErr, (unsigned long)csiDrop);
+#else
+             0UL, 0, 0, 0, 0UL);
+#endif
     outLine("RADARHB:", b);
   }
 }
@@ -503,6 +708,11 @@ void setup() {
   else if (!hasTarget()) logf("[info] 未配置 SERVER_URL/RADAR_TOPIC：只做串口输出");
   else logf("[info] 自动发现网址：汇合点 ntfy.sh/%s（Kaggle 重开后网址变化也不用重新烧录）", RADAR_TOPIC);
   sendHello();
+#if ENABLE_CSI
+  csiQ = xQueueCreate(CSI_QUEUE_LEN, sizeof(CsiPkt));
+  xTaskCreatePinnedToCore(csiTask, "csi", 6144, nullptr, 2, nullptr, 0);
+  logf("[csi] 已开启 CSI 感知：%s", cfgSsid.length() ? "已配置 WiFi -> 连上后对网关 ping，取路由器回包的 CSI" : "未配置 WiFi -> 被动模式（实验）；要稳定的 CSI 请在 config.h 填 WIFI_SSID/WIFI_PASS");
+#endif
   xTaskCreatePinnedToCore(hbTask, "hb", 4096, nullptr, 1, nullptr, 0);
   logf("[boot] 开始扫描…（第一帧约 2 秒内）");
   led(0, 0, 40);
@@ -511,7 +721,11 @@ void setup() {
 void loop() {
   handleSerial();
   uint32_t t0 = millis();
-  bool doSniff = ENABLE_SNIFF && cycleNo > 0 && (cycleNo % SNIFF_EVERY == 0);
+  int sniffEvery = SNIFF_EVERY;
+#if ENABLE_CSI
+  if (WiFi.status() == WL_CONNECTED) sniffEvery = SNIFF_EVERY_CSI;   // CSI 模式下少断线：嗅探会中断 CSI
+#endif
+  bool doSniff = ENABLE_SNIFF && cycleNo > 0 && (cycleNo % sniffEvery == 0);
   if (doSniff) sniffRound();
   int apCount = 0;
   gState = "scan";
@@ -524,7 +738,11 @@ void loop() {
   outLine("RADARJSON:", body.c_str());   // 先从串口输出，再尝试联网：联网失败不影响 3D 显示
 
   if (millis() - lastHello > HELLO_EVERY_MS) sendHello();
-  if (wifiReady()) {
+  bool wifiUp = wifiReady();
+#if ENABLE_CSI
+  if (wifiUp) csiStartPing();
+#endif
+  if (wifiUp) {
     // 取得服务器网址：优先用汇合点上 Kaggle 发布的最新网址，其次用 config.h 的 SERVER_URL
     if (hasTopic() && (!everResolved ? (lastResolve == 0 || millis() - lastResolve > 15000) : (millis() - lastResolve > TOPIC_REFRESH_MS || (consecFail >= 3 && millis() - lastResolve > 20000)))) {
       gState = "resolve";
@@ -538,7 +756,11 @@ void loop() {
       gLastHttp = -100;
     } else {
       gState = "upload";
-      int code = postFrame(body);
+      String upBody = body;
+#if ENABLE_CSI
+      csiAppendSeries(upBody);   // 上传时附带最近 ≈10 秒的 CSI 特征序列
+#endif
+      int code = postFrame(upBody);
       gLastHttp = code;
       if (code >= 200 && code < 300) { okCount++; consecFail = 0; led(0, 40, 0); }
       else { failCount++; consecFail++; led(40, 10, 0); }
@@ -551,9 +773,20 @@ void loop() {
   }
   cycleNo++;
   gState = "idle";
+  uint32_t period = SCAN_PERIOD_MS;
+#if ENABLE_CSI
+  if (WiFi.status() == WL_CONNECTED) period = CSI_SCAN_PERIOD_MS;            // 已连路由器：长间隔，让 CSI 连续流动
+  else {                                                                      // 没连上：被动 CSI 监听一段时间
+    csiPassiveBegin();
+    gState = "csi";
+    uint32_t until2 = millis() + CSI_PASSIVE_MS;
+    while ((int32_t)(until2 - millis()) > 0) { handleSerial(); delay(20); }
+    csiPassiveEnd();
+  }
+#endif
   uint32_t used = millis() - t0;
-  if (used < SCAN_PERIOD_MS) {
-    uint32_t until = millis() + (SCAN_PERIOD_MS - used);
+  if (used < period) {
+    uint32_t until = millis() + (period - used);
     while ((int32_t)(until - millis()) > 0) { handleSerial(); delay(20); }
   }
 }
