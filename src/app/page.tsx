@@ -1,5 +1,5 @@
-import Simulator from "./Simulator";
+import SimulatorShell from "@/components/SimulatorShell";
 
 export default function HomePage() {
-  return <Simulator />;
+  return <SimulatorShell />;
 }
