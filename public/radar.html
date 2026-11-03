@@ -27,7 +27,7 @@ button.pri:hover{filter:brightness(1.1)}
 .stats div{font-size:22px;font-weight:700;line-height:1.1}
 .stats span{display:block;font-size:11px;font-weight:400;color:var(--dim)}
 #gpu{margin-top:7px;font-size:11.5px;color:var(--dim)}
-#ctl{left:14px;bottom:14px;width:370px;max-height:calc(100% - 230px);overflow:auto}
+#ctl{left:14px;bottom:14px;width:370px;max-height:calc(100% - 470px);min-height:150px;overflow:auto}
 .row2{display:flex;align-items:center;gap:8px;margin:3px 0}
 .row2 label{flex:0 0 112px;color:var(--dim)}
 .row2 input[type=range]{flex:1}
@@ -81,6 +81,14 @@ button.pri:hover{filter:brightness(1.1)}
 #dgLog{flex:1;overflow:auto;margin-top:6px;background:#050b14;border-radius:8px;padding:6px;font:11px/1.45 Consolas,Menlo,monospace}
 #dgLog .l{white-space:pre-wrap;word-break:break-all}#dgLog u{text-decoration:none;color:#58708a}#dgLog em{font-style:normal;color:#4cc9f0}
 #dgLog .ERR{color:#ff8fa0}#dgLog .WARN{color:#ffd23f}#dgLog .OK{color:#2ee6a6}#dgLog .INFO{color:#b6cddc}
+#csibox{left:14px;top:150px;width:340px;padding:9px 12px;font-size:12px}
+#csibox .t{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px}
+#csibox canvas{width:100%;display:block;border-radius:6px;margin-top:5px;background:#04101c}
+#csiNum{color:#a9c4d6;line-height:1.5}
+#csibox .btns{margin-top:6px}
+#csibox button{padding:3px 8px;font-size:12px}
+#csiNote{margin-top:5px;color:#7f9db3;font-size:11px;line-height:1.4}
+@media(max-height:760px){#csibox canvas#csiWf{display:none}}
 @media(max-width:900px){#dgp{right:14px;width:calc(100% - 28px)}}
 </style>
 </head>
@@ -99,6 +107,15 @@ button.pri:hover{filter:brightness(1.1)}
   <div id="gpu">GPU: 检测中…</div>
 </div>
 
+<div id="csibox" class="panel">
+  <div class="t"><b>📶 CSI 真实感知</b><span class="chip" id="csiSt">等待 CSI</span></div>
+  <div id="csiNum">等待 CSI…</div>
+  <canvas id="csiWf" width="280" height="64"></canvas>
+  <canvas id="csiMv" width="320" height="38"></canvas>
+  <div class="btns"><button id="bCal">🎯 校准(房间无人)</button><button id="bFocus">🧍 聚焦人体</button></div>
+  <div id="csiNote">人体存在/运动/呼吸来自 ESP32 的 CSI；单节点无法还原关节，3D 人体是活动状态驱动的示意模型。</div>
+</div>
+
 <div id="ctl" class="panel">
   <div class="row2"><label>路径损耗指数 n</label><input id="sN" type="range" min="1.6" max="4.5" step="0.05"><output id="oN"></output></div>
   <div class="row2"><label>1 米参考功率 dBm</label><input id="sT" type="range" min="-70" max="-20" step="1"><output id="oT"></output></div>
@@ -109,6 +126,7 @@ button.pri:hover{filter:brightness(1.1)}
     <label><input type="checkbox" id="cBld"> 街区底图</label>
     <label><input type="checkbox" id="cHeat"> 信号热力</label>
     <label><input type="checkbox" id="cRot"> 自动旋转</label>
+    <label><input type="checkbox" id="cBody"> 人体网格</label>
   </div>
   <div class="btns">
     <button id="bSerial" class="pri">🔌 USB 连接 ESP32</button>
@@ -274,11 +292,25 @@ function diagChecks() {
   // 8 数据
   var nl = 0; APS.forEach(function (a) { if (a.live) nl++; });
   if (frameCount === 0) add('data', '扫描数据', 'wait', '还没有任何数据帧');
-  else { var fa = (tn / 1000 - lastFrameAt); add('data', '扫描数据', fa > 10 ? 'bad' : (nl === 0 ? 'warn' : 'ok'), '共 ' + frameCount + ' 帧 · 实时 AP ' + nl + ' · 设备 ' + STAS.size + ' · 最近一帧 ' + fa.toFixed(1) + 's 前' + (mode === 'demo' ? ' · (演示数据)' : ''), nl === 0 ? 'ESP32 扫到 0 个 AP：天线/位置/扫描是否异常' : ''); }
+  else { var fa = (tn / 1000 - lastFrameAt); add('data', '扫描数据', fa > 30 ? 'bad' : fa > 16 ? 'warn' : (nl === 0 ? 'warn' : 'ok'), '共 ' + frameCount + ' 帧 · 实时 AP ' + nl + ' · 设备 ' + STAS.size + ' · 最近一帧 ' + fa.toFixed(1) + 's 前' + (mode === 'demo' ? ' · (演示数据)' : ''), nl === 0 ? 'ESP32 扫到 0 个 AP：天线/位置/扫描是否异常' : ''); }
   // 9 GPU
   if (SIM) add('gpu', 'Kaggle GPU', 'wait', '模拟器无 GPU');
   else if (SERVER) add('gpu', 'Kaggle GPU', SERVER.gpu && SERVER.gpu.length ? 'ok' : 'warn', (SERVER.gpu && SERVER.gpu.length ? SERVER.gpu.join(' + ') : '无 GPU（CPU 模式）') + (SERVER.res ? ' · ' + SERVER.res : ''), SERVER.gpu && SERVER.gpu.length ? '' : 'Kaggle: Settings → Accelerator 选 GPU T4 x2');
   else add('gpu', 'Kaggle GPU', 'wait', '等待服务器状态');
+  // CSI 感知
+  if (!SIM) {
+    var hbi = s.hbInfo, hl = s.hello, cage = (tn - CS.lastAt) / 1000;
+    if (CS.total > 0) {
+      var cr = CS.res;
+      if (cage > 6) add('csi', 'CSI 感知数据', 'bad', 'CSI 中断 ' + cage.toFixed(0) + ' 秒（已收 ' + CS.total + ' 个）', '路由器是否断开 / ESP32 是否在做 AP 扫描（每 10 秒一次约 2 秒）/ 换 USB 线');
+      else add('csi', 'CSI 感知数据', CS.synth ? 'warn' : 'ok', (CS.synth ? '【模拟数据】' : '真实 CSI ') + '已收 ' + CS.total + ' 个 · ' + (cr ? cr.rate.toFixed(1) + ' 包/s · 运动 ' + cr.level.toFixed(1) + '× · ' + ACT_TXT[cr.act] + (cr.breath ? ' · 呼吸 ' + cr.breath.toFixed(0) : '') : '分析中') + ' · 来源 USB=' + CS.usb + ' WiFi特征=' + CS.series);
+    } else if (hl && hl.csi === undefined) add('csi', 'CSI 感知数据', 'warn', '固件是旧版 v' + hl.fw + '，没有 CSI 功能', '用本项目 firmware/ 重新 Upload（需要 v5.0.0）');
+    else if (hbi && hbi.csie) add('csi', 'CSI 感知数据', 'bad', '固件启用 CSI 失败，错误码 ' + hbi.csie, '该 SDK 构建未开启 CSI；换 platformio.ini 的 platform 版本 / 重新编译');
+    else if (hbi && hbi.csim === 1 && (hbi.csi || 0) === 0) add('csi', 'CSI 感知数据', 'bad', 'ESP32 已连路由器并在 ping 网关，但 0 个 CSI 包', '路由器是否禁 ping（ICMP）？换一台路由器/手机热点 2.4GHz；或固件串口看 [csi] 日志');
+    else if (hbi && hbi.csim === 2 && (hbi.csi || 0) === 0) add('csi', 'CSI 感知数据', 'warn', '被动模式（未连路由器）0 个 CSI 包：多数路由器信标是 11b 速率，没有 CSI', '在 config.h 填 WIFI_SSID/WIFI_PASS（2.4GHz）后重新 Upload，进入 STA+ping 模式');
+    else if (hbi) add('csi', 'CSI 感知数据', 'wait', '固件在线，CSI 模式=' + (hbi.csim === 1 ? 'STA' : hbi.csim === 2 ? '被动' : '待机/扫描中') + '，包数=' + (hbi.csi || 0) + '，速率=' + (hbi.csir || 0) + '/s');
+    else add('csi', 'CSI 感知数据', 'wait', '尚未收到（需要固件 v5 + 已连接的 USB / WiFi 上传）');
+  }
   var rank = { ok: 0, wait: 1, warn: 2, bad: 3 }, lv = 'ok', first = null;
   C.forEach(function (c) { if (rank[c.st] > rank[lv]) lv = c.st; if (!first && c.st === 'bad') first = c; });
   if (!first) C.forEach(function (c) { if (!first && c.st === 'warn') first = c; });
@@ -310,6 +342,11 @@ function buildReport() {
   L.push('最近原始: ' + (s.lastRaw || '-'));
   if (s.hello) L.push('HELLO: ' + safeJson(s.hello));
   if (s.hbInfo) L.push('HB: ' + safeJson(s.hbInfo));
+  L.push('');
+  L.push('--- CSI 感知 ---');
+  L.push('total=' + CS.total + ' usb=' + CS.usb + ' series=' + CS.series + ' bad=' + CS.bad + ' synth=' + CS.synth + ' present=' + CS.present + ' floor=' + (CS.floor || 0).toFixed(4) + ' postOK=' + CS.postOK + ' postFail=' + CS.postFail + ' last=' + CS.lastPost);
+  if (CS.res) L.push('analysis=' + safeJson({ n: CS.res.n, age: +CS.res.age.toFixed(1), rate: +CS.res.rate.toFixed(1), mv: +CS.res.mv.toFixed(4), level: +CS.res.level.toFixed(2), act: CS.res.act, breath: +CS.res.breath.toFixed(1), snr: +CS.res.snr.toFixed(2), dom: CS.res.dom, rssi: +CS.res.rssi.toFixed(0) }));
+  if (CS.srvRes) L.push('server-sense=' + safeJson(CS.srvRes));
   L.push('');
   L.push('--- 服务器 ---');
   L.push('health=' + safeJson({ ok: DG.srv.ok, ms: DG.srv.ms, err: DG.srv.err, info: DG.srv.info }));
@@ -409,6 +446,8 @@ function ingest2(f, src) {
       st.rssi = st.rssi * 0.5 + (+s2.r || -80) * 0.5; st.ch = s2.c; st.cnt = s2.n; st.bssid = s2.b ? String(s2.b).toUpperCase() : st.bssid; st.last = t; st.node = id;
     });
   }
+  csiFromSeries(f, id, src);
+  if ((src === 'sim' || src === 'demo') && !SYN.timer) csiSynthStart();
   lastFrameAt = t; frameCount++; heatDirty = true;
   if (frameCount === 1) dlog('OK', 'data', '🎉 3D 世界已收到第一帧：AP ' + good + ' 个，来源 ' + (src || 'wifi'));
   $('wait').style.display = 'none';
@@ -693,6 +732,7 @@ function frameBody(tn) {
   drawNodes(t);
   drawStations(t);
   drawAPs(dt, t);
+  drawCsiBody(dt, t);
 }
 var fpsN = 0;
 function frame(tn) {
@@ -702,6 +742,271 @@ function frame(tn) {
 }
 setInterval(function () { DG.r.fps = fpsN; fpsN = 0; }, 1000);
 requestAnimationFrame(frame);
+
+/* ================= v5：CSI 真实 WiFi 感知（存在 / 运动 / 呼吸 / 活动 → 3D 人体） =================
+   数据来源：① USB 串口 RADARCSI 行（原始 64 子载波）② ESP32 WiFi 上传帧里的 cs 特征序列 ③ 演示/模拟器的合成 CSI（界面明确标注“模拟”）
+   算法：湍流 d=1-相邻包相关系数 → 运动指数；平均幅度 m 的 0.1~0.55Hz 谱峰 → 呼吸；运动谱 0.5~8Hz → 活动类型。
+   诚实边界：单个 ESP32 只有一条链路，能判断“链路区域内有没有人 / 动没动 / 呼吸”，不能还原关节；3D 人体是由活动状态驱动的示意模型。 */
+var CSBUF = [], CSN = {}, CSMAX = 7000;
+var CS = { total: 0, usb: 0, ser: 0, series: 0, synth: false, lastAt: 0, res: null, floor: 0, h1: [], wf: [], present: false, onAt: 0, offAt: 0, calUntil: 0, calVals: [], bodyAmp: 0, ph: 0, brPh: 0, q: [], postOK: 0, postFail: 0, lastPost: '', bad: 0, lv: [], log1: false, srvRes: null, lastStr: '' };
+function csiAdd(s) {
+  var L = CSBUF.length;
+  if (L && s.t < CSBUF[L - 1].t) { var i = L; while (i > 0 && CSBUF[i - 1].t > s.t) i--; CSBUF.splice(i, 0, s); } else CSBUF.push(s);
+  if (CSBUF.length > CSMAX) CSBUF.splice(0, CSBUF.length - CSMAX);
+  CS.total++; CS.lastAt = Date.now();
+  if (s.a) { CS.wf.push(s.a); if (CS.wf.length > 140) CS.wf.shift(); }
+  if (!CS.log1) { CS.log1 = true; dlog('OK', 'csi', '✅ 收到第一个 CSI 样本（来源 ' + s.src + (s.a ? '，含 ' + s.a.length + ' 个子载波' : '，仅特征') + '）：平均幅度 ' + s.m.toFixed(1) + ' · 湍流 ' + s.d.toFixed(4) + ' · RSSI ' + s.r); $('wait').style.display = 'none'; }
+}
+function csiFromSerial(txt) {
+  var j; try { j = JSON.parse(txt); } catch (e) { CS.bad++; dlogRate('csibad', 3000, 'ERR', 'csi', 'RADARCSI 行解析失败：' + e.message + ' · ' + txt.slice(0, 50)); return; }
+  var id = (DG.ser.hello && DG.ser.hello.node) || (DG.ser.hbInfo && DG.ser.hbInfo.node) || 'S3-USB';
+  var nd = CSN[id] || (CSN[id] = { off: 1e18, lastT: -1 }), fw = +j.t, tn = Date.now();
+  if (!isFinite(fw)) { CS.bad++; return; }
+  if (fw < nd.lastT - 1000) nd.off = 1e18;
+  nd.lastT = fw;
+  if (tn - fw < nd.off) nd.off = tn - fw; else nd.off += 1;
+  var a = null;
+  if (typeof j.a === 'string' && j.a.length >= 16) { a = new Uint8Array(j.a.length >> 1); for (var i = 0; i < a.length; i++) a[i] = parseInt(j.a.substr(2 * i, 2), 16) || 0; }
+  var s = { t: fw + nd.off, m: +j.m || 0, d: +j.d || 0, r: +j.r || 0, c: +j.c || 0, a: a, src: CS.synth ? '模拟' : 'usb' };
+  csiAdd(s);
+  if (!CS.synth) { CS.usb++; CS.ser = tn; csiQueue(s); }
+}
+function csiFromSeries(f, id, src) {
+  var cs = f.cs; if (!cs || !Array.isArray(cs.v) || !cs.v.length) return;
+  if (Date.now() - CS.ser < 5000) return;
+  var nd = CSN[id] || (CSN[id] = { off: 0, lastT: -1, lastE: 0 });
+  if (cs.v[0][0] < nd.lastT - 1000) { nd.lastT = -1; nd.lastE = 0; }
+  var base = Date.now() - (src === 'poll' ? (+f.age || 0) * 1000 : 0), nowFw = +cs.now, added = 0;
+  cs.v.forEach(function (v) {
+    if (!Array.isArray(v) || v[0] <= nd.lastT) return;
+    var t = base - (nowFw - v[0]); if (t <= nd.lastE) return;
+    csiAdd({ t: t, r: +v[1] || 0, m: (+v[2] || 0) / 10, d: (+v[3] || 0) / 1000, a: null, src: 'wifi' });
+    nd.lastT = v[0]; nd.lastE = t; added++;
+  });
+  CS.series += added;
+}
+function csiQueue(s) { CS.q.push([Math.round(s.t), s.r, +s.m.toFixed(1), +s.d.toFixed(4)]); if (CS.q.length > 400) CS.q.splice(0, 200); }
+setInterval(function () {
+  if (SIM || mode !== 'live' || !CS.q.length) return;
+  var batch = CS.q; CS.q = [];
+  var id = (DG.ser.hello && DG.ser.hello.node) || 'S3-USB';
+  fetch('api/csi', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Key': apiKey() }, body: JSON.stringify({ node: id, v: batch }) })
+    .then(function (r) { CS.lastPost = 'HTTP ' + r.status; if (r.ok) CS.postOK++; else CS.postFail++; })
+    .catch(function (e) { CS.postFail++; CS.lastPost = '异常 ' + e.message; });
+}, 1000);
+
+function csiInterp(win, t0, dt, n, key) {
+  var out = new Float32Array(n), j = 0, gaps = 0;
+  for (var i = 0; i < n; i++) {
+    var tt = t0 + i * dt;
+    while (j + 1 < win.length && win[j + 1].t < tt) j++;
+    var a = win[j], b = win[j + 1];
+    if (!b) { out[i] = a[key]; if (tt - a.t > 1500) gaps++; continue; }
+    var f = (tt - a.t) / Math.max(1, b.t - a.t); f = f < 0 ? 0 : f > 1 ? 1 : f;
+    if (b.t - a.t > 1500 && f > 0 && f < 1) gaps++;
+    out[i] = a[key] + (b[key] - a[key]) * f;
+  }
+  return { v: out, gaps: gaps };
+}
+function csiDFT(x, fs, f0, f1, df) {
+  var n = x.length, mean = 0, i; for (i = 0; i < n; i++) mean += x[i]; mean /= n;
+  var y = new Float32Array(n); for (i = 0; i < n; i++) y[i] = (x[i] - mean) * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (n - 1)));
+  var out = [];
+  for (var f = f0; f <= f1 + 1e-9; f += df) {
+    var re = 0, im = 0, w = 2 * Math.PI * f / fs;
+    for (i = 0; i < n; i++) { re += y[i] * Math.cos(w * i); im -= y[i] * Math.sin(w * i); }
+    out.push({ f: f, p: Math.sqrt(re * re + im * im) / n });
+  }
+  return out;
+}
+function csiPct(arr, q) { if (!arr.length) return 0; var s = arr.slice().sort(function (a, b) { return a - b; }); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; }
+function csiAnalyze() {
+  var tn = Date.now(), L = CSBUF.length; if (L < 8) return null;
+  var i0 = L - 1; while (i0 > 0 && tn - CSBUF[i0 - 1].t < 45000) i0--;
+  var win = CSBUF.slice(i0), last = win[win.length - 1], age = (tn - last.t) / 1000;
+  var n2 = 0, s2 = 0, n1 = 0, s1 = 0, rs = 0;
+  for (var i = win.length - 1; i >= 0 && tn - win[i].t < 2500; i--) { n2++; s2 += win[i].d; rs += win[i].r; if (tn - win[i].t < 1200) { n1++; s1 += win[i].d; } }
+  var res = { n: win.length, age: age, rate: n2 / 2.5, mv: n2 ? s2 / n2 : 0, mv1: n1 ? s1 / n1 : 0, rssi: n2 ? rs / n2 : 0, stale: age > 3, floor: 0, level: 0, present: false, act: 'empty', breath: 0, snr: 0, dom: 0, calib: false, spec: [] };
+  var calibrating = tn < CS.calUntil;
+  if (calibrating) { res.calib = true; res.floor = CS.floor; }
+  else {
+    if (CS.calUntil && CS.calVals.length) { CS.floor = Math.max(0.004, 1.15 * CS.calVals.reduce(function (a, b) { return a + b; }, 0) / CS.calVals.length); CS.calVals = []; CS.calUntil = 0; CS.h1 = []; dlog('OK', 'csi', '🎯 手动校准完成：静止基线 = ' + CS.floor.toFixed(4)); }
+    if (CS.h1.length >= 8) CS.floor = Math.max(0.004, csiPct(CS.h1, 0.2)) * 1.1;
+    res.floor = CS.floor; res.calib = CS.h1.length < 8 && !CS.floor;
+  }
+  var fl = Math.max(0.004, res.floor || 0.01);
+  res.level = res.stale ? 0 : res.mv / fl;
+  // 运动谱：d 序列 20Hz，最近 6 秒
+  var dd = csiInterp(win, tn - 6000, 50, 120, 'd');
+  var sp = csiDFT(dd.v, 20, 0.5, 8, 0.5), pk = 0, pf = 0;
+  sp.forEach(function (q) { if (q.p > pk) { pk = q.p; pf = q.f; } });
+  res.spec = sp.map(function (q) { return q.p; }); res.dom = pf;
+  // 呼吸：m 序列 10Hz，最近 32 秒（需要连续、低运动）
+  if (win.length > 100 && tn - win[0].t > 26000 && !res.stale) {
+    var mm = csiInterp(win, tn - 32000, 100, 320, 'm');
+    if (mm.gaps < 4) {
+      var x = mm.v, y = new Float32Array(x.length), k;
+      for (k = 0; k < x.length; k++) { var a = Math.max(0, k - 25), b = Math.min(x.length - 1, k + 25), sm = 0; for (var q2 = a; q2 <= b; q2++) sm += x[q2]; y[k] = x[k] - sm / (b - a + 1); }
+      var bs = csiDFT(y, 10, 0.1, 0.55, 0.01), bp = 0, bf = 0, ps = [];
+      bs.forEach(function (q) { ps.push(q.p); if (q.p > bp) { bp = q.p; bf = q.f; } });
+      var med = csiPct(ps, 0.5) || 1e-6; res.snr = bp / med; res.breath = res.snr >= 5 && bp > 0.02 ? bf * 60 : 0;
+    }
+  }
+  // 存在判定（带滞回）
+  if (!res.stale && !res.calib) {
+    if (!CS.present && res.level > 2.6) { if (!CS.onAt) CS.onAt = tn; if (tn - CS.onAt > 900) { CS.present = true; CS.offAt = 0; dlog('INFO', 'csi', '👤 检测到人体活动：运动指数 ' + res.level.toFixed(1) + '×基线'); if (!CS.autoFocus) { CS.autoFocus = true; csiFocus(); } } } else if (!CS.present) CS.onAt = 0;
+    if (CS.present && res.level < 1.7) { if (!CS.offAt) CS.offAt = tn; if (tn - CS.offAt > 5000) { CS.present = false; CS.onAt = 0; dlog('INFO', 'csi', '链路区域内无明显活动'); } } else if (CS.present) CS.offAt = 0;
+  } else if (res.stale) { CS.present = false; CS.onAt = 0; }
+  res.present = CS.present;
+  if (res.present) res.act = res.level >= 7 && res.dom >= 0.5 ? 'walking' : res.level >= 3.5 ? 'moving' : (res.breath ? 'still' : 'moving');
+  else if (res.breath && res.level < 1.7) { res.act = 'still'; res.present = true; }
+  else res.act = 'empty';
+  return res;
+}
+var ACT_TXT = { empty: '无人/无明显活动', still: '静止（呼吸级）', moving: '小幅动作', walking: '走动/大幅动作' };
+setInterval(function () { var r = CS.res; if (!r || r.stale) return; if (CS.calUntil && Date.now() < CS.calUntil) { CS.calVals.push(r.mv1); return; } CS.h1.push(r.mv1); if (CS.h1.length > 180) CS.h1.shift(); }, 1000);
+setInterval(function () {
+  try { CS.res = csiAnalyze(); } catch (e) { dlogRate('csierr', 4000, 'ERR', 'csi', 'CSI 分析出错：' + e.message); }
+  var r = CS.res; if (r) { CS.lv.push(r.stale ? 0 : r.level); if (CS.lv.length > 120) CS.lv.shift(); }
+  csiHud();
+}, 500);
+function csiHud() {
+  var r = CS.res, st = $('csiSt'), num = $('csiNum'), tn = Date.now();
+  if (!st) return;
+  var src = CS.synth ? '【模拟 CSI·非真实】' : (tn - CS.ser < 5000 ? 'USB 串口 CSI' : CS.series ? 'WiFi 直传 CSI' : '');
+  if (!r) { st.textContent = '等待 CSI'; st.className = 'chip'; num.innerHTML = '固件 v5 连上路由器后每秒约 20 个 CSI 包。<br>未收到：见「🩺 检测日志」的 CSI 检测项。'; return; }
+  if (r.stale) { st.textContent = 'CSI 中断 ' + Math.round(r.age) + 's'; st.className = 'chip bad'; }
+  else if (r.calib) { st.textContent = '校准基线中…'; st.className = 'chip warn'; }
+  else { st.textContent = r.present ? '👤 ' + ACT_TXT[r.act] : '空'; st.className = 'chip ' + (r.present ? 'ok' : ''); }
+  num.innerHTML = src + ' · ' + r.rate.toFixed(1) + ' 包/s · RSSI ' + r.rssi.toFixed(0) + '<br>运动指数 <b>' + r.level.toFixed(1) + '×</b>（基线 ' + (r.floor || 0).toFixed(4) + '）· 主频 ' + (r.dom || 0).toFixed(1) + 'Hz' +
+    '<br>呼吸 <b>' + (r.breath ? r.breath.toFixed(0) + ' 次/分' : '—') + '</b>（谱峰 SNR ' + r.snr.toFixed(1) + '）' + (CS.srvRes ? '<br><span style="color:#7f9db3">GPU: ' + esc(csiSrvTxt()) + '</span>' : '');
+  csiDrawWf(); csiDrawMv();
+}
+function csiSrvTxt() { var s = CS.srvRes; if (!s) return ''; return (s.gpu || 'CPU') + ' · 运动 ' + (+s.level || 0).toFixed(1) + '× · 呼吸 ' + (s.breath ? (+s.breath).toFixed(0) : '—') + ' · ' + (s.act || ''); }
+function csiDrawWf() {
+  var cv = $('csiWf'); if (!cv) return; var c = cv.getContext('2d'), w = cv.width, h = cv.height;
+  c.fillStyle = '#04101c'; c.fillRect(0, 0, w, h);
+  var cols = CS.wf.length;
+  if (cols < 3) { c.fillStyle = '#7f9db3'; c.font = '11px sans-serif'; c.fillText(CS.series && !CS.total ? '' : 'CSI 子载波瀑布（USB 直连时显示）', 8, 20); return; }
+  var ns = 64, mean = new Float32Array(ns), i, k;
+  for (k = 0; k < cols; k++) for (i = 0; i < ns; i++) mean[i] += (CS.wf[k][i] || 0) / cols;
+  var cw = w / 140;
+  for (k = 0; k < cols; k++) for (i = 0; i < ns; i++) {
+    var a = CS.wf[k][i] || 0; if (!a && !mean[i]) continue;
+    var dv = Math.min(1, Math.abs(a - mean[i]) / (mean[i] * 0.35 + 3));
+    c.fillStyle = BCOL[Math.round(dv * 48)]; c.fillRect((140 - cols + k) * cw, h - (i + 1) * (h / ns), cw + 0.5, h / ns + 0.5);
+  }
+}
+function csiDrawMv() {
+  var cv = $('csiMv'); if (!cv) return; var c = cv.getContext('2d'), w = cv.width, h = cv.height;
+  c.fillStyle = '#04101c'; c.fillRect(0, 0, w, h);
+  var y2 = h - Math.min(1, 2.6 / 12) * h; c.strokeStyle = 'rgba(255,210,63,.4)'; c.beginPath(); c.moveTo(0, y2); c.lineTo(w, y2); c.stroke();
+  c.strokeStyle = '#2ee6a6'; c.lineWidth = 1.5; c.beginPath();
+  CS.lv.forEach(function (v, i) { var x = w - (CS.lv.length - i) * (w / 120), y = h - Math.min(1, v / 12) * (h - 3) - 1; if (i) c.lineTo(x, y); else c.moveTo(x, y); });
+  c.stroke();
+}
+/* ---- 合成 CSI（仅演示 / 模拟器：与真实固件同格式的 RADARCSI 行） ---- */
+var SYN = { t0: 0, timer: null, off: 0, tick: 0 };
+function csiSynthLine(ms) {
+  var ts = ms / 1000, cyc = ts % 44, st = cyc < 12 ? 0 : cyc < 26 ? 1 : 2, r = rng(Math.floor(ms / 50) + 7), i, hex = '', mAmp = 0, d;
+  var br = Math.sin(2 * Math.PI * 0.27 * ts);
+  d = st === 0 ? 0.008 + r() * 0.004 : st === 1 ? 0.016 + r() * 0.01 : 0.05 + 0.14 * Math.abs(Math.sin(2 * Math.PI * 1.25 * ts)) + r() * 0.03;
+  for (i = 0; i < 64; i++) {
+    var valid = (i >= 6 && i <= 31) || (i >= 33 && i <= 58), amp = 0;
+    if (valid) { amp = 40 + 18 * Math.cos(i * 0.22) + (st === 1 ? 1.4 * br * Math.sin(i * 0.5) : 0) + (st === 2 ? 6 * Math.sin(2 * Math.PI * 1.25 * ts + i * 0.35) : 0) + (r() - 0.5) * 1.2; amp = Math.max(1, Math.min(255, Math.round(amp))); mAmp += amp; }
+    hex += (amp < 16 ? '0' : '') + amp.toString(16);
+  }
+  return 'RADARCSI:{"t":' + ms + ',"r":' + Math.round(-48 + (st === 2 ? 3 * Math.sin(ts * 5) : 0)) + ',"c":6,"m":' + (mAmp / 52 + (st === 1 ? 0.5 * br : 0)).toFixed(1) + ',"d":' + d.toFixed(4) + ',"a":"' + hex + '"}';
+}
+function csiSynthStart() {
+  CS.synth = true; if (SYN.timer) return;
+  SYN.t0 = Date.now();
+  SYN.timer = setInterval(function () { onSerialLine(csiSynthLine(Date.now() - SYN.t0)); }, 50);
+}
+function csiSynthStop() { clearInterval(SYN.timer); SYN.timer = null; CS.synth = false; }
+
+/* ---- 3D：菲涅尔区 + CSI 驱动的人体线框网格（蓝→黄，仿 DensePose UV 着色） ---- */
+var BCOL = []; (function () { for (var i = 0; i <= 48; i++) { var v = i / 48, r, gg, b; if (v < 0.5) { var k = v / 0.5; r = 36 + 20 * k; gg = 90 + 140 * k; b = 215 - 20 * k; } else { var k2 = (v - 0.5) / 0.5; r = 56 + 199 * k2; gg = 230 + 5 * k2; b = 195 - 135 * k2; } BCOL.push('rgb(' + (r | 0) + ',' + (gg | 0) + ',' + (b | 0) + ')'); } })();
+function csiLink() {
+  var nd = NODES.values().next().value, nx = nd ? nd.x : 0, ny = nd ? nd.y : 0, ap = null, ssid = DG.ser.hello && DG.ser.hello.ssid, best = -999;
+  APS.forEach(function (a) { if (!a.live) return; var sc = a.rssi + (ssid && a.ssid === ssid ? 200 : 0); if (sc > best) { best = sc; ap = a; } });
+  var ax = ap ? ap.tx : nx, ay = ap ? ap.ty : ny + 4;
+  if (!ap || Math.hypot(ax - nx, ay - ny) < 1.5) { ax = nx + 3; ay = ny + 3; }
+  return { nx: nx, ny: ny, ax: ax, ay: ay, d: Math.hypot(ax - nx, ay - ny), ap: ap };
+}
+function bLimb(o, ang, len, lat) { return [o[0] + (lat || 0), o[1] + Math.sin(ang) * len, o[2] - Math.cos(ang) * len]; }
+function bodyJoints(P) {
+  var J = {}, w = P.mode === 'walking', mv = P.mode === 'moving', A = w ? 0.3 + 0.32 * P.s : 0, bob = w ? 0.025 * Math.cos(2 * P.ph) : 0, br = P.br, t = P.t, sway = mv ? 0.02 * Math.sin(t * 1.7) : 0;
+  J.pel = [sway, 0, 0.96 + bob]; J.chest = [sway * 1.4, 0, 1.31 + bob + 0.007 * br]; J.neck = [sway * 1.6, 0.01, 1.51 + bob + 0.007 * br]; J.head = [sway * 1.6, 0.02, 1.66 + bob + 0.005 * br]; J.top = [sway * 1.6, 0.02, 1.79 + bob + 0.005 * br];
+  [-1, 1].forEach(function (sd) {
+    var k = sd > 0 ? 'R' : 'L', ph = P.ph + (sd > 0 ? 0 : Math.PI);
+    var hip = [sd * 0.1 + sway, 0, J.pel[2] - 0.03], th = w ? A * Math.sin(ph) : 0.03 * sd, flex = w ? 0.85 * Math.max(0, Math.cos(ph)) * (A / 0.62) : 0.02;
+    var knee = bLimb(hip, th, 0.44, 0), ank = bLimb(knee, th - flex, 0.43, 0);
+    if (ank[2] < 0.05) ank[2] = 0.05;
+    J['hip' + k] = hip; J['knee' + k] = knee; J['ank' + k] = ank; J['toe' + k] = [ank[0], ank[1] + 0.15, 0.025];
+    var sh = [sd * 0.2 + sway * 1.4, 0, J.chest[2] + 0.13], ta = w ? -0.75 * A * Math.sin(ph) : mv ? 0.5 + 0.7 * Math.sin(t * 2.2 + sd * 1.3) : 0.05;
+    var el = bLimb(sh, ta, 0.29, sd * (0.05 + (mv ? 0.08 : 0))), fa = ta + (w ? 0.35 : mv ? 0.9 + 0.5 * Math.sin(t * 2.6 + sd) : 0.1), wr = bLimb(el, fa, 0.26, sd * 0.02), hd = bLimb(wr, fa, 0.09, 0);
+    J['sh' + k] = sh; J['el' + k] = el; J['wr' + k] = wr; J['hand' + k] = hd;
+  });
+  return J;
+}
+var BONES = [['pel', 'chest', 0.17, 0.11, 0.19, 0.12, 0.35, 0.5, 1], ['chest', 'neck', 0.19, 0.12, 0.06, 0.06, 0.5, 0.7, 1], ['neck', 'head', 0.05, 0.05, 0.085, 0.095, 0.8, 0.9, 0], ['head', 'top', 0.095, 0.1, 0.03, 0.03, 0.92, 1, 0],
+  ['shL', 'shR', 0.05, 0.05, 0.05, 0.05, 0.4, 0.4, 0], ['hipL', 'hipR', 0.07, 0.07, 0.07, 0.07, 0.4, 0.4, 0],
+  ['shL', 'elL', 0.05, 0.05, 0.04, 0.04, 0.25, 0.5, 0], ['elL', 'wrL', 0.04, 0.04, 0.032, 0.032, 0.5, 0.75, 0], ['wrL', 'handL', 0.035, 0.02, 0.03, 0.015, 0.8, 0.95, 0],
+  ['shR', 'elR', 0.05, 0.05, 0.04, 0.04, 0.25, 0.5, 0], ['elR', 'wrR', 0.04, 0.04, 0.032, 0.032, 0.5, 0.75, 0], ['wrR', 'handR', 0.035, 0.02, 0.03, 0.015, 0.8, 0.95, 0],
+  ['hipL', 'kneeL', 0.088, 0.088, 0.062, 0.062, 0.2, 0.45, 0], ['kneeL', 'ankL', 0.062, 0.062, 0.046, 0.046, 0.45, 0.7, 0], ['ankL', 'toeL', 0.045, 0.04, 0.035, 0.03, 0.8, 0.95, 0],
+  ['hipR', 'kneeR', 0.088, 0.088, 0.062, 0.062, 0.2, 0.45, 0], ['kneeR', 'ankR', 0.062, 0.062, 0.046, 0.046, 0.45, 0.7, 0], ['ankR', 'toeR', 0.045, 0.04, 0.035, 0.03, 0.8, 0.95, 0]];
+function drawBone(a, b, bn, sc, fwd) {
+  var dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2], len = Math.hypot(dx, dy, dz) || 1e-6, wx = dx / len, wy = dy / len, wz = dz / len;
+  var ux = fwd[0], uy = fwd[1], uz = 0;
+  if (Math.abs(wx * ux + wy * uy) > 0.85) { ux = 0; uy = 0; uz = 1; }
+  var cx = wy * uz - wz * uy, cy = wz * ux - wx * uz, cz = wx * uy - wy * ux, cl = Math.hypot(cx, cy, cz) || 1; cx /= cl; cy /= cl; cz /= cl;
+  var vx = wy * cz - wz * cy, vy = wz * cx - wx * cz, vz = wx * cy - wy * cx, R = 4, K = 8, pts = [], i, k;
+  for (i = 0; i < R; i++) {
+    var t = i / (R - 1), rx = (bn[2] + (bn[4] - bn[2]) * t) * sc, ry = (bn[3] + (bn[5] - bn[3]) * t) * sc, row = [];
+    for (k = 0; k < K; k++) {
+      var th = k * 2 * Math.PI / K, ca = Math.cos(th) * rx, sa = Math.sin(th) * ry;
+      row.push(P(a[0] + dx * t + cx * ca + vx * sa, a[1] + dy * t + cy * ca + vy * sa, a[2] + dz * t + cz * ca + vz * sa));
+    }
+    pts.push(row);
+  }
+  for (i = 0; i < R; i++) {
+    var tv = bn[6] + (bn[7] - bn[6]) * (i / (R - 1));
+    for (k = 0; k < K; k++) {
+      var p1 = pts[i][k], p2 = pts[i][(k + 1) % K], edge = 0.22 * Math.abs(Math.cos(k * 2 * Math.PI / K));
+      if (p1 && p2) { g.strokeStyle = BCOL[Math.max(0, Math.min(48, Math.round((tv + edge) * 48)))]; g.beginPath(); g.moveTo(p1[0], p1[1]); g.lineTo(p2[0], p2[1]); g.stroke(); }
+      if (i + 1 < R) { var p3 = pts[i + 1][k]; if (p1 && p3) { g.strokeStyle = BCOL[Math.max(0, Math.min(48, Math.round((tv + edge * 1.4) * 48)))]; g.beginPath(); g.moveTo(p1[0], p1[1]); g.lineTo(p3[0], p3[1]); g.stroke(); } }
+    }
+  }
+}
+var csiBodyPos = null;
+function drawCsiBody(dt, t) {
+  if (S.body === false) return;
+  var r = CS.res, want = r && !r.stale && r.present ? 1 : 0, link = csiLink();
+  CS.bodyAmp += (want - CS.bodyAmp) * Math.min(1, dt * 3);
+  if (!r || r.stale && !CS.bodyAmp) return;
+  var zb = clamp(0.55 * Math.sqrt(Math.max(link.d, 1)), 0.8, 3.2), ang = Math.atan2(link.ay - link.ny, link.ax - link.nx), ca = Math.cos(ang), sa = Math.sin(ang), mx = (link.nx + link.ax) / 2, my = (link.ny + link.ay) / 2;
+  // 链路 + 菲涅尔区（人体能影响 CSI 的区域）
+  g.globalAlpha = 1; g.setLineDash && g.setLineDash([6, 5]); g.strokeStyle = 'rgba(255,210,63,.5)'; g.lineWidth = 1.2; g.beginPath(); seg(link.nx, link.ny, 0.1, link.ax, link.ay, 0.1); g.stroke(); g.setLineDash && g.setLineDash([]);
+  var ell = []; for (var i = 0; i < 40; i++) { var th = i * 2 * Math.PI / 40, lx = Math.cos(th) * link.d / 2, ly = Math.sin(th) * zb; ell.push([mx + lx * ca - ly * sa, my + lx * sa + ly * ca, 0.08]); }
+  fillPoly(ell, 'rgba(255,210,63,' + (0.04 + 0.1 * CS.bodyAmp) + ')', 'rgba(255,210,63,.45)', 1);
+  var ep = V(mx, my, 0.1); if (ep[2] > NEAR) { var es = SC(ep); label(es[0], es[1] + 14, 'CSI 链路区域', '#ffd23f', 'ESP32 ↔ ' + (link.ap ? (link.ap.ssid || link.ap.bssid) : '路由器') + ' · ' + link.d.toFixed(1) + 'm（估计）', false); }
+  if (CS.bodyAmp < 0.03) return;
+  var mode = r.act === 'walking' ? 'walking' : r.act === 'moving' ? 'moving' : 'still', spd = clamp(r.level / 14, 0.2, 1.2);
+  CS.ph += dt * 2 * Math.PI * (0.8 + 0.5 * spd); CS.brPh += dt * 2 * Math.PI * ((r.breath || 15) / 60);
+  var J = bodyJoints({ mode: mode, ph: CS.ph, s: spd, br: Math.sin(CS.brPh), t: t });
+  var sc = clamp(cam.dist / 14, 1, 10), hd = ang + Math.PI / 2, ch = Math.cos(hd), sh = Math.sin(hd), fwd = [-sh, ch];
+  var W3 = {}; Object.keys(J).forEach(function (k) { var p = J[k], x = p[0] * sc, y = p[1] * sc; W3[k] = [mx + x * ch - y * sh, my + x * sh + y * ch, p[2] * sc]; });
+  g.globalAlpha = 0.9 * CS.bodyAmp; g.lineWidth = 1;
+  var gs = [], gi; for (gi = 0; gi < 24; gi++) { var gt = gi * Math.PI / 12; gs.push([mx + Math.cos(gt) * 0.5 * sc, my + Math.sin(gt) * 0.5 * sc, 0.03]); }
+  fillPoly(gs, 'rgba(0,0,0,.35)', 'rgba(80,200,255,.0)', 0);
+  BONES.forEach(function (bn) { drawBone(W3[bn[0]], W3[bn[1]], bn, sc, fwd); });
+  g.globalAlpha = 1;
+  var hp = V(W3.top[0], W3.top[1], W3.top[2] + 0.1 * sc); if (hp[2] > NEAR) { var hs = SC(hp); label(hs[0], hs[1] - 6, '👤 人体 · ' + ACT_TXT[r.act], '#ffd23f', (r.breath ? '呼吸 ' + r.breath.toFixed(0) + ' 次/分 · ' : '') + (CS.synth ? '模拟数据' : 'CSI 推断') + (sc > 1.05 ? ' · 放大×' + sc.toFixed(1) : ''), true); }
+  csiBodyPos = { x: mx, y: my };
+}
+function csiFocus() { var l = csiLink(); camGoal = { yaw: cam.yaw, pitch: 0.42, dist: 12, tx: (l.nx + l.ax) / 2, ty: (l.ny + l.ay) / 2, tz: 1 }; }
+function csiCalibrate() { CS.calUntil = Date.now() + 8000; CS.calVals = []; dlog('INFO', 'csi', '🎯 开始校准：请让房间保持无人/静止 8 秒'); toast('校准中：8 秒内请保持房间无人'); }
 
 /* ================= 交互 ================= */
 var ptrs = new Map(), moved = 0, dragAP = null, downAt = null, lastPinch = 0;
@@ -751,12 +1056,12 @@ window.addEventListener('keydown', function (e) {
 function toast(m, ms) { var t = $('toast'); t.textContent = m; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(function () { t.style.display = 'none'; }, ms || 4500); }
 function sync() {
   $('sN').value = S.n; $('oN').textContent = (+S.n).toFixed(2); $('sT').value = S.tx; $('oT').textContent = S.tx;
-  $('cLab').checked = S.labels; $('cSwp').checked = S.sweep; $('cSta').checked = S.stations; $('cBld').checked = S.buildings; $('cHeat').checked = S.heat; $('cRot').checked = S.rotate;
+  $('cLab').checked = S.labels; $('cSwp').checked = S.sweep; $('cSta').checked = S.stations; $('cBld').checked = S.buildings; $('cHeat').checked = S.heat; $('cRot').checked = S.rotate; $('cBody').checked = S.body !== false;
 }
 $('sN').oninput = function () { S.n = +this.value; heatDirty = true; sync(); saveS(); };
 $('sT').oninput = function () { S.tx = +this.value; heatDirty = true; sync(); saveS(); };
-[['cLab', 'labels'], ['cSwp', 'sweep'], ['cSta', 'stations'], ['cBld', 'buildings'], ['cHeat', 'heat'], ['cRot', 'rotate']].forEach(function (p) { $(p[0]).onchange = function () { S[p[1]] = this.checked; saveS(); }; });
-$('bReset').onclick = resetView; $('bFS').onclick = toggleFS;
+[['cLab', 'labels'], ['cSwp', 'sweep'], ['cSta', 'stations'], ['cBld', 'buildings'], ['cHeat', 'heat'], ['cRot', 'rotate'], ['cBody', 'body']].forEach(function (p) { $(p[0]).onchange = function () { S[p[1]] = this.checked; saveS(); }; });
+$('bCal').onclick = csiCalibrate; $('bFocus').onclick = csiFocus; $('bReset').onclick = resetView; $('bFS').onclick = toggleFS;
 $('bClr').onclick = function () { OVR = {}; lsSet('wradar2.bearing', OVR); toast('已清除手动方位'); };
 $('bDemo').onclick = startDemo; $('bDemo2').onclick = startDemo;
 $('bSerial').onclick = serialToggle; $('bSerial2').onclick = serialToggle;
@@ -794,14 +1099,14 @@ setInterval(function () {
   var c = $('chConn');
   if (mode === 'demo') { c.textContent = '演示数据'; c.className = 'chip warn'; }
   else if (frameCount === 0) { c.textContent = SIM ? '等待 RESET' : '等待 ESP32'; c.className = 'chip'; }
-  else if (t - lastFrameAt < 8) { c.textContent = (serialOn ? 'USB 直连' : mode === 'sim' ? '模拟器' : 'ESP32 在线') + ' · ' + frameCount + ' 帧'; c.className = 'chip ok'; }
+  else if (t - lastFrameAt < 8 || Date.now() - CS.lastAt < 5000) { c.textContent = (serialOn ? 'USB 直连' : mode === 'sim' ? '模拟器' : 'ESP32 在线') + ' · ' + frameCount + ' 帧'; c.className = 'chip ok'; }
   else { c.textContent = '数据中断 ' + Math.round(t - lastFrameAt) + 's'; c.className = 'chip bad'; }
   var first = NODES.values().next().value; $('chNode').textContent = first ? first.id : '—';
   var sv = $('chSrv');
   if (SIM) { sv.textContent = '模拟模式'; sv.className = 'chip warn'; }
   else if (srvOK === true) { sv.textContent = '服务器在线'; sv.className = 'chip ok'; } else if (srvOK === false) { sv.textContent = '服务器无响应'; sv.className = 'chip bad'; }
   renderList(); showDetail();
-  if (frameCount === 0 && !SIM) {
+  if (frameCount === 0 && !SIM && !CS.total) {
     var dd = diagChecks(), pick = null;
     dd.checks.forEach(function (c) { if (!pick && (c.st === 'bad')) pick = c; });
     $('diag').innerHTML = dd.checks.filter(function (c) { return c.id === 'env' || c.id === 'srv' || c.id === 'rdv' || c.id === 'wlink' || c.id === 'ser' || c.id === 'fw' || c.id === 'data'; }).map(function (c) { return '<div>' + ICN[c.st] + ' ' + esc(c.name) + '：' + esc(c.msg) + '</div>'; }).join('') + '<div style="color:#7f9db3">ESP32 联网困难时请点“USB 直连”，由电脑转发。完整诊断请点“🩺 检测日志”。</div>';
@@ -820,6 +1125,7 @@ async function poll() {
     var j = await r.json(); DG.srv.pollErr = ''; DG.srv.pollOK++; since = j.seq || 0; SOLVED = j.solved || {}; SERVER = j.status || null;
     (j.frames || []).forEach(function (f) { ingest(f, 'poll'); });
     srvMotion = SERVER && typeof SERVER.motion === 'number' ? SERVER.motion : null;
+    CS.srvRes = SERVER && SERVER.sense ? SERVER.sense : null;
     if (SERVER) {
       var gp = SERVER.gpu && SERVER.gpu.length ? SERVER.gpu.join(' + ') : '无 GPU(CPU)';
       var res = SERVER.res ? ' · ' + SERVER.res : '';
@@ -922,6 +1228,7 @@ function onSerialLine(l) {
   var s = DG.ser, k;
   if (!l) return;
   s.lines++;
+  if ((k = l.indexOf('RADARCSI:')) >= 0) { csiFromSerial(l.slice(k + 9)); return; }
   if ((k = l.indexOf('RADARJSON:')) >= 0) {
     var f = null, txt = l.slice(k + 10);
     try { f = JSON.parse(txt); } catch (e) { s.jsonBad++; dlogRate('jbad', 2000, 'ERR', 'serial', '帧 JSON 解析失败：' + e.message + ' · 长度 ' + txt.length + ' · 开头 ' + txt.slice(0, 60) + ' · 结尾 ' + txt.slice(-40) + '（可能丢字节：换 USB 线/口）'); return; }
@@ -931,6 +1238,7 @@ function onSerialLine(l) {
     if (s.jsonOK === 1) dlog('OK', 'serial', '✅ 收到第一帧扫描数据：' + f.aps.length + ' 个 AP · 设备 ' + (f.st ? f.st.length : 0) + ' · node=' + f.node + ' · fw=' + (f.fw || '?') + ' · 扫描耗时 ' + (f.ms || '?') + 'ms');
     else if (s.jsonOK % 10 === 0) dlog('INFO', 'serial', '帧 #' + f.seq + ' AP=' + f.aps.length + ' 设备=' + (f.st ? f.st.length : 0) + ' 累计 ' + s.jsonOK);
     if (f.err) dlogRate('scanerr', 5000, 'WARN', 'esp32', 'ESP32 扫描返回错误码 ' + f.err);
+    if (SIM && !SYN.timer) csiSynthStart();
     ingest(f, 'usb'); postServer(f);
   } else if ((k = l.indexOf('RADARHB:')) >= 0) {
     try { var j = JSON.parse(l.slice(k + 8)); s.hbInfo = j; s.hbAt = Date.now(); s.hb++; if (s.hb === 1) dlog('OK', 'serial', '✅ 固件心跳已收到：fw=' + j.fw + ' node=' + j.node + ' 状态=' + j.st + ' 运行 ' + j.up + 's'); } catch (e2) { s.jsonBad++; }
@@ -1026,7 +1334,7 @@ async function serialOpen(port, quiet) {
   }
   s.open = true; s.bytes = 0; s.lines = 0; s.badChars = 0; s.jsonOK = quiet ? s.jsonOK : 0; s.jsonBad = 0; s.hb = 0; s.other = 0; s.firstAt = 0; s.mode = ''; s.openedAt = Date.now(); s.lastRaw = ''; s.lastLine = ''; s.hello = null; s.hbInfo = null; s.lastErr = '';
   serialOn = true; SP.port = port; SP.want = true; lsSet('wradar2.autoserial', true);
-  mode = SIM ? 'sim' : 'live';
+  mode = SIM ? 'sim' : 'live'; if (!SIM && CS.synth) { csiSynthStop(); CSBUF = []; CS.wf = []; CS.total = 0; CS.log1 = false; CS.present = false; }
   var tok = ++SP.token;
   dlog('OK', 'serial', '串口已打开 115200 8N1');
   $('wT').textContent = '正在连接 ESP32…'; $('wM').textContent = '串口已打开，正在复位 ESP32 并等待第一帧（约 2~4 秒）…';
@@ -1098,16 +1406,16 @@ function loadDemoWorld() {
   DEMO_WORLD = { buildings: bs, roads: rd }; S.buildings = true; sync();
 }
 function startDemo() {
-  mode = SIM ? 'sim' : 'demo'; if (!DEMO_WORLD) loadDemoWorld(); clearInterval(demoTimer);
+  mode = SIM ? 'sim' : 'demo'; csiSynthStart(); if (!DEMO_WORLD) loadDemoWorld(); clearInterval(demoTimer);
   var tick = function () { ingest(demoFrame(), 'demo'); }; tick(); demoTimer = setInterval(tick, 1500);
   if (SIM) mode = 'sim'; toast('演示数据已启动（模拟的 WiFi 环境，非真实扫描）');
 }
 function reset() {
-  APS.clear(); STAS.clear(); NODES.clear(); SEEN.clear(); actT0 = 0; actBase = null; frameCount = 0; lastFrameAt = 0; actHist = []; clearInterval(demoTimer); $('wait').style.display = 'block';
+  APS.clear(); STAS.clear(); NODES.clear(); SEEN.clear(); actT0 = 0; actBase = null; frameCount = 0; lastFrameAt = 0; actHist = []; clearInterval(demoTimer); csiSynthStop(); CSBUF = []; CS.wf = []; CS.lv = []; CS.res = null; CS.present = false; CS.total = 0; CS.log1 = false; CS.h1 = []; CS.floor = 0; CSN = {}; $('wait').style.display = 'block';
 }
 function setWaiting(title, msg) { $('wT').textContent = title; $('wM').textContent = msg; $('wait').style.display = frameCount ? 'none' : 'block'; }
 
-window.WifiRadar = { feedSerialLine: function (l) { onSerialLine(l); }, diag: function () { return diagChecks(); }, report: buildReport, log: dlog, ingest: function (f) { ingest(f, 'sim'); }, demoFrame: demoFrame, reset: reset, setWaiting: setWaiting, loadDemoWorld: loadDemoWorld, ready: true, frames: function () { return frameCount; }, aps: function () { return APS.size; } };
+window.WifiRadar = { csiSynthLine: csiSynthLine, csiSynth: function (on) { if (on) csiSynthStart(); else csiSynthStop(); }, csi: function () { return CS.res; }, feedSerialLine: function (l) { onSerialLine(l); }, diag: function () { return diagChecks(); }, report: buildReport, log: dlog, ingest: function (f) { ingest(f, 'sim'); }, demoFrame: demoFrame, reset: reset, setWaiting: setWaiting, loadDemoWorld: loadDemoWorld, ready: true, frames: function () { return frameCount; }, aps: function () { return APS.size; } };
 if (SIM) { $('bDemo').style.display = 'none'; $('bDemo2').style.display = 'none'; $('bSerial').style.display = 'none'; $('bSerial2').style.display = 'none'; $('bRst').style.display = 'none'; $('bRst2').style.display = 'none'; loadDemoWorld(); setWaiting('等待 ESP32 启动…', '在左侧虚拟开发板上按下 RESET 键（或按键盘 R）。'); }
 if (Q.get('demo') === '1') startDemo();
 sync(); window.__radarReady = true;
