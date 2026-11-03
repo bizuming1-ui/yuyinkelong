@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v5（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v6（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -22,6 +22,7 @@ WiFi 雷达 · Kaggle 单文件服务端 v5（ESP32-S3 -> Kaggle T4x2 GPU -> 全
       磁盘（历史记录 JSONL 写到 /kaggle/temp，<=RADAR_DISK_GB，默认 45GiB，自动滚动删除最旧文件）。
     - 隧道：cloudflared 自动重试 + 公网自检；可选 ngrok（环境变量 NGROK_TOKEN）。
     - /api/geo：beaconDB WiFi 定位 + OpenStreetMap 真实街区（建筑/道路）。
+    - v6 GPU 大模型诊断助手：Qwen2.5（双卡 7B / 单卡 3B）读取检测日志，网页「检测日志 → 🤖 AI 分析」（/api/llm，后台加载，失败自动退回规则诊断）。
     - 全能检测：/api/diag(JSON) 与 /api/diag.txt(纯文本，可直接复制到 GitHub “检测日志”)；
       网页端日志经 /api/clientlog 汇总到这里，同时写入 /kaggle/working/radar_diag.log（可在 Kaggle Output 下载）。
 """
@@ -42,7 +43,7 @@ PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
 
 
-VERSION = "5.0"
+VERSION = "6.0"
 EVENTS = collections.deque(maxlen=4000)
 EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
 _ECHO = {}
@@ -179,6 +180,18 @@ button.pri:hover{filter:brightness(1.1)}
 #csiNote{margin-top:5px;color:#7f9db3;font-size:11px;line-height:1.4}
 @media(max-height:760px){#csibox canvas#csiWf{display:none}}
 @media(max-width:900px){#dgp{right:14px;width:calc(100% - 28px)}}
+body.pose #side,body.pose #legend,body.pose #actbox{display:none}
+body.pose #dgp{right:14px}
+#dgAIout{display:none;max-height:28%;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#08182a;border:1px solid var(--bd);border-radius:8px;padding:6px 8px;margin-top:6px;font-size:12px;color:#cfe3f1}
+#wX{position:absolute;right:8px;top:6px;padding:1px 8px}
+#wait{width:min(520px,92vw);padding:8px 40px 8px 14px}
+#wait .spin{display:none}
+#wait h2{margin:0 0 2px;font-size:15px}
+#wait p{font-size:12px;margin:2px 0}
+#wait .diag{display:none}
+#wait.open .diag{display:block}
+#wait .btns button{padding:3px 8px;font-size:12px}
+#wDet{position:absolute;right:42px;top:6px;padding:1px 8px}
 </style>
 </head>
 <body>
@@ -209,6 +222,8 @@ button.pri:hover{filter:brightness(1.1)}
   <div class="row2"><label>路径损耗指数 n</label><input id="sN" type="range" min="1.6" max="4.5" step="0.05"><output id="oN"></output></div>
   <div class="row2"><label>1 米参考功率 dBm</label><input id="sT" type="range" min="-70" max="-20" step="1"><output id="oT"></output></div>
   <div class="checks">
+    <label title="隐藏 AP 信号柱 / 标签 / 扫描波 / 设备 / 街区，只保留人物姿态"><input type="checkbox" id="cPose"> 纯人体姿态</label>
+    <label><input type="checkbox" id="cSkel"> 骨架关键点</label>
     <label><input type="checkbox" id="cLab"> 标签</label>
     <label><input type="checkbox" id="cSwp"> 扫描波</label>
     <label><input type="checkbox" id="cSta"> 设备</label>
@@ -244,6 +259,7 @@ button.pri:hover{filter:brightness(1.1)}
 </div>
 
 <div id="wait" class="panel">
+  <button id="wX" title="关闭提示，只看 3D">✕</button><button id="wDet" title="展开/收起逐项检测">详情</button>
   <div class="spin"></div>
   <h2 id="wT">等待 ESP32 上传数据…</h2>
   <p id="wM">按一下 ESP32 的 <code>RESET</code> 键。网页已用 <b>自带 3D 引擎</b> 渲染（不依赖任何 CDN）。</p>
@@ -251,9 +267,10 @@ button.pri:hover{filter:brightness(1.1)}
   <div class="btns" style="justify-content:center"><button class="pri" id="bSerial2">🔌 USB 直连 ESP32（最稳）</button><button id="bDemo">▶ 启动演示数据</button><button id="bRst2">🔁 复位 ESP32</button><button id="bDiag2">🩺 检测日志</button></div>
 </div>
 <div id="dgp" class="panel">
-  <h3><span>🩺 全能检测系统 · 实时日志</span><button id="dgCopy" class="pri">📋 复制日志</button><button id="dgDl">⬇ 下载</button><button id="dgClr">清空</button><button id="dgX">✕</button></h3>
+  <h3><span>🩺 全能检测系统 · 实时日志</span><button id="dgCopy" class="pri">📋 复制日志</button><button id="dgAI">🤖 AI 分析</button><button id="dgDl">⬇ 下载</button><button id="dgClr">清空</button><button id="dgX">✕</button></h3>
   <div id="dgSum" class="dgsum">检测中…</div>
   <div id="dgChecks"></div>
+  <div id="dgAIout"></div>
   <div id="dgLog"></div>
 </div>
 <div id="toast"></div>
@@ -386,6 +403,7 @@ function diagChecks() {
   if (SIM) add('gpu', 'Kaggle GPU', 'wait', '模拟器无 GPU');
   else if (SERVER) add('gpu', 'Kaggle GPU', SERVER.gpu && SERVER.gpu.length ? 'ok' : 'warn', (SERVER.gpu && SERVER.gpu.length ? SERVER.gpu.join(' + ') : '无 GPU（CPU 模式）') + (SERVER.res ? ' · ' + SERVER.res : ''), SERVER.gpu && SERVER.gpu.length ? '' : 'Kaggle: Settings → Accelerator 选 GPU T4 x2');
   else add('gpu', 'Kaggle GPU', 'wait', '等待服务器状态');
+  if (!SIM) { var L6 = DG.llm; add('llm', 'AI 诊断助手', L6 ? (L6.engine === 'llm' ? 'ok' : (L6.state === '加载失败' || L6.state === '依赖安装失败') ? 'warn' : L6.state === '加载中' ? 'wait' : 'ok') : 'wait', L6 ? (L6.engine === 'llm' ? '大模型 ' + L6.model + ' 已就绪（加载 ' + L6.load_s + 's，调用 ' + L6.calls + ' 次）' : '规则诊断' + (L6.state ? '（大模型：' + L6.state + (L6.err ? ' · ' + L6.err : '') + '）' : '（内置服务端）')) : '未检测到 /api/llm'); }
   // CSI 感知
   if (!SIM) {
     var hbi = s.hbInfo, hl = s.hello, cage = (tn - CS.lastAt) / 1000;
@@ -478,7 +496,7 @@ window.addEventListener('message', function (ev) {
 dlog('INFO', 'page', '页面启动', envInfo());
 
 /* ================= 设置 ================= */
-var S = Object.assign({ n: 2.8, tx: -40, labels: true, sweep: true, stations: true, buildings: true, heat: true, rotate: false }, lsGet('wradar2.settings', {}));
+var S = Object.assign({ n: 2.8, tx: -40, labels: true, sweep: true, stations: true, buildings: true, heat: true, rotate: false, pose: true, skel: true }, lsGet('wradar2.settings', {}));
 var OVR = lsGet('wradar2.bearing', {});
 function saveS() { lsSet('wradar2.settings', S); }
 
@@ -815,12 +833,13 @@ function frameBody(tn) {
   var bg = g.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, '#02060d'); bg.addColorStop(0.55, '#04101c'); bg.addColorStop(1, '#030a13');
   g.fillStyle = bg; g.fillRect(0, 0, W, H);
   drawGround();
-  if (S.heat) drawHeat();
-  drawWorld();
-  drawSweep(dt, t);
+  var PO = S.pose !== false;           // 纯人体姿态模式：不画 AP 信号柱 / 标签 / 扫描波 / 设备 / 街区 / 热力
+  if (S.heat && !PO) drawHeat();
+  if (!PO) drawWorld();
+  if (!PO) drawSweep(dt, t);
   drawNodes(t);
-  drawStations(t);
-  drawAPs(dt, t);
+  if (!PO) drawStations(t);
+  if (!PO) drawAPs(dt, t);
   drawCsiBody(dt, t);
 }
 var fpsN = 0;
@@ -1068,30 +1087,41 @@ function drawBone(a, b, bn, sc, fwd) {
     }
   }
 }
+var SKEL = [['head', 'neck'], ['neck', 'chest'], ['chest', 'pel'], ['neck', 'shL'], ['neck', 'shR'], ['shL', 'elL'], ['elL', 'wrL'], ['shR', 'elR'], ['elR', 'wrR'], ['pel', 'hipL'], ['pel', 'hipR'], ['hipL', 'kneeL'], ['kneeL', 'ankL'], ['hipR', 'kneeR'], ['kneeR', 'ankR']];
+var SKJ = ['head', 'neck', 'shL', 'shR', 'elL', 'elR', 'wrL', 'wrR', 'pel', 'hipL', 'hipR', 'kneeL', 'kneeR', 'ankL', 'ankR'];
 var csiBodyPos = null;
 function drawCsiBody(dt, t) {
   if (S.body === false) return;
   var r = CS.res, want = r && !r.stale && r.present ? 1 : 0, link = csiLink();
   CS.bodyAmp += (want - CS.bodyAmp) * Math.min(1, dt * 3);
-  if (!r || r.stale && !CS.bodyAmp) return;
+  var SB = S.pose !== false && (!r || r.stale || !r.present) && CS.bodyAmp < 0.03;   // 待机：没有 CSI/没有人时画一个淡淡的待机姿态，3D 世界永远不是空的
+  if (!SB && (!r || r.stale && !CS.bodyAmp)) return;
+  if (!r) r = { act: 'empty', level: 0, breath: 0, present: false };
   var zb = clamp(0.55 * Math.sqrt(Math.max(link.d, 1)), 0.8, 3.2), ang = Math.atan2(link.ay - link.ny, link.ax - link.nx), ca = Math.cos(ang), sa = Math.sin(ang), mx = (link.nx + link.ax) / 2, my = (link.ny + link.ay) / 2;
   // 链路 + 菲涅尔区（人体能影响 CSI 的区域）
   g.globalAlpha = 1; g.setLineDash && g.setLineDash([6, 5]); g.strokeStyle = 'rgba(255,210,63,.5)'; g.lineWidth = 1.2; g.beginPath(); seg(link.nx, link.ny, 0.1, link.ax, link.ay, 0.1); g.stroke(); g.setLineDash && g.setLineDash([]);
   var ell = []; for (var i = 0; i < 40; i++) { var th = i * 2 * Math.PI / 40, lx = Math.cos(th) * link.d / 2, ly = Math.sin(th) * zb; ell.push([mx + lx * ca - ly * sa, my + lx * sa + ly * ca, 0.08]); }
   fillPoly(ell, 'rgba(255,210,63,' + (0.04 + 0.1 * CS.bodyAmp) + ')', 'rgba(255,210,63,.45)', 1);
   var ep = V(mx, my, 0.1); if (ep[2] > NEAR) { var es = SC(ep); label(es[0], es[1] + 14, 'CSI 链路区域', '#ffd23f', 'ESP32 ↔ ' + (link.ap ? (link.ap.ssid || link.ap.bssid) : '路由器') + ' · ' + link.d.toFixed(1) + 'm（估计）', false); }
-  if (CS.bodyAmp < 0.03) return;
+  if (CS.bodyAmp < 0.03 && !SB) return;
   var mode = r.act === 'walking' ? 'walking' : r.act === 'moving' ? 'moving' : 'still', spd = clamp(r.level / 14, 0.2, 1.2);
   CS.ph += dt * 2 * Math.PI * (0.8 + 0.5 * spd); CS.brPh += dt * 2 * Math.PI * ((r.breath || 15) / 60);
   var J = bodyJoints({ mode: mode, ph: CS.ph, s: spd, br: Math.sin(CS.brPh), t: t });
   var sc = clamp(cam.dist / 14, 1, 10), hd = ang + Math.PI / 2, ch = Math.cos(hd), sh = Math.sin(hd), fwd = [-sh, ch];
   var W3 = {}; Object.keys(J).forEach(function (k) { var p = J[k], x = p[0] * sc, y = p[1] * sc; W3[k] = [mx + x * ch - y * sh, my + x * sh + y * ch, p[2] * sc]; });
-  g.globalAlpha = 0.9 * CS.bodyAmp; g.lineWidth = 1;
+  var AMP = SB ? 0.3 : CS.bodyAmp; g.globalAlpha = 0.9 * AMP; g.lineWidth = 1;
   var gs = [], gi; for (gi = 0; gi < 24; gi++) { var gt = gi * Math.PI / 12; gs.push([mx + Math.cos(gt) * 0.5 * sc, my + Math.sin(gt) * 0.5 * sc, 0.03]); }
   fillPoly(gs, 'rgba(0,0,0,.35)', 'rgba(80,200,255,.0)', 0);
   BONES.forEach(function (bn) { drawBone(W3[bn[0]], W3[bn[1]], bn, sc, fwd); });
+  if (S.skel !== false) {
+    g.lineWidth = 2; g.strokeStyle = 'rgba(255,255,255,.92)';
+    SKEL.forEach(function (e) { var a = P(W3[e[0]][0], W3[e[0]][1], W3[e[0]][2]), b = P(W3[e[1]][0], W3[e[1]][1], W3[e[1]][2]); if (a && b) { g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke(); } });
+    g.fillStyle = '#ffd23f';
+    SKJ.forEach(function (k) { var a = P(W3[k][0], W3[k][1], W3[k][2]); if (a) { g.beginPath(); g.arc(a[0], a[1], 3.2, 0, 6.2832); g.fill(); } });
+    g.lineWidth = 1;
+  }
   g.globalAlpha = 1;
-  var hp = V(W3.top[0], W3.top[1], W3.top[2] + 0.1 * sc); if (hp[2] > NEAR) { var hs = SC(hp); label(hs[0], hs[1] - 6, '👤 人体 · ' + ACT_TXT[r.act], '#ffd23f', (r.breath ? '呼吸 ' + r.breath.toFixed(0) + ' 次/分 · ' : '') + (CS.synth ? '模拟数据' : 'CSI 推断') + (sc > 1.05 ? ' · 放大×' + sc.toFixed(1) : ''), true); }
+  var hp = V(W3.top[0], W3.top[1], W3.top[2] + 0.1 * sc); if (hp[2] > NEAR) { var hs = SC(hp); label(hs[0], hs[1] - 6, (SB ? '👤 待机姿态（示意）' : '👤 人体 · ' + ACT_TXT[r.act]), '#ffd23f', (r.breath ? '呼吸 ' + r.breath.toFixed(0) + ' 次/分 · ' : '') + (SB ? '暂无 CSI / 无人' : CS.synth ? '模拟数据' : 'CSI 推断') + (sc > 1.05 ? ' · 放大×' + sc.toFixed(1) : ''), true); }
   csiBodyPos = { x: mx, y: my };
 }
 function csiFocus() { var l = csiLink(); camGoal = { yaw: cam.yaw, pitch: 0.42, dist: 12, tx: (l.nx + l.ax) / 2, ty: (l.ny + l.ay) / 2, tz: 1 }; }
@@ -1145,11 +1175,11 @@ window.addEventListener('keydown', function (e) {
 function toast(m, ms) { var t = $('toast'); t.textContent = m; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(function () { t.style.display = 'none'; }, ms || 4500); }
 function sync() {
   $('sN').value = S.n; $('oN').textContent = (+S.n).toFixed(2); $('sT').value = S.tx; $('oT').textContent = S.tx;
-  $('cLab').checked = S.labels; $('cSwp').checked = S.sweep; $('cSta').checked = S.stations; $('cBld').checked = S.buildings; $('cHeat').checked = S.heat; $('cRot').checked = S.rotate; $('cBody').checked = S.body !== false;
+  $('cLab').checked = S.labels; $('cSwp').checked = S.sweep; $('cSta').checked = S.stations; $('cBld').checked = S.buildings; $('cHeat').checked = S.heat; $('cRot').checked = S.rotate; $('cBody').checked = S.body !== false; $('cPose').checked = S.pose !== false; $('cSkel').checked = S.skel !== false; document.body.classList.toggle('pose', S.pose !== false);
 }
 $('sN').oninput = function () { S.n = +this.value; heatDirty = true; sync(); saveS(); };
 $('sT').oninput = function () { S.tx = +this.value; heatDirty = true; sync(); saveS(); };
-[['cLab', 'labels'], ['cSwp', 'sweep'], ['cSta', 'stations'], ['cBld', 'buildings'], ['cHeat', 'heat'], ['cRot', 'rotate'], ['cBody', 'body']].forEach(function (p) { $(p[0]).onchange = function () { S[p[1]] = this.checked; saveS(); }; });
+[['cLab', 'labels'], ['cSwp', 'sweep'], ['cSta', 'stations'], ['cBld', 'buildings'], ['cHeat', 'heat'], ['cRot', 'rotate'], ['cBody', 'body'], ['cPose', 'pose'], ['cSkel', 'skel']].forEach(function (p) { $(p[0]).onchange = function () { S[p[1]] = this.checked; saveS(); sync(); if (p[1] === 'pose' && this.checked) csiFocus(); }; });
 $('bCal').onclick = csiCalibrate; $('bFocus').onclick = csiFocus; $('bReset').onclick = resetView; $('bFS').onclick = toggleFS;
 $('bClr').onclick = function () { OVR = {}; lsSet('wradar2.bearing', OVR); toast('已清除手动方位'); };
 $('bDemo').onclick = startDemo; $('bDemo2').onclick = startDemo;
@@ -1508,6 +1538,23 @@ window.WifiRadar = { csiSynthLine: csiSynthLine, csiSynth: function (on) { if (o
 if (SIM) { $('bDemo').style.display = 'none'; $('bDemo2').style.display = 'none'; $('bSerial').style.display = 'none'; $('bSerial2').style.display = 'none'; $('bRst').style.display = 'none'; $('bRst2').style.display = 'none'; loadDemoWorld(); setWaiting('等待 ESP32 启动…', '在左侧虚拟开发板上按下 RESET 键（或按键盘 R）。'); }
 if (Q.get('demo') === '1') startDemo();
 sync(); window.__radarReady = true;
+
+/* ===== v6：等待提示不再遮挡 / AI 分析 / 纯姿态初始镜头 ===== */
+$('wDet').onclick = function () { $('wait').classList.toggle('open'); };
+$('wX').onclick = function () { $('wait').style.display = 'none'; dlog('INFO', 'ui', '用户关闭了等待提示（3D 世界继续运行）'); };
+setInterval(function () { if ((CS.total > 0 || frameCount > 0) && $('wait').style.display !== 'none') { $('wait').style.display = 'none'; dlog('INFO', 'ui', '已收到数据（帧 ' + frameCount + ' · CSI ' + CS.total + '），自动隐藏等待提示'); } }, 700);
+$('dgAI').onclick = async function () {
+  var o = $('dgAIout'); o.style.display = 'block'; o.textContent = '🤖 分析中…（Kaggle 大模型首次调用可能需要 10~40 秒）';
+  try {
+    var r = await fetch('api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ report: buildReport(), problems: diagChecks().checks.filter(function (c) { return c.st !== 'ok'; }).map(function (c) { return c.name + '：' + c.msg; }).join('\n') }) });
+    var j = await r.json();
+    o.textContent = '🤖 [' + (j.engine || '?') + (j.model ? ' · ' + j.model : '') + ']\n' + (j.text || j.error || '无结果');
+    dlog(j.ok ? 'OK' : 'WARN', 'ai', 'AI 分析完成：引擎=' + j.engine + (j.model ? ' 模型=' + j.model : '') + (j.ms ? ' 用时 ' + j.ms + 'ms' : ''));
+  } catch (e) { o.textContent = 'AI 分析失败：' + e.message; dlog('ERR', 'ai', 'AI 分析请求失败：' + e.message); }
+};
+setTimeout(function () { if (S.pose !== false && !camGoal) csiFocus(); }, 1500);
+async function llmPoll() { if (SIM) return; try { var r = await fetch('api/llm', { cache: 'no-store' }); if (r.ok) DG.llm = await r.json(); } catch (e) {} }
+llmPoll(); setInterval(llmPoll, 15000);
 })();
 </script>
 </body>
@@ -1648,6 +1695,7 @@ def server_diag(n_events=80):
         "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "src": v.get("src"), "fw": v.get("fw"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
         "solved": len(SOLVED), "motion": round(MOTION["v"], 3),
         "csi": dict(CSI_STAT, nodes={k: len(v) for k, v in CSI.items()}, sense=SENSE["v"]),
+        "llm": LLM,
     }
     try:
         if torch is not None and NGPU:
@@ -2328,6 +2376,131 @@ def start_ngrok():
     _banner(ngrok.connect(PORT, "http").public_url.replace("http://", "https://"))
 
 
+# ===================== v6：GPU 大语言模型“诊断助手”（可选，后台加载，失败不影响雷达） =====================
+# 作用：读取网页「检测日志」，用大模型给出“卡在哪一步、下一步怎么做”。不参与 CSI 数学计算（不会编造人体数据）。
+# 显卡分配：>=2 张 T4 时用 Qwen2.5-7B-Instruct 切分到两张卡（device_map=auto，约 15GB）；1 张用 3B；无 GPU 用规则诊断。
+# 环境变量：RADAR_LLM=off 关闭；RADAR_LLM=<HuggingFace 模型名> 指定模型。
+LLM_NAME = os.environ.get("RADAR_LLM", "auto")
+LLM = {"state": "未启动", "model": "", "err": "", "load_s": 0.0, "calls": 0, "last_ms": 0, "gpus": []}
+_LLM_OBJ = {"tok": None, "model": None}
+_LLM_LOCK = threading.Lock()
+LLM_SYS = ("你是 ESP32-S3 WiFi 雷达（CSI 人体感知 + 3D 网页）的运维诊断助手。根据用户给出的『检测日志』，用中文简洁回答：1) 当前卡在哪一步；"
+           "2) 最可能的原因（按概率排序，最多3条）；3) 对应的具体操作步骤。只依据日志里出现的事实，不要编造不存在的数据。"
+           "务必记住物理边界：单个 ESP32 只能判断存在/运动/呼吸，3D 人体是示意模型；室内墙体无法还原。")
+
+
+def rule_advice(report):
+    r = report or ""
+    tips = []
+    if re.search(r"HTTP -1|connect timeout|连不上|无响应", r):
+        tips.append("ESP32 或网页连不上服务器：Kaggle 重启后网址会变（固件通过汇合点自动读取），确认 Cell 仍在运行。")
+    if re.search(r"401|API_KEY 不一致|bad key", r):
+        tips.append("API_KEY 不一致：把 config.h 的 API_KEY 改成与本脚本一致（默认 radar-key）。")
+    if re.search(r"0 字节|没有任何串口数据", r):
+        tips.append("串口 0 字节：换 USB 口、关闭 PlatformIO 串口监视器、换数据线，重新 Upload 最新固件。")
+    if re.search(r"下载模式|DOWNLOAD", r):
+        tips.append("ESP32 在下载模式：松开 BOOT，按一下 RESET。")
+    if re.search(r"CSI.*(未收到|等待|关闭)|csi=0", r):
+        tips.append("没有 CSI：固件需填好 WIFI_SSID/WIFI_PASS（2.4GHz）后对路由器 ping 才有 CSI。")
+    if not tips:
+        tips.append("日志里没有发现明显故障。3D 里没人体时：让房间安静约 10 秒建立基线，再在 ESP32↔路由器连线附近走动。")
+    return "【规则诊断】\n" + "\n".join("%d. %s" % (i + 1, t) for i, t in enumerate(tips))
+
+
+def _llm_pick():
+    if LLM_NAME.lower() in ("off", "0", "no", "none"):
+        return []
+    if LLM_NAME != "auto":
+        return [LLM_NAME]
+    if NGPU >= 2:
+        return ["Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
+    if NGPU == 1:
+        return ["Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"]
+    return []
+
+
+def llm_loader():
+    names = _llm_pick()
+    if not names or torch is None or not NGPU:
+        LLM["state"] = "关闭（无 GPU 或已禁用）"
+        evt("INFO", "llm", "大模型诊断助手未启用：%s" % LLM["state"], echo=True)
+        return
+    try:
+        _ensure("transformers")
+        _ensure("accelerate")
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+    except Exception as e:
+        LLM["state"], LLM["err"] = "依赖安装失败", repr(e)[:300]
+        evt("ERR", "llm", "transformers 安装/导入失败：%r（将使用规则诊断）" % (e,), echo=True)
+        return
+    for name in names:
+        t0 = time.time()
+        try:
+            LLM["state"], LLM["model"] = "加载中", name
+            evt("INFO", "llm", "开始加载大模型 %s（首次需下载，几分钟；后台进行，不影响雷达）" % name, echo=True)
+            tok = AutoTokenizer.from_pretrained(name)
+            if "7B" in name or "8B" in name or "14B" in name:
+                mm = {0: "9GiB", 1: "13GiB"} if NGPU >= 2 else {0: "13GiB"}
+                mdl = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="auto", max_memory=mm, low_cpu_mem_usage=True)
+            else:
+                dev = "cuda:%d" % (NGPU - 1)       # 小模型放最后一张卡，第一张留给 CSI FFT/定位求解
+                mdl = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(dev)
+            mdl.eval()
+            _LLM_OBJ["tok"], _LLM_OBJ["model"] = tok, mdl
+            LLM["state"], LLM["load_s"], LLM["err"] = "就绪", round(time.time() - t0, 1), ""
+            LLM["gpus"] = [{"gpu": i, "used_gb": round(torch.cuda.mem_get_info(i)[1] / 1024 ** 3 - torch.cuda.mem_get_info(i)[0] / 1024 ** 3, 2)} for i in range(NGPU)]
+            evt("OK", "llm", "✅ 大模型 %s 已就绪（用时 %.0fs，显存 %s）" % (name, LLM["load_s"], LLM["gpus"]), echo=True)
+            return
+        except Exception as e:
+            LLM["state"], LLM["err"] = "加载失败", repr(e)[:300]
+            evt("ERR", "llm", "加载 %s 失败：%r" % (name, e), echo=True)
+            _LLM_OBJ["tok"] = _LLM_OBJ["model"] = None
+            try:
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+
+def llm_answer(report):
+    tok, mdl = _LLM_OBJ["tok"], _LLM_OBJ["model"]
+    if tok is None or mdl is None:
+        return None
+    msgs = [{"role": "system", "content": LLM_SYS}, {"role": "user", "content": "以下是检测日志（可能已截断）：\n" + report[-6500:]}]
+    text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    inp = tok([text], return_tensors="pt").to(next(mdl.parameters()).device)
+    with torch.no_grad():
+        out = mdl.generate(**inp, max_new_tokens=480, do_sample=False, repetition_penalty=1.05)
+    return tok.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+
+@app.route("/api/llm", methods=["GET", "POST", "OPTIONS"])
+def api_llm():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if request.method == "GET":
+        return jsonify(ok=True, engine="llm" if _LLM_OBJ["model"] is not None else "rules", **LLM)
+    j = request.get_json(force=True, silent=True) or {}
+    report = str(j.get("report", ""))[:80000]
+    problems = j.get("problems")
+    rule_src = problems if isinstance(problems, str) else report
+    t0 = time.time()
+    if _LLM_OBJ["model"] is not None:
+        try:
+            with _LLM_LOCK:
+                txt = llm_answer(("【未通过的检测项】\n" + problems + "\n\n【完整日志】\n" if isinstance(problems, str) else "") + report)
+            ms = int((time.time() - t0) * 1000)
+            LLM["calls"] += 1
+            LLM["last_ms"] = ms
+            evt("OK", "llm", "AI 分析完成：%dms，输出 %d 字" % (ms, len(txt or "")))
+            return jsonify(ok=True, engine="llm", model=LLM["model"], text=txt, ms=ms)
+        except Exception as e:
+            evt("ERR", "llm", "AI 推理失败：%r" % (e,), echo=True)
+            return jsonify(ok=True, engine="rules", model=None, text=rule_advice(rule_src) + "\n（大模型推理失败：%s）" % repr(e)[:160])
+    return jsonify(ok=True, engine="rules", model=None, text=rule_advice(rule_src) + "\n（大模型状态：%s%s）" % (LLM["state"], "，" + LLM["err"] if LLM["err"] else ""))
+
+
 def main():
     from werkzeug.serving import make_server
     srv = make_server("0.0.0.0", PORT, app, threaded=True)
@@ -2335,7 +2508,7 @@ def main():
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
     evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
-    for fn in (motion_loop, sense_loop, res_loop, hist_writer, publish_loop):
+    for fn in (motion_loop, sense_loop, res_loop, hist_writer, publish_loop, llm_loader):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
     if USE_TUNNEL:
