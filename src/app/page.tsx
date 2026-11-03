@@ -1,5 +1,5 @@
 import Simulator from "./Simulator";
 
-export default function Home() {
+export default function HomePage() {
   return <Simulator />;
 }
