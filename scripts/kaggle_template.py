@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端 v2（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+WiFi 雷达 · Kaggle 单文件服务端 v3（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
 =============================================================================
 用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
     1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
@@ -21,8 +21,11 @@ WiFi 雷达 · Kaggle 单文件服务端 v2（ESP32-S3 -> Kaggle T4x2 GPU -> 全
       磁盘（历史记录 JSONL 写到 /kaggle/temp，<=RADAR_DISK_GB，默认 45GiB，自动滚动删除最旧文件）。
     - 隧道：cloudflared 自动重试 + 公网自检；可选 ngrok（环境变量 NGROK_TOKEN）。
     - /api/geo：beaconDB WiFi 定位 + OpenStreetMap 真实街区（建筑/道路）。
+    - 全能检测：/api/diag(JSON) 与 /api/diag.txt(纯文本，可直接复制到 GitHub “检测日志”)；
+      网页端日志经 /api/clientlog 汇总到这里，同时写入 /kaggle/working/radar_diag.log（可在 Kaggle Output 下载）。
 """
 import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections, random, glob
+from urllib.parse import urlparse
 
 API_KEY = os.environ.get("RADAR_KEY", "radar-key")        # 必须与 ESP32 config.h 里的 API_KEY 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
@@ -35,6 +38,39 @@ RESTARTS = int(os.environ.get("RADAR_RESTARTS", "2048"))   # 每个 AP 的并行
 UA = {"User-Agent": "wifi-radar-esp32s3/2.0 (personal project)"}
 PATH_N, PATH_TX = 2.8, -40.0
 HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
+
+
+VERSION = "3.0"
+EVENTS = collections.deque(maxlen=4000)
+EVT_FILE = "/kaggle/working/radar_diag.log" if os.path.isdir("/kaggle/working") else "/tmp/radar_diag.log"
+_ECHO = {}
+_EVT_N = [0]
+TUNNEL = {"state": "未启动", "url": "", "attempts": 0, "probe": ""}
+
+
+def evt(level, cat, msg, echo=False, t=None):
+    """记录一条检测事件：内存环形缓冲 + 磁盘日志文件；echo=True 时同时打印到 Notebook 输出。"""
+    e = {"t": round(t or time.time(), 3), "lv": level, "c": cat, "m": str(msg)[:700]}
+    EVENTS.append(e)
+    line = "%s %s [%s] %s" % (time.strftime("%H:%M:%S", time.localtime(e["t"])), level, cat, e["m"])
+    try:
+        _EVT_N[0] += 1
+        if _EVT_N[0] % 500 == 0 and os.path.exists(EVT_FILE) and os.path.getsize(EVT_FILE) > 64 * 1024 ** 2:
+            open(EVT_FILE, "w").close()
+        with open(EVT_FILE, "a", encoding="utf8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+    if echo:
+        print(line, flush=True)
+
+
+def evt_rate(key, secs, level, cat, msg, echo=True):
+    now = time.time()
+    if now - _ECHO.get(key, 0) < secs:
+        return
+    _ECHO[key] = now
+    evt(level, cat, msg, echo=echo)
 
 
 def _ensure(mod, pip=None):
@@ -92,7 +128,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
+    return jsonify(ok=True, version=VERSION, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
 
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
@@ -101,15 +137,21 @@ def ingest():
     if request.method == "OPTIONS":
         return ("", 204)
     key = request.headers.get("X-Key") or request.args.get("key")
-    if key != API_KEY:
+    origin_host = urlparse(request.headers.get("Origin", "") or "").netloc
+    same = request.headers.get("Sec-Fetch-Site") == "same-origin" or (origin_host != "" and origin_host == request.host)
+    src = "网页USB转发" if same else "ESP32 WiFi直传"
+    if key != API_KEY and not same:
+        evt_rate("badkey", 5, "ERR", "ingest", "拒绝 %s 的上传：API_KEY 不一致（收到 %r，期望 %r）。请把 config.h 的 API_KEY 改成与本脚本一致" % (request.headers.get("CF-Connecting-IP") or request.remote_addr, key, API_KEY))
         return jsonify(ok=False, error="bad key"), 401
     f = request.get_json(force=True, silent=True)
     if not isinstance(f, dict) or not isinstance(f.get("aps"), list):
+        evt_rate("badframe", 5, "ERR", "ingest", "收到格式错误的数据（%s，%d 字节）：缺少 aps 数组" % (src, len(request.get_data() or b"")))
         return jsonify(ok=False, error="bad frame"), 400
     t = time.time()
     with LOCK:
         SEQ += 1
         f["_seq"] = SEQ
+        f["_t"] = t
         FRAMES.append(f)
         nid = str(f.get("node", "node"))
         n = NODES.setdefault(nid, {"frames": 0, "obs": {}})
@@ -132,6 +174,9 @@ def ingest():
             except Exception:
                 continue
         seq = SEQ
+        nframes = n["frames"]
+    if nframes == 1 or nframes % 20 == 0:
+        evt("OK", "ingest", "收到 %s 帧 #%d：node=%s 来自 %s · AP=%d · 设备=%d · 累计 %d 帧" % (src, seq, nid, n.get("ip"), len(f["aps"]), len(f.get("st") or []), nframes), echo=(nframes == 1 or nframes % 60 == 0))
     HIST_Q.append(json.dumps({"t": round(t, 2), "f": f}, ensure_ascii=False, separators=(",", ":")))
     threading.Thread(target=solve_positions, daemon=True).start()
     return jsonify(ok=True, seq=seq)
@@ -151,12 +196,86 @@ def frames():
             out = list(last.values())
         else:
             out = [f for f in FRAMES if f["_seq"] > since][-60:]
+        now_ = time.time()
+        out = [dict(x, age=round(now_ - x.get("_t", now_), 1)) for x in out]
         status = {
             "gpu": GPU_NAMES, "frames": SEQ, "uptime": int(time.time() - T0), "public": PUBLIC_URL,
             "motion": round(MOTION["v"], 3), "res": RES_TEXT,
             "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(time.time() - v.get("last", 0), 1)} for k, v in NODES.items()},
         }
         return jsonify(seq=SEQ, frames=out, solved=SOLVED, status=status)
+
+
+def server_diag(n_events=80):
+    now = time.time()
+    d = {
+        "version": VERSION, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "python": sys.version.split()[0], "uptime": int(now - T0),
+        "public_url": PUBLIC_URL, "tunnel": TUNNEL, "frames": SEQ, "gpu": GPU_NAMES, "res": RES_TEXT,
+        "torch": getattr(torch, "__version__", None) if torch is not None else None,
+        "cuda": bool(torch is not None and torch.cuda.is_available()),
+        "budgets": {"vram_gb": VRAM_GB, "ram_gb": RAM_GB, "disk_gb": DISK_GB, "restarts": RESTARTS},
+        "series": len(SERIES), "series_maxlen": SERIES_MAXLEN, "events_file": EVT_FILE, "hist_dir": HIST_DIR,
+        "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(now - v.get("last", 0), 1)} for k, v in list(NODES.items())},
+        "solved": len(SOLVED), "motion": round(MOTION["v"], 3),
+    }
+    try:
+        if torch is not None and NGPU:
+            d["gpu_mem"] = []
+            for i in range(NGPU):
+                free, total = torch.cuda.mem_get_info(i)
+                d["gpu_mem"].append({"gpu": i, "name": GPU_NAMES[i], "used_gb": round((total - free) / 1024 ** 3, 2), "total_gb": round(total / 1024 ** 3, 2)})
+    except Exception as e:
+        d["gpu_mem_err"] = str(e)
+    d["recent"] = list(EVENTS)[-n_events:]
+    return d
+
+
+@app.get("/api/diag")
+def diag():
+    return jsonify(server_diag())
+
+
+@app.get("/api/diag.txt")
+def diag_txt():
+    d = server_diag(400)
+    L = ["===== WiFi RADAR 服务端检测日志 v%s =====" % d["version"], "时间: %s  运行 %ds  Python %s  torch=%s cuda=%s" % (d["time"], d["uptime"], d["python"], d["torch"], d["cuda"]),
+         "公网地址: %s  隧道: %s" % (d["public_url"], json.dumps(d["tunnel"], ensure_ascii=False)), "GPU: %s  显存: %s" % (d["gpu"], json.dumps(d.get("gpu_mem"), ensure_ascii=False)), "资源: %s" % d["res"],
+         "预算: %s" % json.dumps(d["budgets"]), "总帧数: %d  节点: %s" % (d["frames"], json.dumps(d["nodes"], ensure_ascii=False)), "", "--- 事件 ---"]
+    for e in d["recent"]:
+        L.append("%s %s [%s] %s" % (time.strftime("%H:%M:%S", time.localtime(e["t"])), e["lv"], e["c"], e["m"]))
+    return Response("\n".join(L), mimetype="text/plain; charset=utf-8")
+
+
+@app.route("/api/clientlog", methods=["POST", "OPTIONS"])
+def clientlog():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    j = request.get_json(force=True, silent=True) or {}
+    for e in (j.get("entries") or [])[:100]:
+        try:
+            lv = str(e.get("lv", "INFO"))[:5]
+            m = str(e.get("m", ""))
+            evt(lv, "web/" + str(e.get("c", ""))[:12], m, echo=False, t=float(e.get("t", 0)) / 1000.0 or None)
+            if lv == "ERR":
+                evt_rate("web:" + m[:50], 15, "ERR", "web", m[:300])
+        except Exception:
+            continue
+    return jsonify(ok=True)
+
+
+@app.route("/api/reset", methods=["POST", "OPTIONS"])
+def reset_state():
+    global SEQ, SOLVED
+    if request.method == "OPTIONS":
+        return ("", 204)
+    with LOCK:
+        FRAMES.clear()
+        NODES.clear()
+        SERIES.clear()
+        SOLVED = {}
+        SEQ = 0
+    evt("INFO", "server", "已清空帧缓存/节点/历史序列（/api/reset）", echo=True)
+    return jsonify(ok=True)
 
 
 @app.get("/api/stats")
@@ -471,6 +590,9 @@ def geo():
 def _banner(url):
     global PUBLIC_URL
     PUBLIC_URL = url
+    TUNNEL["state"] = "已建立"
+    TUNNEL["url"] = url
+    evt("OK", "tunnel", "公网隧道已建立：" + url)
     line = "=" * 66
     print("\n" + line)
     print("🌐 全屏 3D 网站： " + url)
@@ -478,6 +600,7 @@ def _banner(url):
     print("   或串口输入：     url %s" % url)
     print("🔌 最稳方案：     用电脑 Chrome/Edge 打开上面网址 -> 点【USB 连接 ESP32】")
     print("🔑 API_KEY：       %s" % API_KEY)
+    print("🩺 检测日志：     网页里点【🩺 检测日志】，或打开 %s/api/diag.txt（也写入 %s）" % (url, EVT_FILE))
     print(line + "\n", flush=True)
     try:
         from IPython.display import display, HTML as _H
@@ -492,11 +615,14 @@ def _probe(url):
         try:
             r = requests.get(url + "/api/health", timeout=8, headers=UA)
             if r.status_code == 200:
-                print("[tunnel] ✅ 公网自检通过：%s/api/health" % url, flush=True)
+                TUNNEL["probe"] = "通过"
+                evt("OK", "tunnel", "公网自检通过：%s/api/health" % url, echo=True)
                 return
         except Exception:
             pass
         time.sleep(4)
+    TUNNEL["probe"] = "未通过"
+    evt("WARN", "tunnel", "公网自检 15 次均未通过")
     print("[tunnel] ⚠ 公网自检未通过（隧道可能还在生效，或被网络拦截）。可稍后刷新，或设置 NGROK_TOKEN 改用 ngrok。", flush=True)
 
 
@@ -517,7 +643,9 @@ def start_cloudflared():
                 if m and not shown:
                     shown = True
                     _banner(m.group(0))
-            print("[tunnel] cloudflared 退出，第 %d 次重试…" % attempt, flush=True)
+            TUNNEL["state"] = "重试中"
+            TUNNEL["attempts"] = attempt
+            evt("WARN", "tunnel", "cloudflared 退出，第 %d 次重试…" % attempt, echo=True)
             time.sleep(3)
 
     threading.Thread(target=runner, daemon=True).start()
@@ -536,6 +664,7 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
     print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
+    evt("INFO", "boot", "服务端 v%s 启动：python=%s torch=%s GPU=%s 日志文件=%s" % (VERSION, sys.version.split()[0], getattr(torch, "__version__", None) if torch is not None else "未安装", GPU_NAMES or "无", EVT_FILE), echo=True)
     for fn in (motion_loop, res_loop, hist_writer):
         threading.Thread(target=fn, daemon=True).start()
     threading.Thread(target=selftest, daemon=True).start()
