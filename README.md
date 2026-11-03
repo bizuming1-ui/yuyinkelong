@@ -1,4 +1,21 @@
-## 📡 ESP32-S3 WiFi 雷达 · 3D 真实世界（v3）
+## 📡 ESP32-S3 WiFi 雷达 · 3D 真实世界（v4）
+
+## v4 修复了什么 —— “卡在等待 ESP32 上传数据”的真正根因
+
+经过沙盒实测（真实 cloudflared 隧道 + 无头 Chromium + PlatformIO 编译）确认：**服务器收到数据后，3D 页面是正常出图的**；卡住的原因全部在“数据到不了服务器”这一段：
+
+1. **网址每次都变（最主要）**：Kaggle 每次运行 `trycloudflare` 网址都不同，而 ESP32 固件里写死的 `SERVER_URL` 一过期就永远上传失败（`HTTP -1`）。
+   **v4：自动发现网址**——Kaggle 把最新网址发布到公共汇合点 `https://ntfy.sh/<RADAR_TOPIC>`（每 4 分钟重发），ESP32 联网后自动读取最新网址再上传。之后只要 `config.h` 填好 WiFi，**Kaggle 重开多少次都不用重新烧录**。`RADAR_TOPIC`（暗号）在固件和 Kaggle 脚本里默认已一致。
+2. **固件 bug：嗅探后永远不重连**：嗅探轮次会断开 WiFi，而重连被“30 秒重试节流”挡住，导致联网上传大部分时间被跳过。已修复（嗅探结束立刻重连）。
+3. **3D 世界不再被“等待”遮住**：等待提示缩小到顶部；页面启动就自动加载真实街区（浏览器定位 → IP 粗略定位 → OpenStreetMap 建筑/道路），ESP32 数据到达后再用周围 WiFi（beaconDB）校准位置。
+4. **隧道更稳**：cloudflared 70 秒没出网址时自动改用 localhost.run 备用隧道。
+5. **检测日志新增两项**：「自动发现汇合点」「ESP32 WiFi 直传」，直接告诉你卡在 `[wifi] → [topic] → [upload]` 哪一步。
+6. 修复检测日志反复创建 WebGL 上下文（浏览器报 “Too many active WebGL contexts”）。
+
+### 沙盒验证记录
+- PlatformIO 真实编译固件（esp32s3 环境）通过。
+- 真实 cloudflared 隧道：服务端发布网址 → 按固件同样的解析规则从 ntfy.sh 读回 → 用 TLS1.2 POST `/api/ingest` 返回 200，服务端识别为 “ESP32 WiFi直传”。
+- 无头 Chromium：3D 页面从“等待”到收到数据后出图，检测面板各项正确。
 
 用一块 ESP32-S3 扫描周围 WiFi，把真实环境实时变成可用鼠标旋转 / 缩放 / 平移的**全屏 3D 世界**。
 
@@ -9,7 +26,7 @@ ESP32-S3 ──扫描 AP + 嗅探设备──┬─ USB 串口(RADARHELLO/RADARH
                                Kaggle (Flask + PyTorch 多GPU + cloudflared)：/ 全屏3D网站 · /api/ingest · /api/diag · /api/geo
 ```
 
-## v3 修复了什么（“卡在等待 ESP32 上传数据”的根因）
+## v3 修复了什么
 
 1. **插哪个 USB 口都能出数据**：`Serial` 到底走 UART 口还是原生 USB 口取决于 `ARDUINO_USB_CDC_ON_BOOT`，旧固件只输出到其中一个，插错口网页就永远 0 字节。现在固件**同时输出到两个口**（默认环境 `esp32s3`）。
 2. **首帧更快**：第一轮不做嗅探，约 2 秒内出第一帧；WiFi 连不上不再每轮阻塞 10 秒（30 秒重试一次，期间串口照常输出）。
@@ -23,8 +40,9 @@ ESP32-S3 ──扫描 AP + 嗅探设备──┬─ USB 串口(RADARHELLO/RADARH
 
 1. **Kaggle**：Settings → Accelerator `GPU T4 x2`，Internet `On`。新建 Code Cell，粘贴 `kaggle/wifi_radar_kaggle.py` 全部内容并运行，得到 `https://xxxx.trycloudflare.com`。
 2. **PlatformIO**：VSCode 打开 `firmware/`，Build → Upload（失败时按住 BOOT 再按 RESET）。不用改 config.h 也能用 USB 直连。
-3. 按一下 ESP32 的 **RESET**。电脑 Chrome/Edge 打开 Kaggle 网址，点「🔌 USB 连接 ESP32」，选择串口 → 3D 世界出现。
-4. 出问题：点网页右上角「🩺 检测日志」→「复制日志」，发给我 / 贴到 GitHub。
+3. （ESP32 直连 Kaggle 的方式）在 `firmware/include/config.h` 填 `WIFI_SSID` / `WIFI_PASS`（2.4GHz），Upload 一次即可；不填则只能用 USB 直连。按一下 ESP32 的 **RESET**。串口监视器应依次看到 `[wifi] connected` → `[topic] ✅ 发现 Kaggle 最新网址` → `[upload] HTTP 200 ✅`。
+4. 电脑 Chrome/Edge 打开 Kaggle 网址，点「🔌 USB 连接 ESP32」，选择串口 → 3D 世界出现。
+5. 出问题：点网页右上角「🩺 检测日志」→「复制日志」，发给我 / 贴到 GitHub。
 
 ## 浏览器模拟器 + 复制代码页
 
