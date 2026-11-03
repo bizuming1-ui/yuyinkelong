@@ -1,4 +1,37 @@
-## 📡 ESP32-S3 WiFi 雷达 · 3D 真实世界（v4）
+## 📡 ESP32-S3 WiFi 雷达 · 3D 真实世界（v5 · 新增 CSI 真实感知）
+
+## v5 做了什么（先看这里）
+
+**第一性原理的结论**：v4 只扫描热点的 RSSI（每个热点一个数字），物理上不可能“看见人/墙”。要让 WiFi 感知到人体，必须用 **CSI（信道状态信息：每个包 64 个子载波的幅度）**——ESP32-S3 硬件支持。v5 把 CSI 打通了整条链路：
+
+```
+ESP32-S3 连路由器 → 对网关 ping 25Hz → 路由器每个回包带 CSI → 固件算 湍流 d=1-相邻包相关系数 / 平均幅度 m
+   ├─ USB 串口：RADARCSI 行（含 64 子载波原始幅度，约 20 行/秒）──→ 网页 Web Serial ──┐
+   └─ WiFi 上传：每轮附带最近 ≈10 秒特征序列 cs ────────────────────────────────────┤
+                                                                                      ▼
+   浏览器(JS)与 Kaggle(PyTorch GPU FFT) 用同一套算法：运动指数 / 存在 / 呼吸(0.1~0.55Hz 谱峰) / 活动类型
+   → 3D 世界里：菲涅尔链路区 + 蓝→黄 UV 着色的人体线框网格（走动/小动作/静止呼吸）
+```
+
+| 内容 | 真实程度 |
+| --- | --- |
+| 人体存在 / 运动强度 / 走动 / 静止呼吸 BPM | ✅ 来自真实 CSI（需固件 v5 + 填好 WIFI_SSID/PASS）。沙盒用合成信号验证：呼吸 16.2→检出 16.1~16.3 BPM；走动检出 |
+| 3D 人体网格 | ⚠ **示意模型**：由活动状态驱动动画。单个 ESP32 = 单条链路，无法还原关节/多人（DensePose 需要多节点+训练好的模型） |
+| 人在哪 | ⚠ 只能确定“在 ESP32↔路由器链路的菲涅尔区内”，位置画在链路中点 |
+| 墙壁/街区 | ✅ 街区建筑来自 OpenStreetMap；❌ 室内墙体无法由单节点 CSI 还原 |
+| 无 WiFi 配置的被动 CSI | ⚠ 实验：多数路由器信标是 11b 速率，没有 CSI → 请配置 WiFi 走 ping 模式 |
+
+使用要点：① `firmware/include/config.h` 填 2.4GHz 的 `WIFI_SSID/WIFI_PASS` → Upload → 按 RESET；② 网页右上「🩺 检测日志」里的 **CSI 感知数据** 项会告诉你卡在哪；③ 开机后先让房间安静约 10 秒建立基线（或点「🎯 校准」）；④ 检测到人体时镜头自动聚焦（也可点「🧍 聚焦人体」）。
+串口新增：`RADARCSI:{"t","r","c","m","d","a"}`；心跳新增 `csi/csir/csim/csie/csid`（包数/速率/模式 0关 1STA 2被动/错误码/丢包）。
+服务端新增：`POST /api/csi`、`GET /api/sense`（GPU FFT 结果）；沙盒测试脚本 `tools/test_csi_server.py`。
+
+### v5 沙盒验证记录（均已实测）
+* PlatformIO 真实编译 `esp32s3`（CSI SDK 已开启 `CONFIG_ESP32_WIFI_CSI_ENABLED`）通过。
+* 本地起 Kaggle 服务端，注入合成 CSI：numpy 路径、PyTorch 路径各一次 → 呼吸与走动均 PASS。
+* 无头 Chromium：演示模式、固件同格式串口行（RADARHELLO/RADARJSON/RADARCSI/RADARHB）→ 页面分析与服务器 `/api/sense` 结果一致，无页面报错。
+
+---
+
 
 ## v4 修复了什么 —— “卡在等待 ESP32 上传数据”的真正根因
 
