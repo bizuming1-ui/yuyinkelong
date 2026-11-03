@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WiFi 雷达 · Kaggle 单文件服务端（ESP32-S3 -> Kaggle GPU -> 全屏 3D 网站）
-=========================================================================
-用法（Kaggle Notebook，右侧 Settings 里打开 Internet，Accelerator 选 GPU T4 x2）：
-    1) 新建一个 Code Cell，把本文件全部内容粘贴进去，点运行（或保存为 .py 后 %run wifi_radar_kaggle.py）
+WiFi 雷达 · Kaggle 单文件服务端 v2（ESP32-S3 -> Kaggle T4x2 GPU -> 全屏 3D 网站）
+=============================================================================
+用法（Kaggle Notebook：右侧 Settings -> Accelerator 选 GPU T4 x2，Internet 选 On）：
+    1) 新建 Code Cell，把本文件【全部内容】粘贴进去，运行。
     2) 等待输出：
          🌐 全屏 3D 网站： https://xxxx.trycloudflare.com
          #define SERVER_URL "https://xxxx.trycloudflare.com"
-    3) 把网址填进 PlatformIO 工程的 firmware/include/config.h 的 SERVER_URL（或串口输入 url https://xxxx...），
-       烧录后按 ESP32 的 RESET 键，网站里就会出现你周围的 WiFi 世界。
-    Cell 必须一直保持运行；停止 Cell = 关闭网站。
+    3) 用电脑 Chrome/Edge 打开该网址 -> 页面里点【🔌 USB 连接 ESP32】(最稳，ESP32 不需要联网)，
+       或者把网址填进 PlatformIO 的 firmware/include/config.h 的 SERVER_URL，烧录后按 RESET。
+    Cell 必须保持运行；停止 Cell = 关闭网站。
 
-它做了什么：
-    - Flask 提供 /（全屏 three.js 3D 页面）、/api/ingest（ESP32 上传）、/api/frames（网页轮询）、/api/geo（真实街区）
-    - cloudflared 免费隧道把 Kaggle 内部 8000 端口发布成公网 https 网址
-    - 当 >=2 个 ESP32 节点同时看到同一个 AP 时，用 PyTorch(GPU) 并行多起点优化做三边定位
-    - /api/geo：用 beaconDB 做 WiFi 定位，再从 OpenStreetMap(Overpass) 取真实建筑和道路，显示成 3D 街区
+内置功能：
+    - 3D 网站零依赖（自带 Canvas 3D 引擎，不再依赖任何 CDN / WebGL）。
+    - /api/ingest 接收 ESP32 (WiFi 直传 或 网页 USB 转发)，/api/frames 网页轮询。
+    - 多 GPU：>=2 个 ESP32 节点同时看到同一个 AP 时，用 PyTorch 在 *所有* GPU 上分片并行做三边定位（2048 起点并行优化）。
+    - GPU 运动检测：把所有 AP 的 RSSI 时间序列堆成矩阵，在 GPU 上计算环境扰动指数。
+    - 资源预算：显存（每卡 <=RADAR_VRAM_GB，默认 12GiB 内按需）、内存（RSSI 历史 <=RADAR_RAM_GB，默认 20GiB 上限）、
+      磁盘（历史记录 JSONL 写到 /kaggle/temp，<=RADAR_DISK_GB，默认 45GiB，自动滚动删除最旧文件）。
+    - 隧道：cloudflared 自动重试 + 公网自检；可选 ngrok（环境变量 NGROK_TOKEN）。
+    - /api/geo：beaconDB WiFi 定位 + OpenStreetMap 真实街区（建筑/道路）。
 """
-import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections
+import os, sys, re, json, math, time, threading, subprocess, shutil, urllib.request, collections, random, glob
 
-API_KEY = "radar-key"          # 必须与 ESP32 config.h 里的 API_KEY 一致
+API_KEY = os.environ.get("RADAR_KEY", "radar-key")        # 必须与 ESP32 config.h 里的 API_KEY 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
-API_KEY = os.environ.get("RADAR_KEY", API_KEY)
 USE_TUNNEL = os.environ.get("RADAR_NO_TUNNEL", "") != "1"
-NGROK_TOKEN = os.environ.get("NGROK_TOKEN", "")   # 可选：填了就用 ngrok 代替 cloudflared
-UA = {"User-Agent": "wifi-radar-esp32s3/1.0 (personal project)"}
-PATH_N, PATH_TX = 2.8, -40.0   # 服务端三边定位使用的路径损耗模型
+NGROK_TOKEN = os.environ.get("NGROK_TOKEN", "")
+VRAM_GB = float(os.environ.get("RADAR_VRAM_GB", "12"))     # 每张 GPU 允许求解器使用的显存上限（T4 共 15GiB）
+RAM_GB = float(os.environ.get("RADAR_RAM_GB", "20"))       # 历史时间序列允许占用的内存上限（Kaggle 共 30GiB）
+DISK_GB = float(os.environ.get("RADAR_DISK_GB", "45"))     # 历史记录磁盘上限（Kaggle 共 57.6GiB）
+RESTARTS = int(os.environ.get("RADAR_RESTARTS", "2048"))   # 每个 AP 的并行起点数
+UA = {"User-Agent": "wifi-radar-esp32s3/2.0 (personal project)"}
+PATH_N, PATH_TX = 2.8, -40.0
+HIST_DIR = "/kaggle/temp/wifi_radar_history" if os.path.isdir("/kaggle/temp") else "/tmp/wifi_radar_history"
 
 
 def _ensure(mod, pip=None):
@@ -49,16 +57,23 @@ FRAMES = collections.deque(maxlen=400)
 SEQ = 0
 NODES = {}
 SOLVED = {}
+SERIES = {}            # bssid -> deque[(t, rssi)]
+MOTION = {"v": 0.0, "base": None}
 T0 = time.time()
 PUBLIC_URL = ""
 GPU_NAMES = []
+RES_TEXT = ""
 _last_solve = 0.0
+HIST_Q = collections.deque(maxlen=20000)
 
 try:
     import torch
     GPU_NAMES = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
 except Exception:
     torch = None
+NGPU = len(GPU_NAMES)
+SERIES_MAXLEN = max(256, int(RAM_GB * 1024 ** 3 / 400 / 2000))   # 单 AP 历史点数上限（按 RAM 预算折算，最多 ~26000）
+SERIES_MAXLEN = min(SERIES_MAXLEN, 26000)
 
 
 @app.after_request
@@ -70,18 +85,21 @@ def _cors(r):
 
 
 @app.get("/")
+@app.get("/radar.html")
 def index():
     return Response(HTML, mimetype="text/html")
 
 
 @app.get("/api/health")
 def health():
-    return jsonify(ok=True, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES)
+    return jsonify(ok=True, frames=SEQ, uptime=int(time.time() - T0), gpu=GPU_NAMES, res=RES_TEXT)
 
 
-@app.post("/api/ingest")
+@app.route("/api/ingest", methods=["POST", "OPTIONS"])
 def ingest():
     global SEQ
+    if request.method == "OPTIONS":
+        return ("", 204)
     key = request.headers.get("X-Key") or request.args.get("key")
     if key != API_KEY:
         return jsonify(ok=False, error="bad key"), 401
@@ -107,9 +125,14 @@ def ingest():
                 r = float(a["r"])
                 old = n["obs"].get(b)
                 n["obs"][b] = {"r": r if old is None else old["r"] * 0.7 + r * 0.3, "c": int(a.get("c", 6)), "t": t}
+                dq = SERIES.get(b)
+                if dq is None:
+                    dq = SERIES[b] = collections.deque(maxlen=SERIES_MAXLEN)
+                dq.append((t, r))
             except Exception:
                 continue
         seq = SEQ
+    HIST_Q.append(json.dumps({"t": round(t, 2), "f": f}, ensure_ascii=False, separators=(",", ":")))
     threading.Thread(target=solve_positions, daemon=True).start()
     return jsonify(ok=True, seq=seq)
 
@@ -130,26 +153,26 @@ def frames():
             out = [f for f in FRAMES if f["_seq"] > since][-60:]
         status = {
             "gpu": GPU_NAMES, "frames": SEQ, "uptime": int(time.time() - T0), "public": PUBLIC_URL,
+            "motion": round(MOTION["v"], 3), "res": RES_TEXT,
             "nodes": {k: {"frames": v["frames"], "aps": v.get("aps", 0), "ip": v.get("ip"), "age": round(time.time() - v.get("last", 0), 1)} for k, v in NODES.items()},
         }
         return jsonify(seq=SEQ, frames=out, solved=SOLVED, status=status)
 
 
-# ---------------------------------------------------------------- GPU 多节点三边定位
+@app.get("/api/stats")
+def stats():
+    return jsonify(res=RES_TEXT, gpu=GPU_NAMES, series=len(SERIES), series_maxlen=SERIES_MAXLEN, hist_dir=HIST_DIR,
+                   budgets={"vram_gb": VRAM_GB, "ram_gb": RAM_GB, "disk_gb": DISK_GB, "restarts": RESTARTS}, motion=MOTION["v"])
+
+
+# ---------------------------------------------------------------- 多 GPU 三边定位
 def _dist(rssi, ch):
     return min(150.0, max(0.5, 10 ** (((PATH_TX - (7 if ch > 14 else 0)) - rssi) / (10 * PATH_N))))
 
 
-def multilaterate(items):
-    """items: [(bssid, [(x, y, d, w), ...])] -> {bssid: {x, y, n, res}}；torch 可用时在 GPU 上批量求解。"""
-    out = {}
-    if torch is None:
-        for b, v in items:
-            ws = sum(w for _, _, _, w in v)
-            out[b] = {"x": sum(x * w for x, _, _, w in v) / ws, "y": sum(y * w for _, y, _, w in v) / ws, "n": len(v), "res": -1}
-        return out
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    N, K, R = len(items), max(len(v) for _, v in items), 256
+def _solve_chunk(items, dev, R):
+    """在单个设备上批量求解一组 AP 的位置。items: [(bssid, [(x, y, d, w), ...])]"""
+    N, K = len(items), max(len(v) for _, v in items)
     P = torch.zeros(N, K, 2)
     D = torch.zeros(N, K)
     W = torch.zeros(N, K)
@@ -166,7 +189,7 @@ def multilaterate(items):
         dist = torch.sqrt(((X[:, :, None, :] - P[:, None, :, :]) ** 2).sum(-1) + 1e-6)
         return (W[:, None, :] * (dist - D[:, None, :]) ** 2).sum(-1)
 
-    for _ in range(120):
+    for _ in range(150):
         opt.zero_grad()
         loss_fn().sum().backward()
         opt.step()
@@ -176,18 +199,54 @@ def multilaterate(items):
         idx = torch.arange(N, device=dev)
         pos = X[idx, best].cpu().tolist()
         res = (L[idx, best] / W.sum(1).clamp(min=1e-6)).sqrt().cpu().tolist()
-    for (b, v), p, r in zip(items, pos, res):
-        px, py = p
-        uniq = {(round(x, 3), round(y, 3)) for x, y, _, _ in v}
-        if len(uniq) == 2:   # 两个节点存在镜像歧义：固定解在 A->B 连线左侧，避免来回跳动
-            (ax, ay), (bx, by) = sorted(uniq)
-            dx, dy = bx - ax, by - ay
-            if dx * (py - ay) - dy * (px - ax) < 0:
-                ln = math.hypot(dx, dy) or 1.0
-                ux, uy = dx / ln, dy / ln
-                t = (px - ax) * ux + (py - ay) * uy
-                px, py = 2 * (ax + ux * t) - px, 2 * (ay + uy * t) - py
-        out[b] = {"x": round(px, 2), "y": round(py, 2), "n": len(v), "res": round(r, 2)}
+    return pos, res
+
+
+def multilaterate(items):
+    out = {}
+    if torch is None:
+        for b, v in items:
+            ws = sum(w for _, _, _, w in v)
+            out[b] = {"x": sum(x * w for x, _, _, w in v) / ws, "y": sum(y * w for _, y, _, w in v) / ws, "n": len(v), "res": -1}
+        return out
+    devs = [torch.device("cuda:%d" % i) for i in range(NGPU)] or [torch.device("cpu")]
+    K = max(len(v) for _, v in items)
+    # 每个起点约占 (K*2 + 2) 个 float，Adam+autograd 约 x8；按显存预算决定一批最多处理多少个 AP
+    per_ap = RESTARTS * (K * 4 + 8) * 4 * 8
+    chunk = max(1, int(VRAM_GB * 1024 ** 3 / per_ap))
+    shards = [items[i::len(devs)] for i in range(len(devs))]
+    results = [None] * len(devs)
+
+    def work(i):
+        its = shards[i]
+        pos, res = [], []
+        for s in range(0, len(its), chunk):
+            p, r = _solve_chunk(its[s:s + chunk], devs[i], RESTARTS)
+            pos += p
+            res += r
+        results[i] = (its, pos, res)
+
+    th = [threading.Thread(target=work, args=(i,)) for i in range(len(devs)) if shards[i]]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    for r in results:
+        if not r:
+            continue
+        its, pos, res = r
+        for (b, v), p, rr in zip(its, pos, res):
+            px, py = p
+            uniq = {(round(x, 3), round(y, 3)) for x, y, _, _ in v}
+            if len(uniq) == 2:   # 两个节点存在镜像歧义：固定解在 A->B 连线左侧，避免来回跳动
+                (ax, ay), (bx, by) = sorted(uniq)
+                dx, dy = bx - ax, by - ay
+                if dx * (py - ay) - dy * (px - ax) < 0:
+                    ln = math.hypot(dx, dy) or 1.0
+                    ux, uy = dx / ln, dy / ln
+                    tt = (px - ax) * ux + (py - ay) * uy
+                    px, py = 2 * (ax + ux * tt) - px, 2 * (ay + uy * tt) - py
+            out[b] = {"x": round(px, 2), "y": round(py, 2), "n": len(v), "res": round(rr, 2)}
     return out
 
 
@@ -217,6 +276,116 @@ def solve_positions():
             SOLVED = res
     except Exception as e:
         print("[solve] error:", e)
+
+
+def selftest():
+    """启动自检：随机 3 个节点 + 40 个 AP，在所有 GPU 上求解，打印中位数误差。"""
+    try:
+        rnd = random.Random(1)
+        nodes = [(0, 0), (30, 0), (0, 30)]
+        items, truth = [], {}
+        for i in range(40):
+            tx, ty = rnd.uniform(-40, 60), rnd.uniform(-40, 60)
+            truth["AP%d" % i] = (tx, ty)
+            items.append(("AP%d" % i, [(nx, ny, math.hypot(tx - nx, ty - ny) * rnd.uniform(0.95, 1.05), 1.0) for nx, ny in nodes]))
+        t = time.time()
+        res = multilaterate(items)
+        errs = sorted(math.hypot(res[b]["x"] - truth[b][0], res[b]["y"] - truth[b][1]) for b in truth)
+        print("[selftest] 三边定位 %d 个 AP, 设备=%s, 用时 %.2fs, 中位误差 %.2f m" % (len(items), (GPU_NAMES or ["CPU"]), time.time() - t, errs[len(errs) // 2]), flush=True)
+    except Exception as e:
+        print("[selftest] 失败:", e, flush=True)
+
+
+# ---------------------------------------------------------------- GPU 运动检测 + 资源监控 + 磁盘历史
+def motion_loop():
+    T = 24
+    while True:
+        time.sleep(1.0)
+        try:
+            now = time.time()
+            with LOCK:
+                rows = [[r for (t, r) in list(dq)[-T:]] for dq in SERIES.values() if len(dq) >= T and now - dq[-1][0] < 15 and dq[-1][1] > -85]
+            if len(rows) < 2:
+                MOTION["v"] *= 0.9
+                continue
+            if torch is not None:
+                dev = torch.device("cuda:0" if NGPU else "cpu")
+                M = torch.tensor(rows, dtype=torch.float32, device=dev)
+                short = M.std(dim=1).mean().item()
+                diff = M.diff(dim=1).abs().mean().item()
+                cur = 0.6 * short + 0.4 * diff
+            else:
+                import statistics
+                cur = sum(statistics.pstdev(r) for r in rows) / len(rows)
+            b = MOTION["base"]
+            MOTION["base"] = cur if b is None else b + (0.004 if cur > b else 0.06) * (cur - b)
+            MOTION["v"] = max(0.0, min(1.0, (cur - MOTION["base"]) / 1.6))
+        except Exception:
+            pass
+
+
+def _meminfo():
+    d = {}
+    try:
+        for l in open("/proc/meminfo"):
+            k, v = l.split(":")
+            d[k] = int(v.split()[0]) * 1024
+    except Exception:
+        pass
+    return d
+
+
+def res_loop():
+    global RES_TEXT
+    while True:
+        try:
+            parts = []
+            if torch is not None and NGPU:
+                v = []
+                for i in range(NGPU):
+                    free, total = torch.cuda.mem_get_info(i)
+                    v.append("%.1f/%.0fG" % ((total - free) / 1024 ** 3, total / 1024 ** 3))
+                parts.append("显存 " + " | ".join(v))
+            m = _meminfo()
+            if m:
+                parts.append("内存 %.1f/%.0fG" % ((m["MemTotal"] - m.get("MemAvailable", 0)) / 1024 ** 3, m["MemTotal"] / 1024 ** 3))
+            du = shutil.disk_usage(os.path.dirname(HIST_DIR))
+            used = sum(os.path.getsize(f) for f in glob.glob(HIST_DIR + "/*.jsonl")) if os.path.isdir(HIST_DIR) else 0
+            parts.append("磁盘 历史 %.2fG (余 %.0fG)" % (used / 1024 ** 3, du.free / 1024 ** 3))
+            RES_TEXT = " · ".join(parts)
+        except Exception:
+            pass
+        time.sleep(5)
+
+
+def hist_writer():
+    os.makedirs(HIST_DIR, exist_ok=True)
+    cur, cur_size = None, 0
+    while True:
+        if not HIST_Q:
+            time.sleep(0.5)
+            continue
+        try:
+            if cur is None or cur_size > 256 * 1024 ** 2:
+                if cur:
+                    cur.close()
+                cur = open(os.path.join(HIST_DIR, "frames_%d.jsonl" % int(time.time())), "a", encoding="utf8")
+                cur_size = 0
+                files = sorted(glob.glob(HIST_DIR + "/*.jsonl"))
+                total = sum(os.path.getsize(f) for f in files)
+                while total > DISK_GB * 1024 ** 3 and len(files) > 1:   # 超过磁盘预算：删除最旧的
+                    total -= os.path.getsize(files[0])
+                    os.remove(files.pop(0))
+            n = 0
+            while HIST_Q and n < 500:
+                line = HIST_Q.popleft() + "\n"
+                cur.write(line)
+                cur_size += len(line)
+                n += 1
+            cur.flush()
+        except Exception as e:
+            print("[hist] error:", e)
+            time.sleep(2)
 
 
 # ---------------------------------------------------------------- 真实世界：beaconDB 定位 + OSM 建筑
@@ -268,7 +437,6 @@ def osm_scene(lat, lon, radius=260):
         pts = [[round((p["lon"] - lon) * kx, 1), round((p["lat"] - lat) * ky, 1)] for p in g]
         tags = e.get("tags", {})
         if "building" in tags:
-            h = None
             try:
                 h = float(str(tags.get("height", "")).split()[0])
             except Exception:
@@ -303,11 +471,12 @@ def geo():
 def _banner(url):
     global PUBLIC_URL
     PUBLIC_URL = url
-    line = "=" * 64
+    line = "=" * 66
     print("\n" + line)
     print("🌐 全屏 3D 网站： " + url)
     print('📟 ESP32 config.h： #define SERVER_URL "%s"' % url)
     print("   或串口输入：     url %s" % url)
+    print("🔌 最稳方案：     用电脑 Chrome/Edge 打开上面网址 -> 点【USB 连接 ESP32】")
     print("🔑 API_KEY：       %s" % API_KEY)
     print(line + "\n", flush=True)
     try:
@@ -315,6 +484,20 @@ def _banner(url):
         display(_H('<a href="%s" target="_blank" style="font-size:18px">▶ 点此打开全屏 3D 世界</a>' % url))
     except Exception:
         pass
+    threading.Thread(target=_probe, args=(url,), daemon=True).start()
+
+
+def _probe(url):
+    for i in range(15):
+        try:
+            r = requests.get(url + "/api/health", timeout=8, headers=UA)
+            if r.status_code == 200:
+                print("[tunnel] ✅ 公网自检通过：%s/api/health" % url, flush=True)
+                return
+        except Exception:
+            pass
+        time.sleep(4)
+    print("[tunnel] ⚠ 公网自检未通过（隧道可能还在生效，或被网络拦截）。可稍后刷新，或设置 NGROK_TOKEN 改用 ngrok。", flush=True)
 
 
 def start_cloudflared():
@@ -323,17 +506,21 @@ def start_cloudflared():
         print("[tunnel] 下载 cloudflared …")
         urllib.request.urlretrieve("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", exe)
         os.chmod(exe, 0o755)
-    p = subprocess.Popen([exe, "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
-    def reader():
-        shown = False
-        for line in p.stdout:
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-            if m and not shown:
-                shown = True
-                _banner(m.group(0))
-    threading.Thread(target=reader, daemon=True).start()
-    return p
+    def runner():
+        for attempt in range(1, 6):
+            p = subprocess.Popen([exe, "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate", "--protocol", "http2"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            shown = False
+            for line in p.stdout:
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m and not shown:
+                    shown = True
+                    _banner(m.group(0))
+            print("[tunnel] cloudflared 退出，第 %d 次重试…" % attempt, flush=True)
+            time.sleep(3)
+
+    threading.Thread(target=runner, daemon=True).start()
 
 
 def start_ngrok():
@@ -348,6 +535,10 @@ def main():
     srv = make_server("0.0.0.0", PORT, app, threaded=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     print("[server] 监听 0.0.0.0:%d  GPU: %s" % (PORT, ", ".join(GPU_NAMES) or "无(CPU)"))
+    print("[budget] 显存<=%.0fG/卡  内存<=%.0fG  磁盘<=%.0fG(%s)  起点数=%d" % (VRAM_GB, RAM_GB, DISK_GB, HIST_DIR, RESTARTS), flush=True)
+    for fn in (motion_loop, res_loop, hist_writer):
+        threading.Thread(target=fn, daemon=True).start()
+    threading.Thread(target=selftest, daemon=True).start()
     if USE_TUNNEL:
         if NGROK_TOKEN:
             start_ngrok()
@@ -358,7 +549,7 @@ def main():
     try:
         while True:
             time.sleep(30)
-            print("[status] frames=%d nodes=%s uptime=%ds" % (SEQ, list(NODES.keys()), time.time() - T0), flush=True)
+            print("[status] frames=%d nodes=%s uptime=%ds | %s" % (SEQ, list(NODES.keys()), time.time() - T0, RES_TEXT), flush=True)
     except KeyboardInterrupt:
         print("stopped")
 
