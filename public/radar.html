@@ -90,6 +90,18 @@ button.pri:hover{filter:brightness(1.1)}
 #csiNote{margin-top:5px;color:#7f9db3;font-size:11px;line-height:1.4}
 @media(max-height:760px){#csibox canvas#csiWf{display:none}}
 @media(max-width:900px){#dgp{right:14px;width:calc(100% - 28px)}}
+body.pose #side,body.pose #legend,body.pose #actbox{display:none}
+body.pose #dgp{right:14px}
+#dgAIout{display:none;max-height:28%;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#08182a;border:1px solid var(--bd);border-radius:8px;padding:6px 8px;margin-top:6px;font-size:12px;color:#cfe3f1}
+#wX{position:absolute;right:8px;top:6px;padding:1px 8px}
+#wait{width:min(520px,92vw);padding:8px 40px 8px 14px}
+#wait .spin{display:none}
+#wait h2{margin:0 0 2px;font-size:15px}
+#wait p{font-size:12px;margin:2px 0}
+#wait .diag{display:none}
+#wait.open .diag{display:block}
+#wait .btns button{padding:3px 8px;font-size:12px}
+#wDet{position:absolute;right:42px;top:6px;padding:1px 8px}
 </style>
 </head>
 <body>
@@ -120,6 +132,8 @@ button.pri:hover{filter:brightness(1.1)}
   <div class="row2"><label>路径损耗指数 n</label><input id="sN" type="range" min="1.6" max="4.5" step="0.05"><output id="oN"></output></div>
   <div class="row2"><label>1 米参考功率 dBm</label><input id="sT" type="range" min="-70" max="-20" step="1"><output id="oT"></output></div>
   <div class="checks">
+    <label title="隐藏 AP 信号柱 / 标签 / 扫描波 / 设备 / 街区，只保留人物姿态"><input type="checkbox" id="cPose"> 纯人体姿态</label>
+    <label><input type="checkbox" id="cSkel"> 骨架关键点</label>
     <label><input type="checkbox" id="cLab"> 标签</label>
     <label><input type="checkbox" id="cSwp"> 扫描波</label>
     <label><input type="checkbox" id="cSta"> 设备</label>
@@ -155,6 +169,7 @@ button.pri:hover{filter:brightness(1.1)}
 </div>
 
 <div id="wait" class="panel">
+  <button id="wX" title="关闭提示，只看 3D">✕</button><button id="wDet" title="展开/收起逐项检测">详情</button>
   <div class="spin"></div>
   <h2 id="wT">等待 ESP32 上传数据…</h2>
   <p id="wM">按一下 ESP32 的 <code>RESET</code> 键。网页已用 <b>自带 3D 引擎</b> 渲染（不依赖任何 CDN）。</p>
@@ -162,9 +177,10 @@ button.pri:hover{filter:brightness(1.1)}
   <div class="btns" style="justify-content:center"><button class="pri" id="bSerial2">🔌 USB 直连 ESP32（最稳）</button><button id="bDemo">▶ 启动演示数据</button><button id="bRst2">🔁 复位 ESP32</button><button id="bDiag2">🩺 检测日志</button></div>
 </div>
 <div id="dgp" class="panel">
-  <h3><span>🩺 全能检测系统 · 实时日志</span><button id="dgCopy" class="pri">📋 复制日志</button><button id="dgDl">⬇ 下载</button><button id="dgClr">清空</button><button id="dgX">✕</button></h3>
+  <h3><span>🩺 全能检测系统 · 实时日志</span><button id="dgCopy" class="pri">📋 复制日志</button><button id="dgAI">🤖 AI 分析</button><button id="dgDl">⬇ 下载</button><button id="dgClr">清空</button><button id="dgX">✕</button></h3>
   <div id="dgSum" class="dgsum">检测中…</div>
   <div id="dgChecks"></div>
+  <div id="dgAIout"></div>
   <div id="dgLog"></div>
 </div>
 <div id="toast"></div>
@@ -297,6 +313,7 @@ function diagChecks() {
   if (SIM) add('gpu', 'Kaggle GPU', 'wait', '模拟器无 GPU');
   else if (SERVER) add('gpu', 'Kaggle GPU', SERVER.gpu && SERVER.gpu.length ? 'ok' : 'warn', (SERVER.gpu && SERVER.gpu.length ? SERVER.gpu.join(' + ') : '无 GPU（CPU 模式）') + (SERVER.res ? ' · ' + SERVER.res : ''), SERVER.gpu && SERVER.gpu.length ? '' : 'Kaggle: Settings → Accelerator 选 GPU T4 x2');
   else add('gpu', 'Kaggle GPU', 'wait', '等待服务器状态');
+  if (!SIM) { var L6 = DG.llm; add('llm', 'AI 诊断助手', L6 ? (L6.engine === 'llm' ? 'ok' : (L6.state === '加载失败' || L6.state === '依赖安装失败') ? 'warn' : L6.state === '加载中' ? 'wait' : 'ok') : 'wait', L6 ? (L6.engine === 'llm' ? '大模型 ' + L6.model + ' 已就绪（加载 ' + L6.load_s + 's，调用 ' + L6.calls + ' 次）' : '规则诊断' + (L6.state ? '（大模型：' + L6.state + (L6.err ? ' · ' + L6.err : '') + '）' : '（内置服务端）')) : '未检测到 /api/llm'); }
   // CSI 感知
   if (!SIM) {
     var hbi = s.hbInfo, hl = s.hello, cage = (tn - CS.lastAt) / 1000;
@@ -389,7 +406,7 @@ window.addEventListener('message', function (ev) {
 dlog('INFO', 'page', '页面启动', envInfo());
 
 /* ================= 设置 ================= */
-var S = Object.assign({ n: 2.8, tx: -40, labels: true, sweep: true, stations: true, buildings: true, heat: true, rotate: false }, lsGet('wradar2.settings', {}));
+var S = Object.assign({ n: 2.8, tx: -40, labels: true, sweep: true, stations: true, buildings: true, heat: true, rotate: false, pose: true, skel: true }, lsGet('wradar2.settings', {}));
 var OVR = lsGet('wradar2.bearing', {});
 function saveS() { lsSet('wradar2.settings', S); }
 
@@ -726,12 +743,13 @@ function frameBody(tn) {
   var bg = g.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, '#02060d'); bg.addColorStop(0.55, '#04101c'); bg.addColorStop(1, '#030a13');
   g.fillStyle = bg; g.fillRect(0, 0, W, H);
   drawGround();
-  if (S.heat) drawHeat();
-  drawWorld();
-  drawSweep(dt, t);
+  var PO = S.pose !== false;           // 纯人体姿态模式：不画 AP 信号柱 / 标签 / 扫描波 / 设备 / 街区 / 热力
+  if (S.heat && !PO) drawHeat();
+  if (!PO) drawWorld();
+  if (!PO) drawSweep(dt, t);
   drawNodes(t);
-  drawStations(t);
-  drawAPs(dt, t);
+  if (!PO) drawStations(t);
+  if (!PO) drawAPs(dt, t);
   drawCsiBody(dt, t);
 }
 var fpsN = 0;
@@ -979,30 +997,41 @@ function drawBone(a, b, bn, sc, fwd) {
     }
   }
 }
+var SKEL = [['head', 'neck'], ['neck', 'chest'], ['chest', 'pel'], ['neck', 'shL'], ['neck', 'shR'], ['shL', 'elL'], ['elL', 'wrL'], ['shR', 'elR'], ['elR', 'wrR'], ['pel', 'hipL'], ['pel', 'hipR'], ['hipL', 'kneeL'], ['kneeL', 'ankL'], ['hipR', 'kneeR'], ['kneeR', 'ankR']];
+var SKJ = ['head', 'neck', 'shL', 'shR', 'elL', 'elR', 'wrL', 'wrR', 'pel', 'hipL', 'hipR', 'kneeL', 'kneeR', 'ankL', 'ankR'];
 var csiBodyPos = null;
 function drawCsiBody(dt, t) {
   if (S.body === false) return;
   var r = CS.res, want = r && !r.stale && r.present ? 1 : 0, link = csiLink();
   CS.bodyAmp += (want - CS.bodyAmp) * Math.min(1, dt * 3);
-  if (!r || r.stale && !CS.bodyAmp) return;
+  var SB = S.pose !== false && (!r || r.stale || !r.present) && CS.bodyAmp < 0.03;   // 待机：没有 CSI/没有人时画一个淡淡的待机姿态，3D 世界永远不是空的
+  if (!SB && (!r || r.stale && !CS.bodyAmp)) return;
+  if (!r) r = { act: 'empty', level: 0, breath: 0, present: false };
   var zb = clamp(0.55 * Math.sqrt(Math.max(link.d, 1)), 0.8, 3.2), ang = Math.atan2(link.ay - link.ny, link.ax - link.nx), ca = Math.cos(ang), sa = Math.sin(ang), mx = (link.nx + link.ax) / 2, my = (link.ny + link.ay) / 2;
   // 链路 + 菲涅尔区（人体能影响 CSI 的区域）
   g.globalAlpha = 1; g.setLineDash && g.setLineDash([6, 5]); g.strokeStyle = 'rgba(255,210,63,.5)'; g.lineWidth = 1.2; g.beginPath(); seg(link.nx, link.ny, 0.1, link.ax, link.ay, 0.1); g.stroke(); g.setLineDash && g.setLineDash([]);
   var ell = []; for (var i = 0; i < 40; i++) { var th = i * 2 * Math.PI / 40, lx = Math.cos(th) * link.d / 2, ly = Math.sin(th) * zb; ell.push([mx + lx * ca - ly * sa, my + lx * sa + ly * ca, 0.08]); }
   fillPoly(ell, 'rgba(255,210,63,' + (0.04 + 0.1 * CS.bodyAmp) + ')', 'rgba(255,210,63,.45)', 1);
   var ep = V(mx, my, 0.1); if (ep[2] > NEAR) { var es = SC(ep); label(es[0], es[1] + 14, 'CSI 链路区域', '#ffd23f', 'ESP32 ↔ ' + (link.ap ? (link.ap.ssid || link.ap.bssid) : '路由器') + ' · ' + link.d.toFixed(1) + 'm（估计）', false); }
-  if (CS.bodyAmp < 0.03) return;
+  if (CS.bodyAmp < 0.03 && !SB) return;
   var mode = r.act === 'walking' ? 'walking' : r.act === 'moving' ? 'moving' : 'still', spd = clamp(r.level / 14, 0.2, 1.2);
   CS.ph += dt * 2 * Math.PI * (0.8 + 0.5 * spd); CS.brPh += dt * 2 * Math.PI * ((r.breath || 15) / 60);
   var J = bodyJoints({ mode: mode, ph: CS.ph, s: spd, br: Math.sin(CS.brPh), t: t });
   var sc = clamp(cam.dist / 14, 1, 10), hd = ang + Math.PI / 2, ch = Math.cos(hd), sh = Math.sin(hd), fwd = [-sh, ch];
   var W3 = {}; Object.keys(J).forEach(function (k) { var p = J[k], x = p[0] * sc, y = p[1] * sc; W3[k] = [mx + x * ch - y * sh, my + x * sh + y * ch, p[2] * sc]; });
-  g.globalAlpha = 0.9 * CS.bodyAmp; g.lineWidth = 1;
+  var AMP = SB ? 0.3 : CS.bodyAmp; g.globalAlpha = 0.9 * AMP; g.lineWidth = 1;
   var gs = [], gi; for (gi = 0; gi < 24; gi++) { var gt = gi * Math.PI / 12; gs.push([mx + Math.cos(gt) * 0.5 * sc, my + Math.sin(gt) * 0.5 * sc, 0.03]); }
   fillPoly(gs, 'rgba(0,0,0,.35)', 'rgba(80,200,255,.0)', 0);
   BONES.forEach(function (bn) { drawBone(W3[bn[0]], W3[bn[1]], bn, sc, fwd); });
+  if (S.skel !== false) {
+    g.lineWidth = 2; g.strokeStyle = 'rgba(255,255,255,.92)';
+    SKEL.forEach(function (e) { var a = P(W3[e[0]][0], W3[e[0]][1], W3[e[0]][2]), b = P(W3[e[1]][0], W3[e[1]][1], W3[e[1]][2]); if (a && b) { g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke(); } });
+    g.fillStyle = '#ffd23f';
+    SKJ.forEach(function (k) { var a = P(W3[k][0], W3[k][1], W3[k][2]); if (a) { g.beginPath(); g.arc(a[0], a[1], 3.2, 0, 6.2832); g.fill(); } });
+    g.lineWidth = 1;
+  }
   g.globalAlpha = 1;
-  var hp = V(W3.top[0], W3.top[1], W3.top[2] + 0.1 * sc); if (hp[2] > NEAR) { var hs = SC(hp); label(hs[0], hs[1] - 6, '👤 人体 · ' + ACT_TXT[r.act], '#ffd23f', (r.breath ? '呼吸 ' + r.breath.toFixed(0) + ' 次/分 · ' : '') + (CS.synth ? '模拟数据' : 'CSI 推断') + (sc > 1.05 ? ' · 放大×' + sc.toFixed(1) : ''), true); }
+  var hp = V(W3.top[0], W3.top[1], W3.top[2] + 0.1 * sc); if (hp[2] > NEAR) { var hs = SC(hp); label(hs[0], hs[1] - 6, (SB ? '👤 待机姿态（示意）' : '👤 人体 · ' + ACT_TXT[r.act]), '#ffd23f', (r.breath ? '呼吸 ' + r.breath.toFixed(0) + ' 次/分 · ' : '') + (SB ? '暂无 CSI / 无人' : CS.synth ? '模拟数据' : 'CSI 推断') + (sc > 1.05 ? ' · 放大×' + sc.toFixed(1) : ''), true); }
   csiBodyPos = { x: mx, y: my };
 }
 function csiFocus() { var l = csiLink(); camGoal = { yaw: cam.yaw, pitch: 0.42, dist: 12, tx: (l.nx + l.ax) / 2, ty: (l.ny + l.ay) / 2, tz: 1 }; }
@@ -1056,11 +1085,11 @@ window.addEventListener('keydown', function (e) {
 function toast(m, ms) { var t = $('toast'); t.textContent = m; t.style.display = 'block'; clearTimeout(toast.h); toast.h = setTimeout(function () { t.style.display = 'none'; }, ms || 4500); }
 function sync() {
   $('sN').value = S.n; $('oN').textContent = (+S.n).toFixed(2); $('sT').value = S.tx; $('oT').textContent = S.tx;
-  $('cLab').checked = S.labels; $('cSwp').checked = S.sweep; $('cSta').checked = S.stations; $('cBld').checked = S.buildings; $('cHeat').checked = S.heat; $('cRot').checked = S.rotate; $('cBody').checked = S.body !== false;
+  $('cLab').checked = S.labels; $('cSwp').checked = S.sweep; $('cSta').checked = S.stations; $('cBld').checked = S.buildings; $('cHeat').checked = S.heat; $('cRot').checked = S.rotate; $('cBody').checked = S.body !== false; $('cPose').checked = S.pose !== false; $('cSkel').checked = S.skel !== false; document.body.classList.toggle('pose', S.pose !== false);
 }
 $('sN').oninput = function () { S.n = +this.value; heatDirty = true; sync(); saveS(); };
 $('sT').oninput = function () { S.tx = +this.value; heatDirty = true; sync(); saveS(); };
-[['cLab', 'labels'], ['cSwp', 'sweep'], ['cSta', 'stations'], ['cBld', 'buildings'], ['cHeat', 'heat'], ['cRot', 'rotate'], ['cBody', 'body']].forEach(function (p) { $(p[0]).onchange = function () { S[p[1]] = this.checked; saveS(); }; });
+[['cLab', 'labels'], ['cSwp', 'sweep'], ['cSta', 'stations'], ['cBld', 'buildings'], ['cHeat', 'heat'], ['cRot', 'rotate'], ['cBody', 'body'], ['cPose', 'pose'], ['cSkel', 'skel']].forEach(function (p) { $(p[0]).onchange = function () { S[p[1]] = this.checked; saveS(); sync(); if (p[1] === 'pose' && this.checked) csiFocus(); }; });
 $('bCal').onclick = csiCalibrate; $('bFocus').onclick = csiFocus; $('bReset').onclick = resetView; $('bFS').onclick = toggleFS;
 $('bClr').onclick = function () { OVR = {}; lsSet('wradar2.bearing', OVR); toast('已清除手动方位'); };
 $('bDemo').onclick = startDemo; $('bDemo2').onclick = startDemo;
@@ -1419,6 +1448,23 @@ window.WifiRadar = { csiSynthLine: csiSynthLine, csiSynth: function (on) { if (o
 if (SIM) { $('bDemo').style.display = 'none'; $('bDemo2').style.display = 'none'; $('bSerial').style.display = 'none'; $('bSerial2').style.display = 'none'; $('bRst').style.display = 'none'; $('bRst2').style.display = 'none'; loadDemoWorld(); setWaiting('等待 ESP32 启动…', '在左侧虚拟开发板上按下 RESET 键（或按键盘 R）。'); }
 if (Q.get('demo') === '1') startDemo();
 sync(); window.__radarReady = true;
+
+/* ===== v6：等待提示不再遮挡 / AI 分析 / 纯姿态初始镜头 ===== */
+$('wDet').onclick = function () { $('wait').classList.toggle('open'); };
+$('wX').onclick = function () { $('wait').style.display = 'none'; dlog('INFO', 'ui', '用户关闭了等待提示（3D 世界继续运行）'); };
+setInterval(function () { if ((CS.total > 0 || frameCount > 0) && $('wait').style.display !== 'none') { $('wait').style.display = 'none'; dlog('INFO', 'ui', '已收到数据（帧 ' + frameCount + ' · CSI ' + CS.total + '），自动隐藏等待提示'); } }, 700);
+$('dgAI').onclick = async function () {
+  var o = $('dgAIout'); o.style.display = 'block'; o.textContent = '🤖 分析中…（Kaggle 大模型首次调用可能需要 10~40 秒）';
+  try {
+    var r = await fetch('api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ report: buildReport(), problems: diagChecks().checks.filter(function (c) { return c.st !== 'ok'; }).map(function (c) { return c.name + '：' + c.msg; }).join('\n') }) });
+    var j = await r.json();
+    o.textContent = '🤖 [' + (j.engine || '?') + (j.model ? ' · ' + j.model : '') + ']\n' + (j.text || j.error || '无结果');
+    dlog(j.ok ? 'OK' : 'WARN', 'ai', 'AI 分析完成：引擎=' + j.engine + (j.model ? ' 模型=' + j.model : '') + (j.ms ? ' 用时 ' + j.ms + 'ms' : ''));
+  } catch (e) { o.textContent = 'AI 分析失败：' + e.message; dlog('ERR', 'ai', 'AI 分析请求失败：' + e.message); }
+};
+setTimeout(function () { if (S.pose !== false && !camGoal) csiFocus(); }, 1500);
+async function llmPoll() { if (SIM) return; try { var r = await fetch('api/llm', { cache: 'no-store' }); if (r.ok) DG.llm = await r.json(); } catch (e) {} }
+llmPoll(); setInterval(llmPoll, 15000);
 })();
 </script>
 </body>
