@@ -50,6 +50,8 @@ if args.reset:
     ser.rts = False
     print("[bridge] 已复位 ESP32")
 ser.write(b"hello\n")
+csi_url = args.url.rstrip("/") + "/api/csi"
+csi_buf, csi_t = [], time.time()
 ok = fail = frames = bytes_seen = 0
 t0 = last = time.time()
 while True:
@@ -75,6 +77,19 @@ while True:
             print("[bridge] 固件 v%s %s 复位原因=%s" % (h.get("fw"), h.get("node"), h.get("rst")))
         except ValueError:
             pass
+        continue
+    if raw.startswith("RADARCSI:"):       # v5：CSI 包（每秒约 20 行），攒成批再发给服务器 /api/csi
+        try:
+            j = json.loads(raw[9:])
+            csi_buf.append([int(time.time() * 1000), j.get("r", 0), j.get("m", 0), j.get("d", 0)])
+        except ValueError:
+            pass
+        if len(csi_buf) >= 20 or now - csi_t > 1.5:
+            try:
+                requests.post(csi_url, json={"node": "S3-BRIDGE", "v": csi_buf}, headers={"X-Key": args.key}, timeout=5)
+            except Exception as e:
+                print("[bridge] CSI 上传失败:", e)
+            csi_buf, csi_t = [], now
         continue
     if not raw.startswith("RADARJSON:"):
         print(raw)
