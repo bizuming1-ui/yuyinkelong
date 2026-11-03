@@ -1,9 +1,9 @@
-// WiFi RADAR · Next.js 内置服务端（v6）
+// WiFi RADAR · Next.js 内置服务端（v7）
 // 作用：让本站自己就是一个完整的“雷达服务器”——ESP32 可以直接 POST 到 /api/ingest，网页 3D 世界从 /api/frames 读取，
 // 不再依赖 Kaggle 才能显示“真实数据”。接口与 kaggle/wifi_radar_kaggle.py 保持一致（同一份 radar.html 两边通用）。
 // 状态保存在进程内存里（globalThis），服务重启后清空；这是实时数据，不需要入库。
 
-export const VERSION = "6.0.0";
+export const VERSION = "7.0.0";
 export const API_KEY = process.env.RADAR_API_KEY || "radar-key";
 
 type AnyObj = Record<string, unknown>;
@@ -228,6 +228,34 @@ function interp(t: number[], v: number[], tt: number) {
   return v[lo] + (v[hi] - v[lo]) * r;
 }
 
+// Hampel 去野值：只剔除孤立尖峰（与 Kaggle 版 GPU 实现一致）
+function hampel(x: number[], k = 7, nsig = 3, floor = 2e-3) {
+  const n = x.length;
+  if (n < 2 * k + 1) return x;
+  const h = k >> 1;
+  const med = (a: number[]) => {
+    const b = [...a].sort((p, q) => p - q);
+    return b[b.length >> 1];
+  };
+  return x.map((v, i) => {
+    const w: number[] = [];
+    for (let j = i - h; j <= i + h; j++) w.push(x[Math.min(n - 1, Math.max(0, j))]);
+    const m = med(w);
+    const mad = med(w.map((a) => Math.abs(a - m))) * 1.4826;
+    return Math.abs(v - m) > nsig * Math.max(mad, floor) ? m : v;
+  });
+}
+
+export function ruleScene(sense: AnyObj | null): string {
+  if (!sense) return "";
+  const act = String(sense.act);
+  if (!sense.present && act === "empty") return "房间无人（静止空场）";
+  if (act === "walking") return `检测到有人在走动（运动指数 ${Number(sense.level).toFixed(1)}×）`;
+  if (act === "moving") return `检测到有人有小幅动作（运动指数 ${Number(sense.level).toFixed(1)}×）`;
+  if (act === "still") return "检测到有人静止" + (Number(sense.breath) ? `，呼吸约 ${Number(sense.breath).toFixed(0)} 次/分` : "");
+  return "状态不明";
+}
+
 const ACT_TXT: Record<string, string> = { empty: "无人/无明显活动", still: "静止（呼吸级）", moving: "小幅动作", walking: "走动/大幅动作" };
 
 function senseTick() {
@@ -243,7 +271,7 @@ function senseTick() {
   }
   const arr = best[1].slice(-1500).filter((x) => now - x[0] < 45);
   if (arr.length < 20) return;
-  const t = arr.map((x) => x[0]), m = arr.map((x) => x[2]), d = arr.map((x) => x[3]);
+  const t = arr.map((x) => x[0]), m = arr.map((x) => x[2]), d = hampel(arr.map((x) => x[3]));
   const age = now - t[t.length - 1];
   const mean = (a: number[]) => (a.length ? a.reduce((p, c) => p + c, 0) / a.length : 0);
   const sel = (th: number) => d.filter((_, i) => t[i] > now - th);
@@ -317,7 +345,7 @@ export function framesResponse(since: number) {
     seq: s.seq,
     frames: outAge,
     solved: {},
-    status: { gpu: ["Next.js 内置服务端"], frames: s.seq, uptime: Math.floor(now - s.t0), public: "", motion: 0, res: "Next.js 内置（无 GPU）", sense: s.sense, nodes },
+    status: { gpu: ["Next.js 内置服务端"], frames: s.seq, uptime: Math.floor(now - s.t0), public: "", motion: 0, res: "Next.js 内置（无 GPU）", sense: s.sense, ai: { state: "规则（无 GPU）", model: "", scene: ruleScene(s.sense), vram: [] }, nodes },
   };
 }
 
