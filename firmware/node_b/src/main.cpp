@@ -64,6 +64,7 @@ static void radioTask(void*) {
       case T_SYNC: {
         memcpy(g_peerMac, it.mac, 6);
         g_havePeer = true;
+        g_acceptAllCsi = false;
         RFrame a;
         memset(&a, 0, sizeof(a));
         a.magic = RMAGIC; a.type = T_ACK; a.sweep = f.sweep;
