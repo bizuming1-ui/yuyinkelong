@@ -1,54 +1,60 @@
 #pragma once
 // ============================================================================
-//  ESP32-S3 双节点 WiFi CSI 全信道拼接雷达 v10 —— 配置文件（Node A 与 Node B 内容相同，直接复制即可）
+//  ESP32-S3 单节点/双节点自适应 WiFi CSI 成像与全物体检测雷达 v11 —— 配置文件
 //
-//  v10：只有 Node A（网关）联网上传；Node B（探头）不连 WiFi，只用 ESP-NOW 跟 A 配合，所以 B 用不到下面的 WiFi / 网址设置。
-//  只需要改下面 3 处（也可以在网页「复制代码界面」顶部的输入框里填好，复制出来的 config.h 会自动带上）：
-//    1) WIFI_SSID / WIFI_PASS   2.4GHz WiFi（路由器或手机热点；iPhone 热点要打开“最大兼容性”）。A 靠它把 CSI 数据传给 Kaggle。
-//    2) KAGGLE_URL(+URL2/3 备用)  Kaggle 运行后【输出框里打印的网址】，形如 https://xxxx.trycloudflare.com ，末尾不要加 /
-//    3) API_KEY                 必须和 Kaggle 脚本里的 API_KEY 一致（默认都是 radar-key）
+//  ★ v11 核心升级（1 块 ESP32-S3 即可完整实现整个 WiFi 成像与物体检测系统，0 断连）：
+//    · SINGLE_NODE_MODE = 1（默认开启）：只需烧录 1 块 ESP32-S3（直接用 Node A 工程即可）！
+//      板子全程保持连接路由器/手机热点（绝不主动断开 WiFi 切台），同时启动：
+//        ① 对路由器网关高频 ICMP Ping + UDP 探测脉冲（50Hz），每个回包触发硬件 64 子载波复数 CSI；
+//        ② 同信道混杂监听（Promiscuous CSI + 周围无线设备/反射体多源感知）；
+//        ③ TLS 长连接复用 + 多隧道自动轮换（trycloudflare / pinggy / lhr.life）+ ntfy 自动发现，彻底杜绝断连。
+//    · 如果后续给第 2 块板子（Node B）上电，系统也能无缝收到 B 的 ESP-NOW 帧并自动融合双节点数据。
 // ============================================================================
 
 #define WIFI_SSID  "bzmdiphone"
 #define WIFI_PASS  "a12332100"
 #define KAGGLE_URL "https://YOUR-TUNNEL.trycloudflare.com"
-// 备用网址（可选，留空 "" 即可）：Kaggle 输出框会同时打印 trycloudflare / lhr.life / pinggy 多个网址。
-// 国内网络常访问不了 trycloudflare.com，把 lhr.life 或 pinggy 的网址填到这里，固件上传失败时会自动换下一个。
+// 备用网址（可选，留空 "" 即可）：Kaggle 每次上传响应也会自动下发全部健康隧道网址给 ESP32 实时备份
 #define KAGGLE_URL2 ""
 #define KAGGLE_URL3 ""
 #define API_KEY    "radar-key"
-// 配对编号（0~255 的整数，默认 0xC5）：附近有多套雷达互相干扰时，每套改成不同的数；Node A 与 Node B 必须相同。
 #define PAIR_MAGIC 0xC5
 
-// 可选：自动发现网址。Kaggle 会把最新网址发布到 https://ntfy.sh/<RADAR_TOPIC>，
-// 当 KAGGLE_URL 没填（或连续上传失败）时，Node A 自动读取最新网址。设为 "" 关闭。
+// 自动发现网址：Kaggle 会把最新网址发布到 https://ntfy.sh/<RADAR_TOPIC>（支持 HTTP 与 HTTPS 双回退）
 #define RADAR_TOPIC "wradar-bzm-5f2k9q7d"
 
-// ---------------- 信道计划 ----------------
-// 1 = 全信道 1..13（80MHz 合成带宽，信道间隔 5MHz = 16 个子载波，相邻信道重叠 → 可做重叠相位拼接）
-// 0 = 先用 [1,6,11] 三个非重叠信道把流程跑通（验证用）
-#define CHANNEL_PLAN 1
+// ---------------- v11 单节点零断连全能模式 ----------------
+// 1 = 单节点零断连模式（默认推荐：只需 1 块 ESP32-S3，全程锁定路由器信道不断线，持续采集高频 CSI 并检测任何物体）
+// 0 = 传统双节点 13 信道跳频模式（需要 Node A + Node B 两块板子同时在线）
+#define SINGLE_NODE_MODE    1
 
-#define DWELL_MS            55   // 每信道停留（≥50ms）：含 3 次换台指令 + 稳定时间 + 多次双向交换
-#define EXCHANGES_PER_CH     8   // 每信道双向交换次数（每次 = A→B 探测 + B→A 回复 + B→A 数据，A、B 各得到一份 CSI）
-#define EXCH_GAP_MS          5   // 两次交换的间隔（必须 ≥4，CSI 与帧的配对靠时间窗 ±1.5ms）
-#define SWEEPS_PER_UPLOAD    3   // 连续扫几轮后回到路由器信道上传一次（越大越连续，但延迟越高）
+#define ACTIVE_PROBE_HZ    50    // 单节点模式下对路由器网关主动发探测包的频率（Hz，推荐 40~80）
+#define SINGLE_BATCH_MS  1100    // 单节点模式下每批采集多久上传一次（毫秒，1.1 秒一批 = 丝滑实时且不断连）
+#define SINGLE_TARGET_RECS 65    // 单节点每批目标采集 CSI 条数（达到条数或到时间即立刻上传）
 
-// ---------------- v10 新增 ----------------
-#define TX_POWER_DBM        15   // 发射功率 dBm（2~20）。两块板子在同一房间，15 足够；功率低 = 供电峰值小 = 不容易“欠压重启”
-#define DISABLE_BROWNOUT     0   // 1 = 关闭欠压检测（只有在网页检测日志显示 rst=BROWNOUT 且换不了电源/线时才用）
-#define SYNC_WAIT_MS      6000   // A 每次等 B 应答的最长时间（B 扫描 13 个信道一圈约 1.6 秒，6 秒足够）
-#define B_WAIT_MS        25000   // B 在“会合信道”等 A 回来的最长时间，超过就重新扫描 1..13 信道找 A
-#define B_SCAN_DWELL_MS    120   // B 扫描找 A 时每个信道停留多久
+// ---------------- 信道计划（双节点跳频或合成网格使用） ----------------
+#define CHANNEL_PLAN        1    // 1 = 1..13 全信道网格；0 = [1,6,11]
+#define DWELL_MS           55
+#define EXCHANGES_PER_CH    8
+#define EXCH_GAP_MS         5
+#define SWEEPS_PER_UPLOAD   3
 
-// DNS 备用：路由器 DNS 解析不了隧道域名时（HTTP 返回 -1），用这个备用 DNS（223.5.5.5 = 阿里 DNS，全球可用；也可改 8.8.8.8）
-#define DNS_FALLBACK "223.5.5.5"
-#define ENABLE_LED 1             // 板载 RGB 灯：蓝=连路由器 黄=上传中 绿=上传成功 红=失败 紫=等对端 青=扫描/跟随中（没接电脑也能看）
+// ---------------- 供电与稳定性保护 ----------------
+#define TX_POWER_DBM       15    // 15dBm 兼顾信号质量与低供电峰值，彻底防止 USB 欠压重启
+#define DISABLE_BROWNOUT    0    // 1 = 关闭欠压复位（仅在供电线极差时开启）
+#define SYNC_WAIT_MS     1800    // 双节点握手等待时间（v11 缩短为 1.8s，超时立即退化为单节点采集，绝不空等！）
+#define B_WAIT_MS       25000
+#define B_SCAN_DWELL_MS   120
 
-#define COUNTRY_CODE "CN"        // 中国 1~13 信道；美国请改 "US"，并把 CHANNEL_PLAN 的 13 改 11
-#define HOME_CHANNEL         1   // A 还没连上路由器时的会合信道（连上后自动改成路由器信道）
-#define WIFI_TIMEOUT_MS   9000   // 每次连路由器最多等多久
-#define HTTP_TIMEOUT_MS   9000
-#define HELLO_EVERY_MS   30000   // 没有数据时多久向 Kaggle 报一次“我在线”
-#define ENABLE_UPLOAD        1   // 0 = 不联网，只做扫描并在串口打印统计（调试同步用）
-#define SERIAL_BAUD     115200
+// DNS 备用（阿里 DNS + 腾讯 DNS，解决手机热点/国内路由器解析隧道域名偶发失败）
+#define DNS_FALLBACK  "223.5.5.5"
+#define DNS_FALLBACK2 "119.29.29.29"
+#define ENABLE_LED          1    // 板载 RGB 灯：蓝=连WiFi 青=采集中 黄=上传中 绿=上传成功 红=重试中
+
+#define COUNTRY_CODE     "CN"
+#define HOME_CHANNEL        1
+#define WIFI_TIMEOUT_MS  9000
+#define HTTP_TIMEOUT_MS  8000
+#define HELLO_EVERY_MS  15000
+#define ENABLE_UPLOAD       1
+#define SERIAL_BAUD    115200
