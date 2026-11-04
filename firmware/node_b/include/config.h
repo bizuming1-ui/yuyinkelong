@@ -16,6 +16,8 @@
 #define KAGGLE_URL2 ""
 #define KAGGLE_URL3 ""
 #define API_KEY    "radar-key"
+// 配对编号（0~255 的整数，默认 0xC5）：附近有多套雷达互相干扰时，每套改成不同的数；Node A 与 Node B 必须相同。
+#define PAIR_MAGIC 0xC5
 
 // 可选：自动发现网址。Kaggle 会把最新网址发布到 https://ntfy.sh/<RADAR_TOPIC>，
 // 当 KAGGLE_URL 没填（或连续上传失败）时，ESP32 自动读取最新网址。设为 "" 关闭。
