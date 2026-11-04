@@ -11,6 +11,21 @@ type Tab = "github" | "kaggle" | "pio";
 
 const rawUrl = (p: string) => `https://raw.githubusercontent.com/${GH_REPO}/main/${p.split("/").map(encodeURIComponent).join("/")}`;
 const norm = (s: string) => s.replace(/\r\n/g, "\n").replace(/\s+$/g, "");
+// 旧版文件：新版已不再使用，建议从 GitHub 仓库删除（点「在 GitHub 删除」打开删除页，再 Commit）
+const LEGACY = [
+  "firmware/platformio.ini",
+  "firmware/src/main.cpp",
+  "firmware/include/config.h",
+  "kaggle/wifi_radar_kaggle.py",
+  "scripts/build-kaggle.mjs",
+  "scripts/kaggle_template.py",
+  "public/radar.html",
+  "src/app/Simulator.tsx",
+  "src/app/code/CodeBrowser.tsx",
+  "src/app/api/bundle/route.ts",
+  "tools/test_llm_mock.py",
+  "tools/test_csi_server.py",
+];
 const kb = (n: number) => (n > 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`);
 
 function applyConfig(path: string, content: string, v: { ssid: string; pass: string; url: string; key: string }): string {
@@ -37,6 +52,7 @@ export default function CodeBrowser() {
   const [sync, setSync] = useState<Record<string, Sync>>({});
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [toast, setToast] = useState("");
+  const [legacy, setLegacy] = useState<Record<string, string>>({});
   const started = useRef(false);
 
   useEffect(() => {
@@ -85,6 +101,15 @@ export default function CodeBrowser() {
     };
     void Promise.all([worker(), worker(), worker(), worker()]);
   }, [tab, bundle]);
+
+  useEffect(() => {
+    if (tab !== "github") return;
+    LEGACY.forEach((p) => {
+      fetch(rawUrl(p) + `?t=${Date.now()}`, { cache: "no-store" })
+        .then((r) => setLegacy((o) => ({ ...o, [p]: r.status === 404 ? "gone" : r.ok ? "exists" : "unknown" })))
+        .catch(() => setLegacy((o) => ({ ...o, [p]: "unknown" })));
+    });
+  }, [tab]);
 
   const content = useCallback((f: F, withVals: boolean) => (withVals ? applyConfig(f.path, f.content, vals) : f.content), [vals]);
 
@@ -188,6 +213,17 @@ export default function CodeBrowser() {
                 填写后自动写入下方 config.h 的复制内容（只保存在你的浏览器里）。Kaggle 网址：{vals.url ? <b className="text-emerald-300">{vals.url}</b> : <span className="text-amber-300">还没填（也可留空，固件会通过 ntfy.sh 自动发现 Kaggle 最新网址）</span>}
               </div>
             </div>
+            <div className="rounded-2xl border border-amber-400/30 bg-[#17130a] p-5 text-[14px] leading-relaxed text-slate-200">
+              <h3 className="text-base font-bold text-amber-300">🛠 VSCode 编译失败？按顺序排查（固件已在 Arduino core 2.x 和 3.x 两种环境实测编译通过）</h3>
+              <ol className="mt-2 list-decimal space-y-1 pl-5">
+                <li><b>只打开 node_a（或 node_b）这一个文件夹</b>，不要打开整个仓库或 firmware 上级目录；每块板子一个独立工程，里面必须有 platformio.ini / include / src。</li>
+                <li><b>工程路径只能是英文</b>（例如 <code>D:\esp\node_a</code>），不能有中文、空格；用户名是中文的电脑也请把工程放到 D 盘。</li>
+                <li>VSCode 底部状态栏点环境名，选 <code>esp32s3</code>（默认）。如果报 <code>esp_now_recv_cb_t</code> 之类错误，说明你的 PlatformIO 用了新版 core 3.x：改选 <code>esp32s3_core3</code>，同一份代码两种都能编译。</li>
+                <li>第一次编译要下载约 1GB 工具链（GitHub），卡住就开代理/VPN，或删除工程里的 <code>.pio</code> 文件夹后重试；PlatformIO → Platforms → 更新。</li>
+                <li>四个文件必须各放对位置：<code>platformio.ini</code> 在工程根目录；<code>config.h</code> 与 <code>radar_common.h</code> 在 <code>include/</code>；<code>main.cpp</code> 在 <code>src/</code>。用本页「复制此文件」逐个粘贴，别用「全部复制」那个带分隔行的文本直接当文件。</li>
+                <li>还失败：复制 VSCode 终端里第一条 <code>error:</code> 开头的红色报错发给我，我据此精确修复。</li>
+              </ol>
+            </div>
             {[
               ["Node A（发起端：信道调度 + 发探测）", bundle.pioA, "Node A"],
               ["Node B（响应端：跟随换台 + 回复探测）", bundle.pioB, "Node B"],
@@ -214,8 +250,8 @@ export default function CodeBrowser() {
                 <li>粘贴到本页「③ PlatformIO 代码」顶部的「Kaggle 网址」（生成 config.h），再粘贴到「浏览器模拟器」顶部的 Kaggle 输入框，点「连接」。</li>
               </ol>
               <div className="mt-3 rounded-lg bg-[#0e1623] p-3 text-[13px] leading-relaxed text-slate-300">
-                资源使用：GPU0 做 8192 点 IFFT（距离剖面），GPU1 做 MUSIC 超分辨（只有 1 块 GPU 时都在 GPU0）；原始 CSI 滚动落盘到 /kaggle/working/radar_raw（上限 20GB，Disk 最大 57.6GiB）。
-                <b>诚实说明</b>：单条链路的数据量很小（每轮约 200 帧×128 字节），T4×2 / 30GB 内存远用不满，这是物理问题规模决定的，不是代码没写好。
+                资源使用：GPU0 做 16384 点 IFFT（距离剖面），GPU1 做 MUSIC 超分辨 + 全距离呼吸扫描（只有 1 块 GPU 时都在 GPU0），预留显存池；原始 CSI 滚动落盘到 /tmp/radar_raw（默认上限 min(40GB, 剩余−8GB)，Kaggle 磁盘最大 57.6GiB）。
+                <b>诚实说明</b>：2 节点 = 1 条双基地链路，数据量约 40KB/s，T4×2 / 30GB 内存远用不满，这是物理问题规模决定的，不是代码没写好；脚本不空转烧 GPU。
               </div>
               <div className="mt-3 max-w-xs">{input("API_KEY（写进脚本默认值，需与 config.h 一致）", key, (v) => saveVals(KEY_KEY, v, setKey), "radar-key")}</div>
             </div>
@@ -231,7 +267,7 @@ export default function CodeBrowser() {
                 <li>每个文件右侧的徽标会实时对比你仓库的 main 分支：<b>已同步</b> / <b>与仓库不同（需更新）</b> / <b>仓库没有（需新建）</b>。</li>
                 <li>点「✏️ 在 GitHub 编辑」：内容自动复制到剪贴板并打开对应的编辑（或新建）页面 → 全选粘贴 → Commit。也可以点「📋 复制此文件」自己处理。</li>
                 <li>这里复制的 config.h 是<b>占位版本（不含你的 WiFi 密码）</b>，可放心提交。</li>
-                <li>仓库里旧的 firmware/platformio.ini、firmware/src/main.cpp 等是旧版（v7）单节点固件，新版在 firmware/node_a 与 firmware/node_b，旧文件可保留也可删除。</li>
+                <li>新版固件在 <code>firmware/node_a</code> 与 <code>firmware/node_b</code>；旧版（v4~v7）单节点文件已经删除，页面最下方「建议从 GitHub 删除的旧文件」逐个提供删除按钮（<code>web/</code> 目录保持不变，不用动）。</li>
               </ol>
             </div>
             {groups.map(([title, fs]) =>
@@ -242,6 +278,19 @@ export default function CodeBrowser() {
                 </section>
               ) : null,
             )}
+            <section className="space-y-2 rounded-2xl border border-amber-400/30 bg-[#17130a] p-5">
+              <h3 className="text-lg font-bold text-amber-300">建议从 GitHub 删除的旧文件（新版已不使用）</h3>
+              <p className="text-[13px] text-slate-300">旧的单节点固件（firmware 根目录下的 platformio.ini / src / include）会在 VSCode 里被当成另一个工程，容易“打开错工程导致编译失败”，建议先删除。徽标显示仓库里是否还存在该文件。</p>
+              {LEGACY.map((p) => (
+                <div key={p} className="flex flex-wrap items-center gap-2 text-[13px]">
+                  <code className="text-slate-200">{p}</code>
+                  <span className={`rounded-full px-2 py-0.5 text-[11px] ${legacy[p] === "exists" ? "bg-rose-500/20 text-rose-200" : legacy[p] === "gone" ? "bg-emerald-500/20 text-emerald-200" : "bg-slate-600/40 text-slate-300"}`}>{legacy[p] === "exists" ? "仓库里还有" : legacy[p] === "gone" ? "已删除" : "检测中/无法检测"}</span>
+                  {legacy[p] !== "gone" && (
+                    <a href={`https://github.com/${GH_REPO}/delete/main/${p.split("/").map(encodeURIComponent).join("/")}`} target="_blank" rel="noreferrer" className="ml-auto rounded-lg border border-rose-400/40 px-3 py-1 text-rose-200 hover:bg-rose-500/10">🗑 在 GitHub 删除</a>
+                  )}
+                </div>
+              ))}
+            </section>
           </>
         )}
       </div>
