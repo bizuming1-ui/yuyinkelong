@@ -16,3 +16,31 @@ export const BROKERS: BrokerDef[] = [
 
 export const GITHUB_REPO = "bizuming1-ui/yuyinkelong";
 export const GITHUB_BRANCH = "main";
+
+// 旧版（Kaggle + Vite 方案）遗留文件：GitHub API 被限流(403)时，复制代码界面用 raw 逐个探测它们是否还在仓库里。
+export const OLD_FILE_HINTS: string[] = [
+  "web/index.html",
+  "web/package.json",
+  "web/tsconfig.json",
+  "web/scripts/build-kaggle.mjs",
+  "web/src/App.tsx",
+  "web/src/main.tsx",
+  "web/src/index.css",
+  "web/src/vite-env.d.ts",
+  "web/src/utils/cn.ts",
+  "web/src/lib/advisor.ts",
+  "web/src/lib/diag.ts",
+  "web/src/lib/radar.ts",
+  "web/src/lib/useRadar.ts",
+  "web/src/components/CodeBrowser.tsx",
+  "web/src/components/DiagPanel.tsx",
+  "web/src/components/Radar3D.tsx",
+  "web/src/components/SimulatorShell.tsx",
+  "src/lib/diag.ts",
+  "src/lib/radar-store.ts",
+  "tools/sim_esp32_csi.py",
+  "tools/test_host.py",
+  "tools/test_scene_server.py",
+  "提示词",
+  "检测日志",
+];
