@@ -1,15 +1,16 @@
 #pragma once
 // ============================================================================
-//  ESP32-S3 双节点 WiFi CSI 全信道拼接雷达 v9 —— 配置文件 (Node A 与 Node B 必须完全相同)
+//  ESP32-S3 双节点 WiFi CSI 全信道拼接雷达 v10 —— 配置文件（Node A 与 Node B 内容相同，直接复制即可）
 //
+//  v10：只有 Node A（网关）联网上传；Node B（探头）不连 WiFi，只用 ESP-NOW 跟 A 配合，所以 B 用不到下面的 WiFi / 网址设置。
 //  只需要改下面 3 处（也可以在网页「复制代码界面」顶部的输入框里填好，复制出来的 config.h 会自动带上）：
-//    1) WIFI_SSID / WIFI_PASS   2.4GHz WiFi（路由器或手机热点）。ESP32 靠它把 CSI 数据传给 Kaggle，完全不需要接电脑 USB。
+//    1) WIFI_SSID / WIFI_PASS   2.4GHz WiFi（路由器或手机热点；iPhone 热点要打开“最大兼容性”）。A 靠它把 CSI 数据传给 Kaggle。
 //    2) KAGGLE_URL(+URL2/3 备用)  Kaggle 运行后【输出框里打印的网址】，形如 https://xxxx.trycloudflare.com ，末尾不要加 /
 //    3) API_KEY                 必须和 Kaggle 脚本里的 API_KEY 一致（默认都是 radar-key）
 // ============================================================================
 
-#define WIFI_SSID  "YOUR_WIFI_SSID"
-#define WIFI_PASS  "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID  "bzmdiphone"
+#define WIFI_PASS  "a12332100"
 #define KAGGLE_URL "https://YOUR-TUNNEL.trycloudflare.com"
 // 备用网址（可选，留空 "" 即可）：Kaggle 输出框会同时打印 trycloudflare / lhr.life / pinggy 多个网址。
 // 国内网络常访问不了 trycloudflare.com，把 lhr.life 或 pinggy 的网址填到这里，固件上传失败时会自动换下一个。
@@ -20,7 +21,7 @@
 #define PAIR_MAGIC 0xC5
 
 // 可选：自动发现网址。Kaggle 会把最新网址发布到 https://ntfy.sh/<RADAR_TOPIC>，
-// 当 KAGGLE_URL 没填（或连续上传失败）时，ESP32 自动读取最新网址。设为 "" 关闭。
+// 当 KAGGLE_URL 没填（或连续上传失败）时，Node A 自动读取最新网址。设为 "" 关闭。
 #define RADAR_TOPIC "wradar-bzm-5f2k9q7d"
 
 // ---------------- 信道计划 ----------------
@@ -29,16 +30,23 @@
 #define CHANNEL_PLAN 1
 
 #define DWELL_MS            55   // 每信道停留（≥50ms）：含 3 次换台指令 + 稳定时间 + 多次双向交换
-#define EXCHANGES_PER_CH     8   // 每信道双向交换次数（每次 = A→B 探测 + B→A 回复，各得到一份 CSI）
+#define EXCHANGES_PER_CH     8   // 每信道双向交换次数（每次 = A→B 探测 + B→A 回复 + B→A 数据，A、B 各得到一份 CSI）
 #define EXCH_GAP_MS          5   // 两次交换的间隔（必须 ≥4，CSI 与帧的配对靠时间窗 ±1.5ms）
 #define SWEEPS_PER_UPLOAD    3   // 连续扫几轮后回到路由器信道上传一次（越大越连续，但延迟越高）
 
+// ---------------- v10 新增 ----------------
+#define TX_POWER_DBM        15   // 发射功率 dBm（2~20）。两块板子在同一房间，15 足够；功率低 = 供电峰值小 = 不容易“欠压重启”
+#define DISABLE_BROWNOUT     0   // 1 = 关闭欠压检测（只有在网页检测日志显示 rst=BROWNOUT 且换不了电源/线时才用）
+#define SYNC_WAIT_MS      6000   // A 每次等 B 应答的最长时间（B 扫描 13 个信道一圈约 1.6 秒，6 秒足够）
+#define B_WAIT_MS        25000   // B 在“会合信道”等 A 回来的最长时间，超过就重新扫描 1..13 信道找 A
+#define B_SCAN_DWELL_MS    120   // B 扫描找 A 时每个信道停留多久
+
 // DNS 备用：路由器 DNS 解析不了隧道域名时（HTTP 返回 -1），用这个备用 DNS（223.5.5.5 = 阿里 DNS，全球可用；也可改 8.8.8.8）
 #define DNS_FALLBACK "223.5.5.5"
-#define ENABLE_LED 1             // 板载 RGB 灯显示状态：蓝=连路由器 黄=上传中 绿=上传成功 红=失败 紫=等对端 青=扫描中（没接电脑也能看）
+#define ENABLE_LED 1             // 板载 RGB 灯：蓝=连路由器 黄=上传中 绿=上传成功 红=失败 紫=等对端 青=扫描/跟随中（没接电脑也能看）
 
 #define COUNTRY_CODE "CN"        // 中国 1~13 信道；美国请改 "US"，并把 CHANNEL_PLAN 的 13 改 11
-#define HOME_CHANNEL         1   // 没连上路由器时双方会合的信道
+#define HOME_CHANNEL         1   // A 还没连上路由器时的会合信道（连上后自动改成路由器信道）
 #define WIFI_TIMEOUT_MS   9000   // 每次连路由器最多等多久
 #define HTTP_TIMEOUT_MS   9000
 #define HELLO_EVERY_MS   30000   // 没有数据时多久向 Kaggle 报一次“我在线”
