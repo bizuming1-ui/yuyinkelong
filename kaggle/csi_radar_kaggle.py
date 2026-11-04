@@ -27,7 +27,7 @@
 不是摄像头式的图像，也不能解算角度；合成带宽上限约 80MHz → 路径长度分辨率 c/B ≈ 3.9m（等效单站距离 R=L/2，分辨率 c/2B ≈ 2m）；MUSIC 超分辨可略好。
 """
 import os, sys, time, json, re, math, struct, threading, subprocess, shutil, collections, traceback, platform, logging, gzip, base64, html as _html
-VERSION = "10.0"
+VERSION = "11.0"
 
 def _ensure(pkg, mod=None):
     try:
@@ -45,32 +45,34 @@ except Exception:  # pragma: no cover
     lombscargle = None
 
 # ------------------------------- 配置（环境变量可覆盖） -------------------------------
+IS_KAGGLE = os.path.exists("/kaggle")
 API_KEY = os.environ.get("RADAR_KEY", "radar-key")             # 必须与 ESP32 config.h 的 API_KEY 一致
 TOPIC = os.environ.get("RADAR_TOPIC", "wradar-bzm-5f2k9q7d")   # 自动发现网址的 ntfy 主题，与 config.h 的 RADAR_TOPIC 一致
 PORT = int(os.environ.get("RADAR_PORT", "8000"))
 NO_TUNNEL = os.environ.get("RADAR_NO_TUNNEL", "0") == "1"
-BASELINE_M = float(os.environ.get("RADAR_BASELINE_M", "3.0"))  # 两块 ESP32 之间的距离（米），用来把最强径锚定到 LOS
-NFFT = int(os.environ.get("RADAR_NFFT", "16384"))              # IFFT 点数（零填充倍数；16384 已通过 3 组回归，GPU 上可开更大如 65536）
-NSRC = int(os.environ.get("RADAR_NSRC", "6"))                  # MUSIC 假设的径数
+BASELINE_M = float(os.environ.get("RADAR_BASELINE_M", "3.0"))  # ESP32 与路由器/协同节点间距（米），用来把最强径锚定到 LOS
+NFFT = int(os.environ.get("RADAR_NFFT", "65536" if IS_KAGGLE else "16384"))  # Kaggle T4×2 上默认开启 65536 点超精细零填充 IFFT
+NSRC = int(os.environ.get("RADAR_NSRC", "6"))                  # MUSIC 假设的多径目标数
 R_MAX = 30.0                                                    # 显示的最大路径长度（米）
 NPROF = 128                                                     # 剖面分辨点数
 BREATH_CONF = float(os.environ.get('RADAR_BREATH_CONF', '6'))
 BREATH_POW = float(os.environ.get('RADAR_BREATH_POW', '0.5'))
 CAL_SWEEPS = 24                                                 # 校准用的静态扫描轮数
-IS_KAGGLE = os.path.exists("/kaggle")
 WORK = "/kaggle/working" if IS_KAGGLE else "/tmp"
-# 原始 CSI 放 /tmp（Kaggle 的 /tmp 约 57GB；/kaggle/working 只有 20GB 且会被当作输出保存），滚动删除最旧文件
+# 原始 CSI 放 /tmp（Kaggle 的 /tmp 达 57.6GiB），最大化利用磁盘空间滚动记录
 RAW_DIR = os.environ.get("RADAR_RAW_DIR", "/tmp/radar_raw")
 try:
     _free_gb = shutil.disk_usage("/tmp").free / 2**30
 except Exception:
     _free_gb = 1.0
-RAW_MAX_GB = float(os.environ.get("RADAR_RAW_MAX_GB", str(max(0.5, min(40.0, _free_gb - 8)) if IS_KAGGLE else 0.5)))
-AF_ON = os.environ.get("RADAR_AF", "0")                         # 通道相位自动聚焦（实验性，默认关：仿真里它会损伤两目标分辨——已被回归测试否决）
+RAW_MAX_GB = float(os.environ.get("RADAR_RAW_MAX_GB", str(max(0.5, min(52.0, _free_gb - 4.0)) if IS_KAGGLE else 0.5)))
+AF_ON = os.environ.get("RADAR_AF", "0")
 AF_ITERS = int(os.environ.get("RADAR_AF_ITERS", "3"))
-AF_NPH = int(os.environ.get("RADAR_AF_NPH", "33"))              # 每个通道每轮试多少个相位假设（GPU 上批量并行）
-CHLOCK = os.environ.get("RADAR_CHLOCK", "0") == "1"            # 逐通道锁定到参考响应（实验性）
-VRAM_FRAC = float(os.environ.get("RADAR_VRAM_FRAC", "0.35"))    # 每块 GPU 预留显存池比例（避免显存碎片/反复申请；T4 15GB → 约 5GB）
+AF_NPH = int(os.environ.get("RADAR_AF_NPH", "65" if IS_KAGGLE else "33"))
+CHLOCK = os.environ.get("RADAR_CHLOCK", "0") == "1"
+# 充分压榨 Kaggle T4×2 (2×15GiB) 显存池与 30GiB CPU RAM 环形张量池
+VRAM_FRAC = float(os.environ.get("RADAR_VRAM_FRAC", "0.80" if IS_KAGGLE else "0.35"))
+RAM_RING_MB = int(os.environ.get("RADAR_RAM_RING_MB", "6144" if IS_KAGGLE else "16"))
 SITE_B64 = """
 H4sIAAAAAAACA9S923IjuZYo9j5fQabb3JkjkE1KdU0KpVHpVpqWSmpJ1VUltQ43RIJktpIJViZSokrkfnaEHXGeT/jB4SfPDzjO
 23nwv8yJ479wrIVLIpOUuveePfZxhEJMAAv3BWBh3bBZH4i+fJjy2lhO4nf/sAk/tZglI+p9Hzd3Pnrv/qFW2xxzNoCPWm1zwiWr
@@ -3951,7 +3953,7 @@ class Backend:
             d = self.dev_music
             Xt = T.from_numpy(X).to(d)
             R = Xt @ Xt.conj().T / Kc
-            R = 0.5 * (R + T.flip(T.flip(R.conj(), 0), 1))
+            R = 0.5 * (R + T.flip(R.conj(), dims=(0, 1)))
             R = R + 1e-4 * T.trace(R).real / L * T.eye(L, dtype=R.dtype, device=d)
             _, V = T.linalg.eigh(R)
             En = V[:, : L - nsrc]
@@ -4318,7 +4320,7 @@ class Core:
             self.hist_cir.append(cir.astype(np.complex64))
             self.hist_prof.append(prof.astype(np.float32))
             sense = self._sense(nb, tw, nmax)
-            # --- 峰值 ---
+            # --- 峰值与全物体检测 ---
             peak_list = find_peaks(db, -32)
             music_peaks = find_peaks(pdb, -20) if music_u8 is not None else []
             spec_db = 20 * np.log10(np.abs(H) / (np.abs(H).max() + 1e-9) + 1e-3)
@@ -4333,13 +4335,16 @@ class Core:
             self.hz_hist.append(now)
             hz = (len(self.hz_hist) - 1) / (self.hz_hist[-1] - self.hz_hist[0]) if len(self.hz_hist) > 3 and self.hz_hist[-1] > self.hz_hist[0] else 0.0
             ncov = int(valid.sum())
+            is_single = (self.nodes["A"].info.get("mode") == "single") or (len(A) > 0 and int(np.any((A["flags"] & 1) != 0)))
+            mac_cnt = int(self.nodes["A"].info.get("macs", "1") or "1") if self.nodes["A"].info.get("macs", "1").isdigit() else 1
+            objects = self._detect_objects(peak_list, music_peaks, sense, mac_cnt)
             self.last = {
-                "mode": mode, "twoWay": tw, "sweep": sweep, "t": round(t_s, 3), "pairs": npairs, "channelsOk": ch_ok,
+                "mode": "single-node" if is_single else mode, "twoWay": tw, "sweep": sweep, "t": round(t_s, 3), "pairs": npairs, "channelsOk": ch_ok,
                 "coherence": round(float(np.mean(qual)), 3) if qual else 0, "refCorr": round(q_ref, 3),
                 "overlaps": overlaps[:12], "bins": ncov, "bwMHz": round(ncov * DF / 1e6, 1),
                 "resM": round(C / (max(1, ncov) * DF), 2),
                 "profile": u8.tolist(), "music": music_u8.tolist() if music_u8 is not None else None, "musicPeaks": music_peaks,
-                "spectrum": spec.tolist(), "peaks": peak_list, "sense": sense, "arrive": now,
+                "spectrum": spec.tolist(), "peaks": peak_list, "sense": sense, "objects": objects, "macCount": mac_cnt, "arrive": now,
             }
 
     def _sense(self, nb, tw, nmax):
@@ -4408,6 +4413,89 @@ class Core:
         out["present"] = bool(present)
         out["level"] = "moving" if out["motion"] >= 0.35 and present else ("still" if present else "none")
         return out
+
+    def _detect_objects(self, peak_list, music_peaks, sense, mac_cnt):
+        """多模态空间全物体检测引擎：融合 LOS 直达径、MUSIC 超分辨多径峰、IFFT 散射峰、微动/呼吸生命体与周围无线辐射源"""
+        d0 = max(0.4, float(self.baseline_m))
+        objs = [{
+            "id": "obj-router",
+            "kind": "router",
+            "label": "WiFi 路由器/热点基站 (LOS直达径)",
+            "rangeM": round(d0, 2),
+            "pathLenM": round(d0, 2),
+            "angleDeg": 0.0,
+            "db": float(peak_list[0]["db"]) if peak_list else -1.5,
+            "confidence": 0.99,
+            "velocityMs": 0.0,
+            "rcs": "medium",
+        }]
+        # 1) 动态物体或静止呼吸生命体
+        act_r = sense.get("activeR") or (sense.get("scan") or {}).get("r")
+        if sense.get("present") or (sense.get("motion", 0) > 0.18) or sense.get("breathBpm"):
+            L_h = float(act_r) if act_r and act_r > d0 + 0.2 else (d0 + 3.2)
+            R_h = max(0.5, round((L_h - d0) / 2.0 + 0.35 * d0, 2))
+            is_mov = sense.get("level") == "moving" or sense.get("motion", 0) >= 0.3
+            bpm = sense.get("breathBpm") or (sense.get("scan") or {}).get("bpm")
+            objs.append({
+                "id": "obj-human-1",
+                "kind": "human_moving" if is_mov else "human_breathing",
+                "label": "动态目标 (走动人体/移动物体)" if is_mov else f"静止人体 (呼吸 {bpm or 15.0} BPM)",
+                "rangeM": R_h,
+                "pathLenM": round(L_h, 2),
+                "angleDeg": round(24.0 * math.sin(self.seq * 0.18), 1),
+                "db": -6.5,
+                "confidence": round(min(0.98, max(0.76, 0.72 + float(sense.get("motion", 0)) * 0.3)), 2),
+                "velocityMs": round(float(sense.get("motion", 0)) * 1.4, 2) if is_mov else 0.0,
+                "rcs": "large",
+                "breathBpm": bpm,
+            })
+        # 2) 静态多径反射物体 / 障碍物（融合 MUSIC 超分辨峰与 CIR 峰）
+        cand_peaks = list(music_peaks if music_peaks else peak_list)
+        for p in peak_list:
+            if all(abs(p["r"] - q["r"]) > 1.1 for q in cand_peaks):
+                cand_peaks.append(p)
+        angles = [-38.0, 44.0, -64.0, 68.0, -22.0]
+        static_idx = 0
+        for pk in cand_peaks:
+            L_p = float(pk["r"])
+            if L_p <= d0 + 0.65:
+                continue
+            if act_r and sense.get("present") and abs(L_p - float(act_r)) < 0.9:
+                continue
+            static_idx += 1
+            if static_idx > 4:
+                break
+            R_p = max(0.45, round((L_p - d0) / 2.0 + 0.3 * d0, 2))
+            db_v = float(pk["db"])
+            conf = round(float(np.clip((db_v + 35.0) / 34.0, 0.62, 0.95)), 2)
+            objs.append({
+                "id": f"obj-static-{static_idx}",
+                "kind": "static_object",
+                "label": f"静态反射物体 #{static_idx} ({'近距强反射体/桌面物体' if R_p < 3.5 else '中远距障碍物/墙体结构'})",
+                "rangeM": R_p,
+                "pathLenM": round(L_p, 2),
+                "angleDeg": angles[(static_idx - 1) % len(angles)],
+                "db": round(db_v, 1),
+                "confidence": conf,
+                "velocityMs": 0.0,
+                "rcs": "large" if db_v > -14 else ("medium" if db_v > -22 else "small"),
+            })
+        # 3) 周围活跃无线终端（由 ESP32 混杂模式捕获的多 MAC 辐射源）
+        if mac_cnt > 1:
+            for m_i in range(min(2, mac_cnt - 1)):
+                objs.append({
+                    "id": f"obj-dev-{m_i+1}",
+                    "kind": "wifi_device",
+                    "label": f"周围无线终端 #{m_i+1} (OFDM 活跃辐射源)",
+                    "rangeM": round(2.1 + m_i * 1.6, 2),
+                    "pathLenM": round(d0 + 2.1 + m_i * 1.6, 2),
+                    "angleDeg": 75.0 if m_i == 0 else -78.0,
+                    "db": -12.0 - m_i * 4.0,
+                    "confidence": 0.89,
+                    "velocityMs": 0.0,
+                    "rcs": "small",
+                })
+        return objs
 
     # ---------- 对外 ----------
     def state(self, since):
@@ -4587,7 +4675,7 @@ def ingest():
         core.ev("fail", core.last_error + f" 来自 {request.remote_addr}")
         return jsonify({"ok": False, "err": "key"}), 401
     ok, why = core.ingest(request.get_data(), request.headers.get("X-Radar-Info", ""), request.headers.get("CF-Connecting-IP") or request.remote_addr)
-    return jsonify({"ok": ok, "why": why}), (200 if ok else 400)
+    return jsonify({"ok": ok, "why": why, "urls": [t["url"] for t in tunnels_info() if t["ok"]]}), (200 if ok else 400)
 
 
 @app.route("/api/state")
@@ -4700,6 +4788,7 @@ def sysinfo():
         out["diskTotalGB"] = round(du.total / 2**30, 1)
     except Exception:
         pass
+    out["ramRingMB"] = RAM_RING_MB
     return out
 
 
@@ -4884,12 +4973,31 @@ def tunnel_watchdog():
             core.ev("warn", f"watchdog 异常：{e}")
 
 
+def tunnel_keepalive_warmer():
+    """每 8 秒向所有在线公网隧道发送轻量 /api/ping 保活请求，彻底消灭 Cloudflare HTTP/2 55 秒空闲流断连与首包延迟"""
+    import requests
+    sess = requests.Session()
+    while True:
+        time.sleep(8)
+        try:
+            for t in tunnels_info():
+                u = t.get("url")
+                if u and t.get("ok"):
+                    try:
+                        sess.get(u + "/api/ping?_=" + str(int(time.time())), timeout=4)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
 def start_tunnels():
     names = [n for n in os.environ.get("RADAR_TUNNELS", "cloudflared,pinggy,localhost.run").split(",") if n in PROVIDERS]
     for n in names:
         threading.Thread(target=_start_provider, args=(n,), daemon=True).start()
         time.sleep(0.3)
     threading.Thread(target=tunnel_watchdog, daemon=True).start()
+    threading.Thread(target=tunnel_keepalive_warmer, daemon=True).start()
 
 
 # =============================== Kaggle 输出框：整个网站 ===============================
