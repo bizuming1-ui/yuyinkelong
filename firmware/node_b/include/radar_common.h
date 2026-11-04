@@ -17,8 +17,19 @@
 #include <stdarg.h>
 #include "config.h"
 
-#define FW_VERSION "9.0.0"
-#define RMAGIC 0xC5
+#define FW_VERSION "9.1.0"
+#ifndef PAIR_MAGIC
+#define PAIR_MAGIC 0xC5   // 同一空间有多套雷达时，给每套改成不同的数（Node A/B 必须一致）
+#endif
+#define RMAGIC PAIR_MAGIC
+
+// ---- Arduino-ESP32 core 2.x (espressif32@6.x) 与 core 3.x (pioarduino / espressif32@>=53) 兼容层 ----
+// core 3.x 的 ESP-NOW 接收回调签名变成 (const esp_now_recv_info_t*, data, len)，旧写法会编译失败。
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+#define RADAR_CORE3 1
+#else
+#define RADAR_CORE3 0
+#endif
 
 enum : uint8_t { T_SYNC = 1, T_ACK = 2, T_HOP = 3, T_PROBE = 4, T_REPLY = 5, T_HOME = 6 };
 
@@ -74,7 +85,11 @@ static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // ---------------- 状态灯：板载 RGB（没接电脑也能看状态） ----------------
 static void led(uint8_t r, uint8_t g, uint8_t b) {
 #if ENABLE_LED && defined(RGB_BUILTIN)
+#if RADAR_CORE3
+  rgbLedWrite(RGB_BUILTIN, r, g, b);
+#else
   neopixelWrite(RGB_BUILTIN, r, g, b);
+#endif
 #endif
 }
 
@@ -119,7 +134,7 @@ static volatile uint32_t g_csiSeen = 0, g_csiKept = 0;
 
 static void csiCb(void*, wifi_csi_info_t* info) {
   if (!g_csiOn || !info || !info->buf || info->len < 128) return;
-  g_csiSeen++;
+  g_csiSeen = g_csiSeen + 1;
   if (!g_havePeer || memcmp(info->mac, g_peerMac, 6) != 0) return;
   CsiSlot& s = g_csi[g_csiHead % CSI_RING];
   s.used = 0;
@@ -131,8 +146,8 @@ static void csiCb(void*, wifi_csi_info_t* info) {
   s.hw_ts = info->rx_ctrl.timestamp;
   memcpy(s.buf, info->buf, 128);
   s.used = 1;
-  g_csiHead++;
-  g_csiKept++;
+  g_csiHead = g_csiHead + 1;
+  g_csiKept = g_csiKept + 1;
 }
 
 // 按“回调时间最接近”取出与某个 ESP-NOW 帧对应的 CSI
@@ -180,12 +195,12 @@ static bool recsInit() {
 }
 
 static void recAdd(uint8_t dir, uint8_t ch, uint8_t seq, uint16_t sweep, const CsiSlot& s, uint32_t aux) {
-  if (g_nrec >= RECS_CAP) { g_dropped++; return; }
+  if (g_nrec >= RECS_CAP) { g_dropped = g_dropped + 1; return; }
   RRec& r = g_recs[g_nrec];
   r.dir = dir; r.ch = ch; r.seq = seq; r.rssi = s.rssi; r.sweep = sweep;
   r.ts = s.hw_ts; r.aux = aux; r.len = 128; r.flags = 0;
   memcpy(r.csi, s.buf, 128);
-  g_nrec++;
+  g_nrec = g_nrec + 1;
 }
 
 // ---------------- ESP-NOW ----------------
@@ -193,7 +208,20 @@ static esp_err_t sendFrame(const RFrame& f) {
   return esp_now_send(BCAST, (const uint8_t*)&f, sizeof(RFrame));
 }
 
-static void radioInit(esp_now_recv_cb_t cb) {
+typedef void (*radar_recv_fn)(const uint8_t* mac, const uint8_t* data, int len);
+static radar_recv_fn g_userRecv = nullptr;
+#if RADAR_CORE3
+static void espnowRecvThunk(const esp_now_recv_info_t* info, const uint8_t* d, int len) {
+  if (g_userRecv && info) g_userRecv(info->src_addr, d, len);
+}
+#else
+static void espnowRecvThunk(const uint8_t* mac, const uint8_t* d, int len) {
+  if (g_userRecv) g_userRecv(mac, d, len);
+}
+#endif
+
+static void radioInit(radar_recv_fn cb) {
+  g_userRecv = cb;
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -206,7 +234,7 @@ static void radioInit(esp_now_recv_cb_t cb) {
   esp_wifi_set_country(&c);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   if (esp_now_init() != ESP_OK) { rlog("[radio] esp_now_init 失败"); return; }
-  esp_now_register_recv_cb(cb);
+  esp_now_register_recv_cb(espnowRecvThunk);
   esp_now_peer_info_t p;
   memset(&p, 0, sizeof(p));
   memcpy(p.peer_addr, BCAST, 6);
@@ -214,7 +242,10 @@ static void radioInit(esp_now_recv_cb_t cb) {
   p.ifidx = WIFI_IF_STA;
   p.encrypt = false;
   esp_now_add_peer(&p);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   esp_err_t r = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);   // 6Mbps OFDM：稳、必带 L-LTF
+#pragma GCC diagnostic pop
   if (r != ESP_OK) rlog("[radio] espnow_rate err=0x%x", (unsigned)r);
 
   wifi_csi_config_t cc;
@@ -399,6 +430,12 @@ static bool postRecs(uint8_t node) {
 // 回到路由器信道并上传。返回会合信道（home）。无数据且最近报过平安时直接跳过，节省时间。
 static void homeUpload(uint8_t node, uint8_t* homeCh) {
 #if ENABLE_UPLOAD
+  // 无人值守看门狗：连续失败太多次 / 堆内存异常 → 自动重启（只供电不接电脑时，卡死也能自愈）
+  if (gFailStreak >= 40 || ESP.getFreeHeap() < 16000) {
+    rlog("[wdt] 连续失败 %u 次 / 堆内存 %u：自动重启", (unsigned)gFailStreak, (unsigned)ESP.getFreeHeap());
+    delay(300);
+    ESP.restart();
+  }
   bool due = g_nrec > 0 || gLastHelloMs == 0 || millis() - gLastHelloMs > HELLO_EVERY_MS;
   if (!due) return;
   if (wifiPlaceholder()) { if (gLastHelloMs == 0) rlog("[wifi] 未填 WIFI_SSID：只做扫描，不上传"); g_nrec = 0; gLastHelloMs = millis(); return; }
