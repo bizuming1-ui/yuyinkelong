@@ -17,7 +17,7 @@
 #include <stdarg.h>
 #include "config.h"
 
-#define FW_VERSION "8.0.0"
+#define FW_VERSION "9.0.0"
 #define RMAGIC 0xC5
 
 enum : uint8_t { T_SYNC = 1, T_ACK = 2, T_HOP = 3, T_PROBE = 4, T_REPLY = 5, T_HOME = 6 };
@@ -70,6 +70,13 @@ static const uint8_t PLAN[] = {1, 6, 11};
 #define MATCH_US 1500
 
 static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ---------------- 状态灯：板载 RGB（没接电脑也能看状态） ----------------
+static void led(uint8_t r, uint8_t g, uint8_t b) {
+#if ENABLE_LED && defined(RGB_BUILTIN)
+  neopixelWrite(RGB_BUILTIN, r, g, b);
+#endif
+}
 
 // ---------------- 日志（同时输出到 USB 口和 UART 口，插哪个都能在串口监视器看到） ----------------
 static void rlog(const char* fmt, ...) {
@@ -246,16 +253,30 @@ static int gRouterCh = 0;
 static uint32_t gLeaseMs = 0, gLastHelloMs = 0;
 static uint32_t gUpOk = 0, gUpFail = 0, gFailStreak = 0;
 static String gBase = KAGGLE_URL;
+static String gUrls[3] = {KAGGLE_URL, KAGGLE_URL2, KAGGLE_URL3};
+static int gUrlIdx = 0;
+static int gLastErr = 0;
 static int gLastCode = 0;
 
-static bool urlPlaceholder(const String& u) { return u.length() < 12 || u.indexOf("YOUR-TUNNEL") >= 0; }
+static bool urlPlaceholder(const String& u) { return u.length() < 12 || u.indexOf("YOUR-TUNNEL") >= 0 || !u.startsWith("http"); }
+static void rotateUrl() {   // 上传失败后换下一个可用网址（trycloudflare / lhr.life / pinggy）
+  for (int i = 1; i <= 3; i++) {
+    int j = (gUrlIdx + i) % 3;
+    if (!urlPlaceholder(gUrls[j])) { gUrlIdx = j; gBase = gUrls[j]; return; }
+  }
+}
 static bool wifiPlaceholder() { return String(WIFI_SSID) == "YOUR_WIFI_SSID" || strlen(WIFI_SSID) == 0; }
 
 static bool wifiUp(uint32_t tmo) {
   esp_wifi_set_promiscuous(false);
   g_csiOn = false;
   if (gHaveLease && millis() - gLeaseMs > 1200000) { gHaveLease = false; WiFi.config(IPAddress(), IPAddress(), IPAddress()); }
-  if (gHaveLease) WiFi.config(gIp, gGw, gMask, gDns);   // 复用上次的 IP，省掉 DHCP（重连更快）
+  if (gHaveLease) {                                      // 复用上次的 IP，省掉 DHCP（重连更快）；DNS = 路由器 + 备用 DNS
+    IPAddress d1 = (gDns == IPAddress((uint32_t)0)) ? gGw : gDns;
+    IPAddress d2;
+    if (!d2.fromString(DNS_FALLBACK)) d2 = IPAddress(223, 5, 5, 5);
+    WiFi.config(gIp, gGw, gMask, d1, d2);
+  }
   if (gHaveBssid) WiFi.begin(WIFI_SSID, WIFI_PASS, gRouterCh, gBssid, true);
   else WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
@@ -276,6 +297,7 @@ static bool wifiUp(uint32_t tmo) {
   return true;
 }
 
+// 从 ntfy 读 Kaggle 最新发布的网址（空格分隔的多个）：发现的排在前面，config.h 里的排在后面，最多 3 个
 static String discoverUrl() {
   if (strlen(RADAR_TOPIC) == 0) return "";
   WiFiClientSecure c;
@@ -285,19 +307,41 @@ static String discoverUrl() {
   String u = String("https://ntfy.sh/") + RADAR_TOPIC + "/raw?poll=1&since=12h";
   if (!h.begin(c, u)) return "";
   int code = h.GET();
-  String out = "";
+  String first = "";
   if (code == 200) {
     String s = h.getString();
-    int p = s.lastIndexOf("https://");
-    if (p >= 0) {
-      int e = p;
-      while (e < (int)s.length() && s[e] > ' ') e++;
-      out = s.substring(p, e);
+    s.trim();
+    int nl = s.lastIndexOf('\n');
+    String line = nl >= 0 ? s.substring(nl + 1) : s;
+    String found[3];
+    int nf = 0, p = 0;
+    while (nf < 3) {
+      int a = line.indexOf("https://", p);
+      if (a < 0) break;
+      int e = a;
+      while (e < (int)line.length() && line[e] > ' ') e++;
+      found[nf++] = line.substring(a, e);
+      p = e;
+    }
+    if (nf > 0) {
+      String merged[3];
+      int nm = 0;
+      for (int k = 0; k < nf && nm < 3; k++) merged[nm++] = found[k];
+      String cfg[3] = {KAGGLE_URL, KAGGLE_URL2, KAGGLE_URL3};
+      for (int k = 0; k < 3 && nm < 3; k++) {
+        if (urlPlaceholder(cfg[k])) continue;
+        bool dup = false;
+        for (int m = 0; m < nm; m++) if (merged[m] == cfg[k]) dup = true;
+        if (!dup) merged[nm++] = cfg[k];
+      }
+      for (int k = 0; k < 3; k++) gUrls[k] = k < nm ? merged[k] : String("");
+      gUrlIdx = 0;
+      first = gUrls[0];
     }
   }
   h.end();
-  rlog("[topic] %s -> HTTP %d %s", u.c_str(), code, out.c_str());
-  return out;
+  rlog("[topic] ntfy -> HTTP %d  %s", code, first.c_str());
+  return first;
 }
 
 // 已连上路由器时调用：POST 记录（nrec=0 也可作为“在线心跳”）
@@ -306,6 +350,7 @@ static bool postRecs(uint8_t node) {
     String d = discoverUrl();
     if (d.length() > 12) { gBase = d; gFailStreak = 0; }
   }
+  if (urlPlaceholder(gBase)) rotateUrl();
   if (urlPlaceholder(gBase)) { rlog("[upload] ❌ 没有 Kaggle 网址：请在 config.h 填 KAGGLE_URL"); return false; }
   while (gBase.endsWith("/")) gBase.remove(gBase.length() - 1);
   uint16_t n = g_nrec;
@@ -314,10 +359,12 @@ static bool postRecs(uint8_t node) {
   h->boot = g_boot; h->uptime_ms = millis(); h->dropped = g_dropped;
   size_t bytes = sizeof(RHdr) + (size_t)n * sizeof(RRec);
 
-  char info[240];
-  snprintf(info, sizeof(info), "fw=%s;mac=%s;rssi=%d;ch=%d;ip=%s;heap=%u;up=%u;fail=%u;plan=%d;seen=%u;kept=%u",
+  char info[300];
+  String host = gBase;
+  host.replace("https://", ""); host.replace("http://", "");
+  snprintf(info, sizeof(info), "fw=%s;mac=%s;rssi=%d;ch=%d;ip=%s;heap=%u;up=%u;fail=%u;plan=%d;seen=%u;kept=%u;lerr=%d;url=%.40s",
            FW_VERSION, WiFi.macAddress().c_str(), WiFi.RSSI(), WiFi.channel(), WiFi.localIP().toString().c_str(),
-           (unsigned)ESP.getFreeHeap(), (unsigned)gUpOk, (unsigned)gUpFail, NPLAN, (unsigned)g_csiSeen, (unsigned)g_csiKept);
+           (unsigned)ESP.getFreeHeap(), (unsigned)gUpOk, (unsigned)gUpFail, NPLAN, (unsigned)g_csiSeen, (unsigned)g_csiKept, gLastErr, host.c_str());
 
   bool secure = gBase.startsWith("https://");
   WiFiClientSecure cs;
@@ -333,8 +380,19 @@ static bool postRecs(uint8_t node) {
   http.addHeader("X-Radar-Info", info);
   int code = http.POST(g_body, bytes);
   gLastCode = code;
+  String es = code < 0 ? http.errorToString(code) : String("");
   http.end();
-  rlog("[upload] node=%c rec=%u bytes=%u -> HTTP %d", node ? 'B' : 'A', (unsigned)n, (unsigned)bytes, code);
+  rlog("[upload] node=%c rec=%u bytes=%u -> HTTP %d %s  (%s)", node ? 'B' : 'A', (unsigned)n, (unsigned)bytes, code, es.c_str(), gBase.c_str());
+  if (code != 200) {
+    gLastErr = code;
+    // 失败时做一次 DNS / 公网体检，串口里直接看到原因
+    String hh = gBase; hh.replace("https://", ""); hh.replace("http://", "");
+    int sl = hh.indexOf('/'); if (sl > 0) hh = hh.substring(0, sl);
+    IPAddress ip;
+    bool dnsOk = WiFi.hostByName(hh.c_str(), ip) == 1;
+    rlog("[diag] DNS %s -> %s %s | 提示：-1=连不上(DNS/被墙/网址旧) -11=超时 401=API_KEY不一致 530/1033=隧道已换 → 改 config.h 的 KAGGLE_URL 或填备用网址", hh.c_str(), dnsOk ? "OK" : "失败", dnsOk ? ip.toString().c_str() : "");
+    rotateUrl();
+  } else gLastErr = 0;
   return code == 200;
 }
 
@@ -345,13 +403,17 @@ static void homeUpload(uint8_t node, uint8_t* homeCh) {
   if (!due) return;
   if (wifiPlaceholder()) { if (gLastHelloMs == 0) rlog("[wifi] 未填 WIFI_SSID：只做扫描，不上传"); g_nrec = 0; gLastHelloMs = millis(); return; }
   uint32_t t0 = millis();
+  led(0, 0, 40);   // 蓝：连路由器
   if (!wifiUp(WIFI_TIMEOUT_MS)) {
+    led(60, 0, 0);
     gUpFail++; gFailStreak++;
     rlog("[wifi] ❌ 连接 %s 失败（SSID/密码错或是 5GHz？）", WIFI_SSID);
     if (g_nrec > RECS_CAP / 2) g_nrec = 0;
   } else {
     *homeCh = (uint8_t)WiFi.channel();
+    led(40, 30, 0);  // 黄：上传中
     bool ok = postRecs(node);
+    led(ok ? 0 : 60, ok ? 40 : 0, 0);   // 绿=成功 红=失败
     if (ok) { gUpOk++; gFailStreak = 0; g_nrec = 0; gLastHelloMs = millis(); }
     else { gUpFail++; gFailStreak++; if (g_nrec > RECS_CAP / 2) g_nrec = 0; }
     rlog("[wifi] ✅ RSSI=%d 信道=%d 用时 %lu ms", WiFi.RSSI(), WiFi.channel(), (unsigned long)(millis() - t0));
