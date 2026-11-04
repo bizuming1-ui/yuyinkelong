@@ -1,595 +1,378 @@
-"use client";
-import { forwardRef, useEffect, useImperativeHandle, useRef, type MutableRefObject } from "react";
-import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import type { DetectedObject, ObjectKind, RadarState, Row } from "@/lib/radar";
+import { useEffect, useRef } from "react";
+import type { Obj } from "../lib/store";
 
-export type SceneOpts = { terrain: boolean; ellipses: boolean; autoRotate: boolean; music: boolean; objects3d?: boolean };
-export type SceneStatus = { gl: boolean; renderer: string; error: string; fps: number; pixelRatio: number };
-export type Radar3DHandle = { resetView: () => void; focusObject: (obj: DetectedObject) => void };
+/** 自研透视投影 3D 场景（零依赖）：距离-时间地形 + 路径椭圆 + ESP32/路由器 + 检测到的物体 */
+export type SceneOpts = { terrain: boolean; ellipses: boolean; music: boolean; rotate: boolean };
 type Props = {
-  stateRef: MutableRefObject<RadarState | null>;
-  rowsRef: MutableRefObject<Row[]>;
-  baselineM: number;
+  snap: any;
+  hist: number[][];
+  baseline: number;
   opts: SceneOpts;
-  selectedObjId?: string | null;
-  onStatus: (s: SceneStatus) => void;
+  resetKey: number;
+  onFps?: (fps: number) => void;
 };
 
-const COLS = 128;
-const ROWS = 72;
-const TW = 30;
-const TD = 18;
-const TZ = -19;
-const HMAX = 6;
-const NEL = 7;
-const NPT = 200;
-const MAX_OBJ3D = 10;
+type V3 = [number, number, number];
+const CAM0 = { yaw: -1.25, pitch: 0.68, dist: 54, tx: -9, ty: 10, tz: 0 };
+const KIND_COL: Record<string, string> = {
+  moving: "#ff4d6d",
+  breathing: "#ff9f43",
+  device: "#a78bfa",
+  reflector: "#34d399",
+  router: "#fbbf24",
+};
+const TX0 = -34; // 地形（距离-时间）放在椭圆区域左侧
+const TW = 24;
 
-function colormap(v: number, out: THREE.Color) {
-  const stops: [number, number, number][] = [
-    [0.02, 0.05, 0.16],
-    [0.0, 0.35, 0.65],
-    [0.0, 0.85, 0.85],
-    [0.6, 0.95, 0.3],
-    [1.0, 0.65, 0.1],
-    [1.0, 0.2, 0.15],
-  ];
-  const x = Math.min(0.999, Math.max(0, v)) * (stops.length - 1);
-  const i = Math.floor(x);
-  const f = x - i;
-  const a = stops[i];
-  const b = stops[i + 1];
-  out.setRGB(a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f);
+function heat(v: number) {
+  v = Math.max(0, Math.min(1, v));
+  const r = Math.round(14 + 120 * v * v);
+  const g = Math.round(46 + 190 * v);
+  const b = Math.round(110 + 145 * v);
+  return `rgb(${r},${g},${b})`;
 }
 
-function drawLabelCanvas(c: HTMLCanvasElement, text: string, subText: string, color: string) {
-  c.width = 512;
-  c.height = 112;
-  const g = c.getContext("2d");
-  if (!g) return;
-  g.clearRect(0, 0, c.width, c.height);
-  g.fillStyle = "rgba(4, 11, 24, 0.82)";
-  g.strokeStyle = color;
-  g.lineWidth = 3;
-  g.beginPath();
-  g.roundRect(8, 8, 496, 96, 16);
-  g.fill();
-  g.stroke();
-  g.font = "bold 28px sans-serif";
-  g.textAlign = "center";
-  g.textBaseline = "middle";
-  g.fillStyle = color;
-  g.fillText(text.slice(0, 26), 256, subText ? 38 : 56);
-  if (subText) {
-    g.font = "22px monospace";
-    g.fillStyle = "#e2e8f0";
-    g.fillText(subText.slice(0, 36), 256, 76);
-  }
-}
-
-function label(text: string, color: string, scale = 1.6): THREE.Sprite {
-  const c = document.createElement("canvas");
-  drawLabelCanvas(c, text, "", color);
-  const t = new THREE.CanvasTexture(c);
-  const m = new THREE.SpriteMaterial({ map: t, transparent: true, depthWrite: false });
-  const s = new THREE.Sprite(m);
-  s.scale.set(4.2 * scale, 0.95 * scale, 1);
-  return s;
-}
-
-function ellipsePoints(L: number, d: number, out: Float32Array, y: number) {
-  const a = Math.max(d / 2 + 0.05, L / 2);
-  const c = d / 2;
-  const b = Math.sqrt(Math.max(0.0001, a * a - c * c));
-  for (let i = 0; i < NPT; i++) {
-    const th = (i / NPT) * Math.PI * 2;
-    out[i * 3] = a * Math.cos(th);
-    out[i * 3 + 1] = y;
-    out[i * 3 + 2] = b * Math.sin(th);
-  }
-}
-
-function kindColorHex(kind: ObjectKind): { num: number; css: string } {
-  switch (kind) {
-    case "human_moving":
-      return { num: 0xff6b2b, css: "#ff854d" };
-    case "human_breathing":
-      return { num: 0x10b981, css: "#34d399" };
-    case "static_object":
-      return { num: 0xfbbf24, css: "#fcd34d" };
-    case "wifi_device":
-      return { num: 0xe879f9, css: "#f0abfc" };
-    case "router":
-    default:
-      return { num: 0x22d3ee, css: "#67e8f9" };
-  }
-}
-
-export function objWorldPos(obj: DetectedObject, baselineM: number): [number, number, number] {
-  if (obj.kind === "router") {
-    return [baselineM / 2, 0, 0];
-  }
-  const rad = ((obj.angleDeg || 0) * Math.PI) / 180;
-  const r = Math.max(0.6, Math.min(24, obj.rangeM || 2.0));
-  const x = r * Math.sin(rad);
-  const z = r * Math.cos(rad);
-  return [x, 0, z];
-}
-
-const Radar3D = forwardRef<Radar3DHandle, Props>(function Radar3D({ stateRef, rowsRef, baselineM, opts, selectedObjId, onStatus }, ref) {
-  const host = useRef<HTMLDivElement>(null);
-  const optsRef = useRef(opts);
-  optsRef.current = opts;
-  const baseRef = useRef(baselineM);
-  baseRef.current = baselineM;
-  const selRef = useRef(selectedObjId);
-  selRef.current = selectedObjId;
-  const api = useRef<{ setBaseline: (d: number) => void; reset: () => void; focus: (obj: DetectedObject) => void } | null>(null);
-  const statusRef = useRef(onStatus);
-  statusRef.current = onStatus;
-
-  useImperativeHandle(ref, () => ({
-    resetView: () => api.current?.reset(),
-    focusObject: (obj: DetectedObject) => api.current?.focus(obj),
-  }));
-  useEffect(() => {
-    api.current?.setBaseline(baselineM);
-  }, [baselineM]);
+export default function Radar3D({ snap, hist, baseline, opts, resetKey, onFps }: Props) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const P = useRef({ snap, hist, baseline, opts, onFps });
+  P.current = { snap, hist, baseline, opts, onFps };
+  const camRef = useRef({ ...CAM0 });
 
   useEffect(() => {
-    const el = host.current;
-    if (!el) return;
-    let renderer: THREE.WebGLRenderer;
-    try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-    } catch (e) {
-      statusRef.current({ gl: false, renderer: "", error: e instanceof Error ? e.message : String(e), fps: 0, pixelRatio: 0 });
-      return;
-    }
-    let pr = Math.min(window.devicePixelRatio || 1, 1.5);
-    renderer.setPixelRatio(pr);
-    renderer.setClearColor(0x040a14, 1);
-    el.appendChild(renderer.domElement);
-    renderer.domElement.style.display = "block";
-    let rname = "WebGL";
-    try {
-      const gl = renderer.getContext();
-      const ext = gl.getExtension("WEBGL_debug_renderer_info");
-      rname = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : "WebGL";
-    } catch {
-      /* ignore */
-    }
+    Object.assign(camRef.current, CAM0);
+  }, [resetKey]);
 
-    const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0x040a14, 42, 100);
-    const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 300);
-    const home = { pos: new THREE.Vector3(0, 16, 26), tgt: new THREE.Vector3(0, 0, -4) };
-    camera.position.copy(home.pos);
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.copy(home.tgt);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.07;
-    controls.maxPolarAngle = Math.PI * 0.49;
-    controls.minDistance = 3;
-    controls.maxDistance = 95;
-    controls.autoRotateSpeed = 0.6;
-    controls.update();
-
-    scene.add(new THREE.AmbientLight(0x6a8cb0, 1.2));
-    const sun = new THREE.DirectionalLight(0xbfe3ff, 1.7);
-    sun.position.set(-10, 25, 12);
-    scene.add(sun);
-
-    const grid = new THREE.GridHelper(80, 80, 0x0f5578, 0x0a2a40);
-    (grid.material as THREE.Material).transparent = true;
-    (grid.material as THREE.Material).opacity = 0.6;
-    scene.add(grid);
-
-    const staticGroup = new THREE.Group();
-    scene.add(staticGroup);
-    const nodeGroup = new THREE.Group();
-    scene.add(nodeGroup);
-
-    const buildStatic = (d: number) => {
-      staticGroup.traverse((o) => {
-        const m = o as THREE.Line;
-        m.geometry?.dispose?.();
-      });
-      staticGroup.clear();
-      nodeGroup.clear();
-      for (let L = 6; L <= 30; L += 6) {
-        if (L <= d + 0.2) continue;
-        const arr = new Float32Array(NPT * 3);
-        ellipsePoints(L, d, arr, 0.02);
-        const g = new THREE.BufferGeometry();
-        g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
-        const ln = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: 0x1b86b8, transparent: true, opacity: 0.35 }));
-        staticGroup.add(ln);
-        const lb = label(`L=${L}m`, "#6fd6ff", 0.95);
-        lb.position.set(0, 0.3, Math.sqrt(Math.max(0.01, (L / 2) ** 2 - (d / 2) ** 2)));
-        staticGroup.add(lb);
-      }
-      const mk = (x: number, col: number, name: string) => {
-        const grp = new THREE.Group();
-        const s = new THREE.Mesh(new THREE.SphereGeometry(0.45, 24, 16), new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.85 }));
-        s.position.y = 0.5;
-        const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 5.5, 8), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.35 }));
-        beam.position.y = 2.8;
-        const lb = label(name, "#" + col.toString(16).padStart(6, "0"), 1.15);
-        lb.position.y = 6.1;
-        grp.add(s, beam, lb);
-        grp.position.x = x;
-        return grp;
-      };
-      nodeGroup.add(mk(-d / 2, 0x38e8ff, "ESP32-S3 雷达主节点"), mk(d / 2, 0xff4fd8, "路由器基站 / 协同锚点"));
-      const bl = new THREE.Line(
-        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-d / 2, 0.5, 0), new THREE.Vector3(d / 2, 0.5, 0)]),
-        new THREE.LineBasicMaterial({ color: 0x9be7ff, transparent: true, opacity: 0.75 }),
-      );
-      nodeGroup.add(bl);
-      const dl = label(`参考基线 ${d.toFixed(1)}m`, "#cfefff", 0.9);
-      dl.position.set(0, 1.35, 0.8);
-      nodeGroup.add(dl);
-    };
-    buildStatic(baseRef.current);
-
-    // 雷达扫描波纹环
-    const sweepGeo = new THREE.RingGeometry(0.3, 0.55, 64);
-    sweepGeo.rotateX(-Math.PI / 2);
-    const sweepMat = new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false });
-    const sweepRing = new THREE.Mesh(sweepGeo, sweepMat);
-    sweepRing.position.set(-baseRef.current / 2, 0.04, 0);
-    scene.add(sweepRing);
-
-    // 动态路径长度椭圆
-    const els: { line: THREE.LineLoop; arr: Float32Array; L: number; tL: number; op: number; tOp: number }[] = [];
-    for (let i = 0; i < NEL; i++) {
-      const arr = new Float32Array(NPT * 3);
-      ellipsePoints(10, baseRef.current, arr, 0.06);
-      const g = new THREE.BufferGeometry();
-      g.setAttribute("position", new THREE.BufferAttribute(arr, 3));
-      const line = new THREE.LineLoop(g, new THREE.LineBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0, depthWrite: false }));
-      line.frustumCulled = false;
-      scene.add(line);
-      els.push({ line, arr, L: 10, tL: 10, op: 0, tOp: 0 });
-    }
-
-    // 活动粒子椭圆
-    const actArr = new Float32Array(NPT * 3);
-    ellipsePoints(10, baseRef.current, actArr, 0.1);
-    const actGeo = new THREE.BufferGeometry();
-    actGeo.setAttribute("position", new THREE.BufferAttribute(actArr, 3));
-    const actMat = new THREE.PointsMaterial({ color: 0x3dff9a, size: 4, sizeAttenuation: false, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending });
-    const act = new THREE.Points(actGeo, actMat);
-    act.frustumCulled = false;
-    scene.add(act);
-    const actState = { L: 10, tL: 10, op: 0, tOp: 0, motion: 0 };
-    const actLabel = label("活动", "#7dffb8", 1.0);
-    actLabel.visible = false;
-    scene.add(actLabel);
-
-    // ★ 3D 全息检测物体池（将检测到的任何物体实时渲染在 3D 空间）
-    type ObjSlot = {
-      group: THREE.Group;
-      core: THREE.Mesh;
-      wire: THREE.LineSegments;
-      ring: THREE.Mesh;
-      sprite: THREE.Sprite;
-      canvas: HTMLCanvasElement;
-      tex: THREE.CanvasTexture;
-      lastKey: string;
-      tx: number;
-      tz: number;
-      ty: number;
-      op: number;
-      tOp: number;
-      scale: number;
-      kind: ObjectKind;
-    };
-    const objPool: ObjSlot[] = [];
-    const objGroup = new THREE.Group();
-    scene.add(objGroup);
-
-    const boxGeo = new THREE.BoxGeometry(1.1, 1.8, 1.1);
-    const edgesGeo = new THREE.EdgesGeometry(boxGeo);
-    const ringObjGeo = new THREE.RingGeometry(0.65, 0.85, 32);
-    ringObjGeo.rotateX(-Math.PI / 2);
-
-    for (let i = 0; i < MAX_OBJ3D; i++) {
-      const grp = new THREE.Group();
-      grp.visible = false;
-      const coreMat = new THREE.MeshStandardMaterial({
-        color: 0x38bdf8,
-        emissive: 0x38bdf8,
-        emissiveIntensity: 0.55,
-        transparent: true,
-        opacity: 0.45,
-        roughness: 0.3,
-      });
-      const core = new THREE.Mesh(boxGeo, coreMat);
-      core.position.y = 0.95;
-
-      const wireMat = new THREE.LineBasicMaterial({ color: 0x7dd3fc, transparent: true, opacity: 0.9 });
-      const wire = new THREE.LineSegments(edgesGeo, wireMat);
-      wire.position.y = 0.95;
-
-      const rMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthWrite: false });
-      const ring = new THREE.Mesh(ringObjGeo, rMat);
-      ring.position.y = 0.05;
-
-      const cv = document.createElement("canvas");
-      drawLabelCanvas(cv, "目标", "", "#38bdf8");
-      const tex = new THREE.CanvasTexture(cv);
-      const spMat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
-      const sp = new THREE.Sprite(spMat);
-      sp.position.y = 2.6;
-      sp.scale.set(4.8, 1.08, 1);
-
-      grp.add(core, wire, ring, sp);
-      objGroup.add(grp);
-      objPool.push({
-        group: grp,
-        core,
-        wire,
-        ring,
-        sprite: sp,
-        canvas: cv,
-        tex,
-        lastKey: "",
-        tx: 0,
-        tz: 3,
-        ty: 0,
-        op: 0,
-        tOp: 0,
-        scale: 1,
-        kind: "static_object",
-      });
-    }
-
-    // 距离-时间地形
-    const geo = new THREE.PlaneGeometry(TW, TD, COLS - 1, ROWS - 1);
-    geo.rotateX(-Math.PI / 2);
-    const pos = geo.attributes.position as THREE.BufferAttribute;
-    const colA = new THREE.BufferAttribute(new Float32Array(pos.count * 3), 3);
-    geo.setAttribute("color", colA);
-    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 0.65, metalness: 0.05, transparent: true, opacity: 0.94 });
-    const terrain = new THREE.Mesh(geo, mat);
-    const wire = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x66d8ff, wireframe: true, transparent: true, opacity: 0.07, depthWrite: false }));
-    const tGroup = new THREE.Group();
-    tGroup.add(terrain, wire);
-    tGroup.position.set(0, 0, TZ);
-    scene.add(tGroup);
-    for (const L of [0, 10, 20, 30]) {
-      const lb = label(`L=${L}m`, "#9fd8ff", 0.95);
-      lb.position.set(L - TW / 2, 0.5, TZ + TD / 2 + 1.4);
-      scene.add(lb);
-    }
-    const tl = label("路径长度 L = 多径反射总路径  →   时间 ↑（远处更早）", "#7fb4d6", 1.9);
-    tl.position.set(0, 0.2, TZ + TD / 2 + 3.4);
-    scene.add(tl);
-    const tgt = new Float32Array(ROWS * COLS);
-    const disp = new Float32Array(ROWS * COLS);
-    let scroll = 0;
-    const dz = TD / (ROWS - 1);
-    const tmpC = new THREE.Color();
+  useEffect(() => {
+    const cv = ref.current!;
+    const cx = cv.getContext("2d")!;
+    const cam = camRef.current;
+    let W = 1,
+      H = 1,
+      DPR = 1,
+      raf = 0,
+      last = 0,
+      fpsT = performance.now(),
+      fpsC = 0;
+    let B = { px: 0, py: 0, pz: 0, fx: 0, fy: 0, fz: 0, rx: 0, ry: 0, rz: 0, ux: 0, uy: 0, uz: 0 };
 
     const resize = () => {
-      const w = el.clientWidth || 800;
-      const h = el.clientHeight || 600;
-      renderer.setSize(w, h, false);
-      renderer.domElement.style.width = w + "px";
-      renderer.domElement.style.height = h + "px";
-      camera.aspect = w / Math.max(1, h);
-      camera.updateProjectionMatrix();
+      DPR = Math.min(window.devicePixelRatio || 1, 2);
+      const r = cv.getBoundingClientRect();
+      W = Math.max(1, r.width);
+      H = Math.max(1, r.height);
+      cv.width = W * DPR;
+      cv.height = H * DPR;
+      cx.setTransform(DPR, 0, 0, DPR, 0, 0);
     };
-    resize();
     const ro = new ResizeObserver(resize);
-    ro.observe(el);
+    ro.observe(cv);
+    resize();
 
-    api.current = {
-      setBaseline: (d) => {
-        buildStatic(d);
-        sweepRing.position.x = -d / 2;
-      },
-      reset: () => {
-        camera.position.copy(home.pos);
-        controls.target.copy(home.tgt);
-        controls.update();
-      },
-      focus: (obj: DetectedObject) => {
-        const [ox, , oz] = objWorldPos(obj, baseRef.current);
-        controls.target.set(ox, 0.8, oz);
-        camera.position.set(ox + 4, 8, oz + 9);
-        controls.update();
-      },
+    const basis = () => {
+      const cp = Math.cos(cam.pitch),
+        sp = Math.sin(cam.pitch);
+      const px = cam.tx + cam.dist * cp * Math.cos(cam.yaw);
+      const py = cam.ty + cam.dist * cp * Math.sin(cam.yaw);
+      const pz = cam.tz + cam.dist * sp;
+      let fx = cam.tx - px,
+        fy = cam.ty - py,
+        fz = cam.tz - pz;
+      const fl = Math.hypot(fx, fy, fz);
+      fx /= fl;
+      fy /= fl;
+      fz /= fl;
+      // right = f × up(0,0,1)
+      let rx = fy,
+        ry = -fx;
+      const rl = Math.hypot(rx, ry) || 1;
+      rx /= rl;
+      ry /= rl;
+      const rz = 0;
+      // up' = r × f
+      const ux = ry * fz - rz * fy,
+        uy = rz * fx - rx * fz,
+        uz = rx * fy - ry * fx;
+      B = { px, py, pz, fx, fy, fz, rx, ry, rz, ux, uy, uz };
+    };
+    const proj = (x: number, y: number, z: number): [number, number, number] | null => {
+      const dx = x - B.px,
+        dy = y - B.py,
+        dz = z - B.pz;
+      const Z = dx * B.fx + dy * B.fy + dz * B.fz;
+      if (Z < 0.5) return null;
+      const f = Math.min(W, H * 1.6) * 0.95;
+      return [W / 2 + (f * (dx * B.rx + dy * B.ry + dz * B.rz)) / Z, H / 2 - (f * (dx * B.ux + dy * B.uy + dz * B.uz)) / Z, Z];
+    };
+    const line = (a: V3, b: V3, col: string, w = 1) => {
+      const p = proj(...a),
+        q = proj(...b);
+      if (!p || !q) return;
+      cx.strokeStyle = col;
+      cx.lineWidth = w;
+      cx.beginPath();
+      cx.moveTo(p[0], p[1]);
+      cx.lineTo(q[0], q[1]);
+      cx.stroke();
+    };
+    const label = (x: number, y: number, z: number, t: string, col: string, big = false) => {
+      const p = proj(x, y, z);
+      if (!p) return;
+      cx.font = `${big ? "bold 15px" : "12px"} ui-sans-serif, system-ui, sans-serif`;
+      const w = cx.measureText(t).width + 12;
+      cx.fillStyle = "rgba(6,10,20,.78)";
+      cx.fillRect(p[0] - w / 2, p[1] - 11, w, 22);
+      cx.fillStyle = col;
+      cx.textAlign = "center";
+      cx.textBaseline = "middle";
+      cx.fillText(t, p[0], p[1]);
+    };
+    const dot = (x: number, y: number, z: number, r: number, col: string, glow = 2.4) => {
+      const p = proj(x, y, z);
+      if (!p) return;
+      const rr = Math.max(3.5, (r * 520) / p[2]);
+      const g = cx.createRadialGradient(p[0], p[1], 0, p[0], p[1], rr * glow);
+      g.addColorStop(0, col);
+      g.addColorStop(0.35, col);
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      cx.fillStyle = g;
+      cx.beginPath();
+      cx.arc(p[0], p[1], rr * glow, 0, 7);
+      cx.fill();
+      cx.fillStyle = "#fff";
+      cx.globalAlpha = 0.85;
+      cx.beginPath();
+      cx.arc(p[0], p[1], Math.max(1.5, rr * 0.28), 0, 7);
+      cx.fill();
+      cx.globalAlpha = 1;
+    };
+    const ellipsePts = (b: number, L: number, n = 90): V3[] => {
+      const a = (b + L) / 2,
+        c = b / 2,
+        bb = Math.sqrt(Math.max(a * a - c * c, 0.01));
+      const out: V3[] = [];
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n) * Math.PI * 2;
+        out.push([a * Math.cos(t), bb * Math.sin(t), 0.02]);
+      }
+      return out;
+    };
+    const poly = (pts: V3[], col: string, w: number) => {
+      let prev: ReturnType<typeof proj> = null;
+      cx.strokeStyle = col;
+      cx.lineWidth = w;
+      for (const p3 of pts) {
+        const p = proj(...p3);
+        if (p && prev) {
+          cx.beginPath();
+          cx.moveTo(prev[0], prev[1]);
+          cx.lineTo(p[0], p[1]);
+          cx.stroke();
+        }
+        prev = p;
+      }
     };
 
-    let raf = 0;
-    let frames = 0;
-    let fps = 60;
-    let lastFpsT = performance.now();
-    let prevT = performance.now();
-    let lowStreak = 0;
-    statusRef.current({ gl: true, renderer: rname, error: "", fps: 60, pixelRatio: pr });
+    const render = (ts: number) => {
+      raf = requestAnimationFrame(render);
+      if (ts - last < 28) return;
+      last = ts;
+      const { snap, hist, baseline: b, opts } = P.current;
+      if (opts.rotate) cam.yaw += 0.004;
+      basis();
+      // 背景
+      const bg = cx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, "#050914");
+      bg.addColorStop(1, "#02040a");
+      cx.fillStyle = bg;
+      cx.fillRect(0, 0, W, H);
+      cx.globalAlpha = 1;
 
-    const tick = (now: number) => {
-      raf = requestAnimationFrame(tick);
-      const dt = Math.min(0.1, (now - prevT) / 1000);
-      prevT = now;
-      frames++;
-      if (now - lastFpsT >= 600) {
-        fps = (frames * 1000) / (now - lastFpsT);
-        frames = 0;
-        lastFpsT = now;
-        if (fps < 28 && pr > 1) {
-          lowStreak++;
-          if (lowStreak >= 2) {
-            pr = Math.max(0.85, +(pr - 0.25).toFixed(2));
-            renderer.setPixelRatio(pr);
-            resize();
-            lowStreak = 0;
+      // 地面网格
+      for (let g = -60; g <= 60; g += 4) {
+        line([g, -30, -0.01], [g, 70, -0.01], "rgba(34,120,170,.16)");
+        line([-60, g + 10, -0.01], [60, g + 10, -0.01], "rgba(34,120,170,.16)");
+      }
+
+      // 路径椭圆
+      const prof = snap?.profile;
+      if (opts.ellipses) {
+        for (const L of [3, 6, 12, 20, 30]) {
+          poly(ellipsePts(b, L), "rgba(56,189,248,.28)", 1);
+          const a = (b + L) / 2;
+          label(a, 0, 0.1, `L=${L}m`, "#7dd3fc");
+        }
+        if (opts.music && prof?.music) {
+          const m: number[] = prof.music;
+          const pk: number[] = [];
+          for (let i = 1; i < m.length - 1; i++) if (m[i] > m[i - 1] && m[i] >= m[i + 1] && m[i] > 0.25) pk.push(i);
+          pk.sort((x, y) => m[y] - m[x]);
+          pk.slice(0, 4).forEach((i) => poly(ellipsePts(b, (i / m.length) * (prof.axis_max || 30) + 0.01), "rgba(244,114,182,.7)", 1.6));
+        }
+      }
+
+      // 距离-时间地形
+      if (opts.terrain && hist.length > 1) {
+        const R = hist.length,
+          C = 64,
+          dx = TW / 47,
+          dy = 30 / (C - 1);
+        const quads: { d: number; pts: [number, number][]; v: number }[] = [];
+        const get = (r: number, c: number) => {
+          const row = hist[r];
+          const k = Math.min(row.length - 1, Math.floor((c / C) * row.length));
+          return row[k] || 0;
+        };
+        for (let r = 0; r < R - 1; r++)
+          for (let c = 0; c < C - 1; c++) {
+            const v00 = get(r, c),
+              v10 = get(r + 1, c),
+              v11 = get(r + 1, c + 1),
+              v01 = get(r, c + 1);
+            const X0 = TX0 + (r + 47 - R + 1) * dx,
+              X1 = X0 + dx,
+              Y0 = c * dy,
+              Y1 = Y0 + dy;
+            const p = [proj(X0, Y0, v00 * 3.2), proj(X1, Y0, v10 * 3.2), proj(X1, Y1, v11 * 3.2), proj(X0, Y1, v01 * 3.2)];
+            if (p.some((q) => !q)) continue;
+            quads.push({ d: p[0]![2], pts: p.map((q) => [q![0], q![1]] as [number, number]), v: (v00 + v10 + v11 + v01) / 4 });
           }
-        } else lowStreak = 0;
-        statusRef.current({ gl: true, renderer: rname, error: "", fps, pixelRatio: pr });
+        quads.sort((a, b2) => b2.d - a.d);
+        for (const q of quads) {
+          cx.fillStyle = heat(q.v);
+          cx.strokeStyle = "rgba(120,200,255,.10)";
+          cx.beginPath();
+          cx.moveTo(q.pts[0][0], q.pts[0][1]);
+          for (let i = 1; i < 4; i++) cx.lineTo(q.pts[i][0], q.pts[i][1]);
+          cx.closePath();
+          cx.fill();
+          cx.stroke();
+        }
+      }
+      if (opts.terrain) {
+        // 地形边框与距离刻度
+        const x0 = TX0,
+          x1 = TX0 + TW;
+        poly([[x0, 0, 0], [x1, 0, 0], [x1, 30, 0], [x0, 30, 0], [x0, 0, 0]], "rgba(125,211,252,.5)", 1.2);
+        for (const L of [0, 10, 20, 30]) label(x0 - 2.5, L, 0, `L=${L}m`, "#9fb4d0");
+        label(x0 - 5, 15, 0, "路径长度 L →", "#7dd3fc", true);
+        label((x0 + x1) / 2, -2.5, 0, "时间 →（最新在右）", "#64748b");
       }
 
-      const o = optsRef.current;
-      controls.autoRotate = o.autoRotate;
-      tGroup.visible = o.terrain;
-      staticGroup.visible = o.ellipses;
-      objGroup.visible = o.objects3d !== false;
+      // 节点：路由器 + ESP32
+      const R: V3 = [-b / 2, 0, 0.3],
+        E: V3 = [b / 2, 0, 0.3];
+      line(R, E, "rgba(251,191,36,.7)", 2);
+      label((R[0] + E[0]) / 2, 0, 1.1, `基线 ${b.toFixed(1)}m`, "#fbbf24");
+      dot(...R, 0.7, "#fbbf24");
+      dot(...E, 0.7, "#22d3ee");
+      label(R[0], 0, 2.6, "路由器/热点", "#fbbf24", true);
+      label(E[0], 0, 4.6, "ESP32-S3 (N16R8)", "#22d3ee", true);
 
-      // 雷达扫描扩散波纹动画
-      const pulse = ((now * 0.00065) % 1);
-      const sRad = 0.5 + pulse * 22;
-      sweepRing.scale.set(sRad, 1, sRad);
-      sweepMat.opacity = (1 - pulse) * 0.42;
-
-      const q = rowsRef.current;
-      while (q.length) {
-        const r = q.shift()!;
-        tgt.copyWithin(COLS, 0, (ROWS - 1) * COLS);
-        disp.copyWithin(COLS, 0, (ROWS - 1) * COLS);
-        const p = r.p;
-        for (let c = 0; c < COLS; c++) {
-          const v = (p[Math.min(p.length - 1, Math.floor((c * p.length) / COLS))] || 0) / 255;
-          tgt[c] = v;
-          disp[c] = v * 0.65;
+      // 物体
+      const objs: Obj[] = snap?.objects || [];
+      const tt = ts / 1000;
+      for (const o of objs) {
+        if (o.kind === "router") continue;
+        const col = KIND_COL[o.kind] || "#fff";
+        let pos: V3 | null = null;
+        if (o.kind === "device" && o.range_m != null) {
+          const r = Math.max(1.2, o.range_m);
+          pos = [E[0] + r * Math.cos(o.ang), E[1] + r * Math.sin(o.ang), 0.6];
+          line(E, pos, "rgba(167,139,250,.35)", 1);
+        } else if (o.kind === "reflector" && o.range_m != null) {
+          const a = (b + o.range_m) / 2,
+            c = b / 2,
+            bb = Math.sqrt(Math.max(a * a - c * c, 0.01));
+          pos = [a * Math.cos(o.ang), bb * Math.sin(o.ang), 0.6];
+          line(R, pos, "rgba(52,211,153,.3)", 1);
+          line(pos, E, "rgba(52,211,153,.3)", 1);
         }
-        scroll = dz;
-      }
-      scroll *= Math.exp(-dt * 9);
-      terrain.position.z = scroll;
-      wire.position.z = scroll;
-
-      if (o.terrain) {
-        const k = 1 - Math.exp(-dt * 12);
-        const carr = colA.array as Float32Array;
-        const parr = pos.array as Float32Array;
-        for (let i = 0; i < ROWS * COLS; i++) {
-          const v = disp[i] + (tgt[i] - disp[i]) * k;
-          disp[i] = v;
-          parr[i * 3 + 1] = v * HMAX;
-          colormap(v, tmpC);
-          carr[i * 3] = tmpC.r;
-          carr[i * 3 + 1] = tmpC.g;
-          carr[i * 3 + 2] = tmpC.b;
-        }
-        pos.needsUpdate = true;
-        colA.needsUpdate = true;
-      }
-
-      const st = stateRef.current;
-      const d = baseRef.current;
-      const L = st?.last;
-      const pks = L ? (o.music && L.musicPeaks?.length ? L.musicPeaks : L.peaks) || [] : [];
-      for (let i = 0; i < NEL; i++) {
-        const e = els[i];
-        const pk = o.ellipses ? pks[i] : undefined;
-        if (pk && pk.r > d + 0.15) {
-          e.tL = pk.r;
-          e.tOp = Math.min(0.9, Math.max(0.2, (pk.db + 35) / 35));
-        } else {
-          e.tOp = 0;
-        }
-        e.L += (e.tL - e.L) * Math.min(1, dt * 8);
-        e.op += (e.tOp - e.op) * Math.min(1, dt * 8);
-        e.line.visible = e.op > 0.02;
-        if (e.line.visible) {
-          ellipsePoints(e.L, d, e.arr, 0.06 + i * 0.01);
-          (e.line.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-          const m = e.line.material as THREE.LineBasicMaterial;
-          m.opacity = e.op;
-          m.color.setHex(o.music && L?.musicPeaks?.length ? 0xff4fd8 : 0xffb347);
+        if (pos) {
+          dot(...pos, 0.55 + 0.4 * o.conf, col);
+          label(pos[0], pos[1], pos[2] + 2.4, o.label, col);
+        } else if (o.kind === "moving" || o.kind === "breathing") {
+          // 位置未知（单链路无角度）：以「感知区」脉冲表示“检测到了存在”，不伪造坐标
+          for (let k = 0; k < 3; k++) {
+            const ph = (tt * (o.kind === "moving" ? 0.9 : 0.3) + k / 3) % 1;
+            poly(ellipsePts(b, 1 + ph * 14, 60).map((p) => [p[0], p[1], 0.05] as V3), `rgba(${o.kind === "moving" ? "255,77,109" : "255,159,67"},${(1 - ph) * 0.8})`, 2);
+          }
+          label(0, 12, 3, `${o.label}（位置未知·仅检测到存在）`, col, true);
         }
       }
 
-      const s = L?.sense;
-      if (o.ellipses && s && s.present && s.activeR && s.activeR > d + 0.15) {
-        actState.tL = s.activeR;
-        actState.tOp = 0.95;
-        actState.motion = s.motion;
+      // 坐标轴指示
+      line([0, 0, 0], [6, 0, 0], "rgba(255,255,255,.2)");
+
+      fpsC++;
+      if (ts - fpsT > 1000) {
+        P.current.onFps?.(Math.round((fpsC * 1000) / (ts - fpsT)));
+        fpsC = 0;
+        fpsT = ts;
+      }
+    };
+    raf = requestAnimationFrame(render);
+
+    // 交互：左键旋转 / 右键或 Shift 平移 / 滚轮缩放 / 双指缩放
+    const ptrs = new Map<number, { x: number; y: number }>();
+    let pinch = 0;
+    const down = (e: PointerEvent) => {
+      cv.setPointerCapture(e.pointerId);
+      ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (ptrs.size === 2) {
+        const [a, b] = [...ptrs.values()];
+        pinch = Math.hypot(a.x - b.x, a.y - b.y);
+      }
+    };
+    const move = (e: PointerEvent) => {
+      const p = ptrs.get(e.pointerId);
+      if (!p) return;
+      const dx = e.clientX - p.x,
+        dy = e.clientY - p.y;
+      p.x = e.clientX;
+      p.y = e.clientY;
+      if (ptrs.size === 2) {
+        const [a, b] = [...ptrs.values()];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (pinch) cam.dist = Math.min(140, Math.max(8, (cam.dist * pinch) / d));
+        pinch = d;
+        return;
+      }
+      if (e.buttons & 2 || e.shiftKey) {
+        const s = cam.dist * 0.0016;
+        cam.tx -= (dx * B.rx - dy * B.ux) * s;
+        cam.ty -= (dx * B.ry - dy * B.uy) * s;
+        cam.tz -= -dy * B.uz * s * 0 + 0;
       } else {
-        actState.tOp = 0;
+        cam.yaw -= dx * 0.006;
+        cam.pitch = Math.min(1.5, Math.max(0.08, cam.pitch + dy * 0.005));
       }
-      actState.L += (actState.tL - actState.L) * Math.min(1, dt * 7);
-      actState.op += (actState.tOp - actState.op) * Math.min(1, dt * 6);
-      act.visible = actState.op > 0.03;
-      actLabel.visible = act.visible;
-      if (act.visible) {
-        const breath = s?.breathBpm ? 0.12 * Math.sin((now / 1000) * ((s.breathBpm / 60) * Math.PI * 2)) : 0;
-        ellipsePoints(actState.L + breath, d, actArr, 0.14);
-        (actGeo.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-        actMat.opacity = actState.op * (0.65 + 0.35 * Math.sin(now * 0.008));
-        actMat.color.setHex(s?.level === "moving" ? 0xff7b3d : 0x3dff9a);
-        const b = Math.sqrt(Math.max(0.01, (actState.L / 2) ** 2 - (d / 2) ** 2));
-        actLabel.position.set(0, 1.1, b);
-      }
-
-      // ★ 渲染所有检测到的 3D 空间物体
-      const rawObjs = L?.objects ?? [];
-      const visObjs = rawObjs.filter((x) => x.kind !== "router").slice(0, MAX_OBJ3D);
-      for (let i = 0; i < MAX_OBJ3D; i++) {
-        const slot = objPool[i];
-        const item = visObjs[i];
-        if (item && o.objects3d !== false) {
-          const [wx, , wz] = objWorldPos(item, d);
-          slot.tx = wx;
-          slot.tz = wz;
-          slot.tOp = Math.max(0.35, Math.min(1.0, item.confidence));
-          slot.kind = item.kind;
-          const sc = item.rcs === "large" ? 1.25 : item.rcs === "small" ? 0.75 : 1.0;
-          slot.scale = sc;
-          const isSel = selRef.current === item.id;
-          const sub = `R=${item.rangeM}m · L=${item.pathLenM}m · ${item.db}dB · 置信${Math.round(item.confidence * 100)}%`;
-          const key = `${item.id}|${item.label}|${sub}|${isSel ? "1" : "0"}`;
-          if (slot.lastKey !== key) {
-            slot.lastKey = key;
-            const kc = kindColorHex(item.kind);
-            drawLabelCanvas(slot.canvas, (isSel ? "🎯 " : "") + item.label, sub, isSel ? "#ffffff" : kc.css);
-            slot.tex.needsUpdate = true;
-            (slot.core.material as THREE.MeshStandardMaterial).color.setHex(kc.num);
-            (slot.core.material as THREE.MeshStandardMaterial).emissive.setHex(kc.num);
-            (slot.wire.material as THREE.LineBasicMaterial).color.setHex(isSel ? 0xffffff : kc.num);
-            (slot.ring.material as THREE.MeshBasicMaterial).color.setHex(kc.num);
-          }
-        } else {
-          slot.tOp = 0;
-        }
-
-        slot.op += (slot.tOp - slot.op) * Math.min(1, dt * 8);
-        slot.group.visible = slot.op > 0.03;
-        if (slot.group.visible) {
-          slot.group.position.x += (slot.tx - slot.group.position.x) * Math.min(1, dt * 7);
-          slot.group.position.z += (slot.tz - slot.group.position.z) * Math.min(1, dt * 7);
-          const bob = slot.kind === "human_moving" ? 0.12 * Math.abs(Math.sin(now * 0.008)) : slot.kind === "human_breathing" ? 0.05 * Math.sin(now * 0.003) : 0;
-          slot.core.scale.set(slot.scale, slot.scale + bob, slot.scale);
-          slot.wire.scale.set(slot.scale * 1.05, slot.scale * 1.05 + bob, slot.scale * 1.05);
-          const rScale = slot.scale * (1 + 0.18 * Math.sin(now * 0.005 + i));
-          slot.ring.scale.set(rScale, 1, rScale);
-          (slot.core.material as THREE.MeshStandardMaterial).opacity = slot.op * 0.42;
-          (slot.wire.material as THREE.LineBasicMaterial).opacity = slot.op * 0.95;
-          (slot.ring.material as THREE.MeshBasicMaterial).opacity = slot.op * 0.7;
-          (slot.sprite.material as THREE.SpriteMaterial).opacity = slot.op;
-        }
-      }
-
-      controls.update();
-      renderer.render(scene, camera);
     };
-    raf = requestAnimationFrame(tick);
-
+    const up = (e: PointerEvent) => {
+      ptrs.delete(e.pointerId);
+      pinch = 0;
+    };
+    const wheel = (e: WheelEvent) => {
+      e.preventDefault();
+      cam.dist = Math.min(140, Math.max(8, cam.dist * (1 + Math.sign(e.deltaY) * 0.1)));
+    };
+    const ctx = (e: Event) => e.preventDefault();
+    cv.addEventListener("pointerdown", down);
+    cv.addEventListener("pointermove", move);
+    cv.addEventListener("pointerup", up);
+    cv.addEventListener("pointercancel", up);
+    cv.addEventListener("wheel", wheel, { passive: false });
+    cv.addEventListener("contextmenu", ctx);
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
-      controls.dispose();
-      renderer.dispose();
-      renderer.domElement.remove();
+      cv.removeEventListener("pointerdown", down);
+      cv.removeEventListener("pointermove", move);
+      cv.removeEventListener("pointerup", up);
+      cv.removeEventListener("pointercancel", up);
+      cv.removeEventListener("wheel", wheel);
+      cv.removeEventListener("contextmenu", ctx);
     };
-  }, [rowsRef, stateRef]);
+  }, []);
 
-  return <div ref={host} className="h-full w-full select-none" />;
-});
-
-export default Radar3D;
+  return <canvas ref={ref} className="absolute inset-0 h-full w-full touch-none cursor-grab active:cursor-grabbing" />;
+}
