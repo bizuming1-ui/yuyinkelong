@@ -1,74 +1,54 @@
-# ESP32-S3 双节点 CSI 雷达 · 检测日志  2026/11/4 11:14:26
-页面: https://goal-pee-backing-shift.trycloudflare.com/
-浏览器: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/159.0.0.0 Safari/537.36
+#pragma once
+// ============================================================================
+//  ESP32-S3 双节点 WiFi CSI 全信道拼接雷达 v10 —— 配置文件（Node A 与 Node B 内容相同，直接复制即可）
+//
+//  v10：只有 Node A（网关）联网上传；Node B（探头）不连 WiFi，只用 ESP-NOW 跟 A 配合，所以 B 用不到下面的 WiFi / 网址设置。
+//  只需要改下面 3 处（也可以在网页「复制代码界面」顶部的输入框里填好，复制出来的 config.h 会自动带上）：
+//    1) WIFI_SSID / WIFI_PASS   2.4GHz WiFi（路由器或手机热点；iPhone 热点要打开“最大兼容性”）。A 靠它把 CSI 数据传给 Kaggle。
+//    2) KAGGLE_URL(+URL2/3 备用)  Kaggle 运行后【输出框里打印的网址】，形如 https://xxxx.trycloudflare.com ，末尾不要加 /
+//    3) API_KEY                 必须和 Kaggle 脚本里的 API_KEY 一致（默认都是 radar-key）
+// ============================================================================
 
-## 浏览器侧检测
-✅ 3D 渲染 (WebGL): ANGLE (AMD, AMD Radeon(TM) 780M (0x00001900) Direct3D11 vs_5_0 ps_5_0, D3D11) · 120 fps · 像素比 1.50
-✅ Kaggle 网址: https://goal-pee-backing-shift.trycloudflare.com
-✅ 主机 /api/health: HTTP 200 · 530ms · 主机 v9.0 已运行 1006s
-❌ 实时轮询: 状态 error · 延迟 408ms · 成功 31 次 / 失败 3 次 · 最近错误：请求超时(15s) · 最近成功 30.2s 前
-✅ Node A: 在线 · 17.7s 前上传 · 3 次/0 条 · 固件 9.1.1 · RSSI -22 · 缓冲丢弃 0
-✅ Node B: 在线 · 14.4s 前上传 · 4 次/0 条 · 固件 9.1.1 · RSSI -47 · 缓冲丢弃 0
-⚠️ CSI 剖面: 节点在线但还没有 CSI 记录：两块板子没同步（看串口 [sync]）
-✅ GPU: cuda:0 Tesla T4 14.6GiB | cuda:1 Tesla T4 14.6GiB · CIR 8.53ms · MUSIC 0ms
+#define WIFI_SSID  "bzmdiphone"
+#define WIFI_PASS  "a12332100"
+#define KAGGLE_URL "https://absolute-classes-tall-worker.trycloudflare.com"
+// 备用网址（可选，留空 "" 即可）：Kaggle 输出框会同时打印 trycloudflare / lhr.life / pinggy 多个网址。
+// 国内网络常访问不了 trycloudflare.com，把 lhr.life 或 pinggy 的网址填到这里，固件上传失败时会自动换下一个。
+#define KAGGLE_URL2 ""
+#define KAGGLE_URL3 ""
+#define API_KEY    "radar-key"
+// 配对编号（0~255 的整数，默认 0xC5）：附近有多套雷达互相干扰时，每套改成不同的数；Node A 与 Node B 必须相同。
+#define PAIR_MAGIC 0xC5
 
-## 主机(Kaggle)侧检测
-✅ 主机服务: 运行 1075s · Python 3.12.13 · numpy 2.0.2 · 端口 8000 · Kaggle
-✅ 公网隧道: cloudflared:✓ https://goal-pee-backing-shift.trycloudflare.com | pinggy:✓ https://ibpwl-35-199-8-42.run.pinggy-free.link | localhost.run:✓ https://736f957839ecf8.lhr.life
-✅ GPU 加速: cuda:0 Tesla T4 14.6GiB, cuda:1 Tesla T4 14.6GiB · IFFT/autofocus→cuda:0 · MUSIC→cuda:1 · 利用率 [0, 0] % · 显存池预留 [5219, 5219] MB · autofocus 0.0ms 锐度增益×1.0（0 次）
-ℹ️ 主机资源: 内存 2.0/31.3 GB · 磁盘剩余 966.9/8156.9 GB · CPU 4 核
-✅ Node A: 在线 · 15s 前 · 固件 9.1.1 · IP 172.20.10.3 · 路由器信道 6 · RSSI -22 · 上传 3 次 / 0 条 · 缓冲丢弃 0 · 重启 2
-✅ Node B: 在线 · 12s 前 · 固件 9.1.1 · IP 172.20.10.4 · 路由器信道 6 · RSSI -47 · 上传 4 次 / 0 条 · 缓冲丢弃 0 · 重启 3
-❌ CSI 数据: 两个节点都还没有上传 CSI 记录。节点在线但记录为 0 → 两块板子没有同步（看串口 [sync]）；都没在线 → 先解决上传
-✅ 错误计数: {} · 最近错误：无
-✅ 原始数据落盘: 0.0 MB 已写入 /tmp/radar_raw（上限 40.0 GB）
+// 可选：自动发现网址。Kaggle 会把最新网址发布到 https://ntfy.sh/<RADAR_TOPIC>，
+// 当 KAGGLE_URL 没填（或连续上传失败）时，Node A 自动读取最新网址。设为 "" 关闭。
+#define RADAR_TOPIC "wradar-bzm-5f2k9q7d"
 
-## 主机事件(最近)
-10:55:58 [info] 服务启动 · numpy 2.0.2 · GPU 2 块 · NFFT=16384
-10:55:59 [warn] localhost.run: If you get a permission denied error check the faq for how to connect with a key or
-10:56:00 [info] localhost.run 给出网址 https://4385d429c1f7e5.lhr.life，正在自检…
-10:56:01 [info] pinggy 给出网址 https://ibpwl-35-199-8-42.run.pinggy-free.link，正在自检…
-10:56:02 [info] cloudflared 给出网址 https://goal-pee-backing-shift.trycloudflare.com，正在自检…
-10:56:15 [ok] cloudflared 公网自检通过 https://goal-pee-backing-shift.trycloudflare.com (351ms)
-10:56:15 [ok] pinggy 公网自检通过 https://ibpwl-35-199-8-42.run.pinggy-free.link (509ms)
-10:56:16 [ok] localhost.run 公网自检通过 https://4385d429c1f7e5.lhr.life (336ms)
-10:56:16 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
-11:00:16 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
-11:04:29 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
-11:08:43 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
-11:08:45 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -24
-11:09:30 [warn] Node B 超过 45 秒没有上传，判定离线
-11:09:30 [ok] Node A 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -10
-11:09:40 [warn] Node B 重启过（boot 48565→39520）
-11:09:40 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -23
-11:10:15 [warn] Node A 超过 45 秒没有上传，判定离线
-11:10:25 [warn] Node B 超过 45 秒没有上传，判定离线
-11:10:49 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link
-11:10:53 [info] 收到校准指令：清空参考与基线，请保持房间安静约 20 秒
-11:10:53 [info] 两节点间距设为 0.50 m，重新校准
-11:10:53 [info] 收到校准指令：清空参考与基线，请保持房间安静约 20 秒
-11:10:53 [info] 收到校准指令：清空参考与基线，请保持房间安静约 20 秒
-11:11:13 [warn] Node B 重启过（boot 39520→16284）
-11:11:13 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -39
-11:11:17 [warn] Node A 重启过（boot 15728→26164）
-11:11:17 [ok] Node A 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -25
-11:11:21 [warn] localhost.run 自检连续失败（https://4385d429c1f7e5.lhr.life），重启隧道换新网址
-11:11:21 [warn] localhost.run: If you get a permission denied error check the faq for how to connect with a key or
-11:11:22 [info] localhost.run 给出网址 https://736f957839ecf8.lhr.life，正在自检…
-11:11:37 [ok] localhost.run 公网自检通过 https://736f957839ecf8.lhr.life (220ms)
-11:11:37 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://736f957839ecf8.lhr.life
-11:11:58 [warn] Node B 超过 45 秒没有上传，判定离线
-11:12:02 [warn] Node A 超过 45 秒没有上传，判定离线
-11:13:37 [warn] Node A 重启过（boot 26164→42641）
-11:13:37 [ok] Node A 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -22
-11:13:40 [warn] Node B 重启过（boot 16284→47614）
-11:13:40 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -47
+// ---------------- 信道计划 ----------------
+// 1 = 全信道 1..13（80MHz 合成带宽，信道间隔 5MHz = 16 个子载波，相邻信道重叠 → 可做重叠相位拼接）
+// 0 = 先用 [1,6,11] 三个非重叠信道把流程跑通（验证用）
+#define CHANNEL_PLAN 1
 
-## 浏览器事件
-11:12:43 [info] 开始连接：https://goal-pee-backing-shift.trycloudflare.com
-11:12:44 [ok] https://goal-pee-backing-shift.trycloudflare.com → HTTP 200 · 530ms · 主机 v9.0 已运行 1006s
-11:13:08 [fail] 轮询失败：请求超时(15s)
-11:13:13 [ok] 连接恢复
-11:13:38 [fail] 轮询失败：请求超时(15s)
-11:13:46 [ok] 连接恢复
-11:14:11 [fail] 轮询失败：请求超时(15s)
+#define DWELL_MS            55   // 每信道停留（≥50ms）：含 3 次换台指令 + 稳定时间 + 多次双向交换
+#define EXCHANGES_PER_CH     8   // 每信道双向交换次数（每次 = A→B 探测 + B→A 回复 + B→A 数据，A、B 各得到一份 CSI）
+#define EXCH_GAP_MS          5   // 两次交换的间隔（必须 ≥4，CSI 与帧的配对靠时间窗 ±1.5ms）
+#define SWEEPS_PER_UPLOAD    3   // 连续扫几轮后回到路由器信道上传一次（越大越连续，但延迟越高）
+
+// ---------------- v10 新增 ----------------
+#define TX_POWER_DBM        15   // 发射功率 dBm（2~20）。两块板子在同一房间，15 足够；功率低 = 供电峰值小 = 不容易“欠压重启”
+#define DISABLE_BROWNOUT     0   // 1 = 关闭欠压检测（只有在网页检测日志显示 rst=BROWNOUT 且换不了电源/线时才用）
+#define SYNC_WAIT_MS      6000   // A 每次等 B 应答的最长时间（B 扫描 13 个信道一圈约 1.6 秒，6 秒足够）
+#define B_WAIT_MS        25000   // B 在“会合信道”等 A 回来的最长时间，超过就重新扫描 1..13 信道找 A
+#define B_SCAN_DWELL_MS    120   // B 扫描找 A 时每个信道停留多久
+
+// DNS 备用：路由器 DNS 解析不了隧道域名时（HTTP 返回 -1），用这个备用 DNS（223.5.5.5 = 阿里 DNS，全球可用；也可改 8.8.8.8）
+#define DNS_FALLBACK "223.5.5.5"
+#define ENABLE_LED 1             // 板载 RGB 灯：蓝=连路由器 黄=上传中 绿=上传成功 红=失败 紫=等对端 青=扫描/跟随中（没接电脑也能看）
+
+#define COUNTRY_CODE "CN"        // 中国 1~13 信道；美国请改 "US"，并把 CHANNEL_PLAN 的 13 改 11
+#define HOME_CHANNEL         1   // A 还没连上路由器时的会合信道（连上后自动改成路由器信道）
+#define WIFI_TIMEOUT_MS   9000   // 每次连路由器最多等多久
+#define HTTP_TIMEOUT_MS   9000
+#define HELLO_EVERY_MS   30000   // 没有数据时多久向 Kaggle 报一次“我在线”
+#define ENABLE_UPLOAD        1   // 0 = 不联网，只做扫描并在串口打印统计（调试同步用）
+#define SERIAL_BAUD     115200
