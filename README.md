@@ -1,13 +1,58 @@
-## 📡 ESP32-S3 双节点 WiFi CSI 全信道拼接雷达（v9）
+## 📡 ESP32-S3 双节点 WiFi CSI 全信道拼接雷达（v10）
 
-两块 ESP32-S3（仅 2.4GHz 802.11b/g/n）+ Kaggle（T4×2）主机端 + 浏览器模拟器。**ESP32 不用接电脑**：烧录后只要供电，数据通过 WiFi（HTTPS）上传到 Kaggle。
+两块 ESP32-S3（仅 2.4GHz 802.11b/g/n）+ Kaggle（T4×2）主机端 + 浏览器模拟器。**ESP32 不用接电脑**：烧录后只要供电。
 
 ```
-Node A ──ESP-NOW 跳频/探测──▶ Node B     （13 信道 × 8 次双向交换，每信道 55ms）
-   └── 扫完 SWEEPS_PER_UPLOAD 轮 → 一起回路由器信道 → 各自 HTTPS POST 二进制 CSI
-Kaggle：Flask + 内嵌网站 + 多隧道(cloudflared/pinggy/localhost.run) → 配对 → 相位标定 → 拼接 → IFFT(GPU0)/MUSIC+呼吸扫描(GPU1) → 感知
-输出框：绿色按钮「🚀 打开 WiFi 成像系统」→ 整个 3D 网站（同源，自动连接，无需粘贴网址）
+Node A（网关+指挥）──ESP-NOW 跳频/探测──▶ Node B（射频探头，不联网）   13 信道 × 8 次双向交换，每信道 55ms
+   ▲  B 收到探测 → 立刻回复(REPLY) + 把自己测到的 CSI 单播(T_DATA，带 ACK 重传)发回 A
+   └─ A 扫完 SWEEPS_PER_UPLOAD 轮 → 回路由器信道 → 分两次 HTTPS POST：node=0(A 的 H_BA) / node=1(B 的 H_AB)
+Kaggle：Flask + 内嵌网站 + 多隧道 → 配对 → 相位标定 → 拼接 → IFFT(GPU0)/MUSIC+呼吸扫描(GPU1) → 感知
 ```
+
+### v10 —— 针对「检测日志」的修复（本次更新）
+
+检测日志显示：Node A / Node B 都在线、上传正常，但 **CSI 记录始终为 0**，并且两块板子反复重启（boot ID 一直在变，互相相隔几秒）。
+
+| 批判性复盘 | v10 做法 |
+| --- | --- |
+| v9 里 A、B 都要在“回路由器上传”和“ESP-NOW 会合”之间来回切换，两块板的上传耗时不同，会合只能靠时间窗碰运气；B 还要跑 TLS（峰值电流大、栈/堆压力大） | **A=网关+指挥，B=纯射频探头**：B 不连 WiFi、不做 TLS，永远在 ESP-NOW 上待命；B 的 H_AB 用单播(T_DATA，MAC 层 ACK+重传)实时发回 A，由 A 代传。Kaggle 协议、记录格式（144 字节）完全不变 |
+| 两块板几乎同时重启，且无从知道原因 | 固件把「上次复位原因（BROWNOUT/PANIC/看门狗…）」「复位前阶段」存进 RTC 内存并随心跳上报，Kaggle 事件里直接提示：欠压→换线/换电源；崩溃→贴串口回溯 |
+| 无法判断是哪一层不通 | A 上报 `lnk=` 链路计数（同步窗口、探测、回复、配对 CSI、B 的数据帧、B 状态、发送错误、CSI 回调数）；检测日志新增「ESP-NOW 链路」项，分 4 层给出结论 |
+| 发射 19.5dBm 对近距离是浪费，峰值电流大 | `TX_POWER_DBM` 默认 15；可选 `DISABLE_BROWNOUT` |
+| loop 任务栈 8KB，TLS 握手偶发溢出 | `SET_LOOP_TASK_STACK_SIZE(16KB)` |
+| B 晚上电 / 中途断电 / A 上传很久 | B 状态机 SCAN→FOLLOW→WAIT→SCAN：WAIT 停在 A 的路由器信道，超过 `B_WAIT_MS` 自动重扫 1..13 信道 |
+
+只有 **Node A** 需要 WiFi 与 Kaggle 网址（手机热点请开“最大兼容性”= 2.4GHz）。`config.h`、`radar_common.h` 两个工程内容相同。
+
+### 怎么用（4 步）
+
+1. **Kaggle**：Settings → Accelerator `GPU T4 x2`，Internet `On`；新建 Code Cell，粘贴 `kaggle/csi_radar_kaggle.py` 全部内容，运行，约 1 分钟后输出框出现绿色按钮和网址。
+2. **浏览器模拟器 →「📋 进入复制代码界面」→ ③ PlatformIO**：填 WiFi、粘贴 Kaggle 网址，复制 Node A / Node B 各 4 个文件到两个 PlatformIO 工程（Board: ESP32-S3-DevKitC-1，Framework: Arduino）→ Build → Upload。
+3. 两块板子供电（用短而粗的 USB 线 + 充电头）。串口（可选）A：`[sync] ✅ Node B 已就绪` → `[sweep] …` → `[upload] node=A … HTTP 200` → `[upload] node=B … HTTP 200`；B：`[stat] state=2 …`。
+4. 点 Kaggle 输出框里的按钮看实时 3D。出问题点右上角「🩺 检测日志」复制回来——现在它会指出具体哪一层不通。
+
+### 无硬件自测
+
+```
+python3 tools/sim_protocol.py --legacy   # 协议状态机仿真（v10 与 v9 对比；丢包/上传耗时/B 晚上电/B 断电）
+python3 tools/test_host.py --seed 1       # 主机端回归：空场/走动/呼吸/两目标/稀疏/单向/401/400
+python3 tools/test_link_diag.py           # v10 链路分层诊断 + 复位原因事件
+RADAR_NO_TUNNEL=1 python3 kaggle/csi_radar_kaggle.py &
+python3 tools/sim_esp32_csi.py --url http://127.0.0.1:8000 --scenario two --check
+```
+
+### 验证记录（沙盒实测，每项 3 次）
+
+* PlatformIO 真实编译（espressif32@6.9.0 / Arduino 2.0.17）：Node A、Node B × `esp32s3` / `esp32s3_uart` / `esp32s3_n16r8`，连续 3 轮全部 SUCCESS（RAM ≈15% / Flash ≈21~26%）。
+* `esp32s3_core3`（pioarduino）：代码只使用 core2/core3 共有 API，保留 v9.1 的兼容层；但沙盒的 Python 环境无法安装 pioarduino 的 penv，**这个环境本次没能重新编译**，请用默认 `esp32s3` 环境。
+* 协议仿真 `sim_protocol.py`：4 个场景 × 3 个随机种子全部达标（v10 同样条件下比 v9 多约 10~20% 扫描轮数）。**诚实结论**：仿真里 v9 的会合逻辑本身也能工作，所以“0 条记录”的真实根因更可能在射频层/供电（欠压重启）而不是时间窗；v10 把这些层全部做成可观测。
+* 主机回归 `test_host.py` 3 个种子全 PASS；`test_link_diag.py` 3 轮全 PASS。
+* ⚠ 沙盒没有两块真实 ESP32 与 GPU：ESP-NOW 实际同步率、CSI 回调是否触发、T4×2 占用只能在你的硬件上验证。GPU 利用率 0% 是因为目前没有任何 CSI 数据进来；链路通了之后 GPU 才会有负载（数据量约 40KB/s，不会跑满）。
+* 物理边界不变：2 节点 = 1 条双基地链路，只有路径长度剖面，不能成像/测角度；合成带宽约 76.6MHz，路径长度分辨率约 3.9m。
+
+---
+
+## 以下为 v9 及更早的说明（保留）
 
 ### v9.1.1 —— 修复「编译报错路径在 .platformio\packages\framework-arduinoespressif32 里」（本次更新）
 
