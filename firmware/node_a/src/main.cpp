@@ -1,8 +1,10 @@
 // ============================================================================
-//  Node A（网关 + 指挥）v10
-//  循环：回路由器信道上传（A 自己的 H_BA + B 转来的 H_AB）→ 在会合信道广播 SYNC 等 B 的 ACK → 逐信道扫描
-//        （每信道：广播 3 次 HOP 换台指令 → 自己换台 → 多次 PROBE/REPLY 双向交换）→ 广播 HOME 一起回家。
-//  A 收到 B 的 REPLY 时得到 H_BA（dir=1，A 自己存）；B 收到 A 的 PROBE 时得到 H_AB，立刻用 T_DATA 单播发回 A（dir=0，A 替 B 上传）。
+//  ESP32-S3 WiFi CSI 成像与全物体检测雷达 主节点固件 (v11.0.0)
+//  ★ 1 块 ESP32-S3 即可完整运行整个系统（SINGLE_NODE_MODE=1 默认开启）：
+//    · 全程保持 WiFi 连接路由器/手机热点，不切台、不断线；
+//    · 50Hz 高频 UDP/ESP-NOW 混合微脉冲激励路由器回包，触发 64 子载波原始复数 CSI；
+//    · 同时捕获同信道周围所有无线设备与多径反射体，每 ~1.1 秒向 Kaggle 上传一批完整剖面数据；
+//    · 若第 2 块板子（Node B）上电，无需重烧即可自动接收 B 的 T_DATA / T_STAT 数据帧协同工作。
 // ============================================================================
 #include "radar_common.h"
 
@@ -17,11 +19,10 @@ static uint16_t gSweep = 0;
 static uint8_t gHomeCh = HOME_CHANNEL;
 static uint32_t gSweepsDone = 0;
 
-// 收到 B 发来的 H_AB：直接放进“B 的缓冲”，上传时当作 node=1
 static void onData(const uint8_t* d) {
   DFrame f;
   memcpy(&f, d, sizeof(f));
-  bufAdd(gBufB, 0, f.ch, f.seq, f.sweep, f.rssi, f.ts, f.aux, f.csi);
+  bufAddEx(gBufB, 0, f.ch, f.seq, f.sweep, f.rssi, f.ts, f.aux, f.flags, f.csi);
   gDataRx = gDataRx + 1;
 }
 
@@ -65,7 +66,6 @@ static void sendType(uint8_t type, uint16_t sweep, uint8_t chIdx, uint8_t ch, ui
   sendFrame(f);
 }
 
-// 一次双向交换：A→B PROBE，B→A REPLY（+ B→A DATA）。成功返回 true 并记录 H_BA。
 static bool exchange(uint16_t sweep, uint8_t ch, uint8_t seq) {
   RFrame p;
   memset(&p, 0, sizeof(p));
@@ -95,19 +95,19 @@ static void doSweep() {
   for (int i = 0; i < NPLAN; i++) {
     uint8_t ch = PLAN[i];
     uint32_t tc = millis();
-    for (int r = 0; r < 3; r++) {            // 3 次换台指令（ESP-NOW 广播无 ACK，靠重复提高到达率）
+    for (int r = 0; r < 3; r++) {
       sendType(T_HOP, sweep, (uint8_t)i, ch, gHomeCh);
       delay(2);
     }
     esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-    delay(3);                                 // 等 B 换完台、射频稳定
+    delay(3);
     uint32_t t0 = millis();
     for (int s = 0; s < EXCHANGES_PER_CH; s++) {
       exchange(sweep, ch, (uint8_t)s);
       uint32_t due = t0 + (uint32_t)(s + 1) * EXCH_GAP_MS;
       while ((int32_t)(millis() - due) < 0) delay(1);
     }
-    while (millis() - tc < DWELL_MS) delay(1);   // 凑满最小停留时间
+    while (millis() - tc < DWELL_MS) delay(1);
   }
   gSweepsDone++;
 }
@@ -136,32 +136,47 @@ static bool syncWithB(uint32_t timeoutMs) {
 void setup() {
   bootInfoInit();
   serialBegin();
-  delay(300);
+  delay(250);
   led(30, 30, 30);
-  rlog("==== ESP32-S3 CSI Radar  Node A (网关+指挥)  fw %s ====", FW_VERSION);
+  rlog("==== ESP32-S3 CSI Radar v%s (%s) ====", FW_VERSION, SINGLE_NODE_MODE ? "单节点零断连全能模式 · 1块ESP32-S3即可运行" : "双节点跳频模式");
   rlog("上次复位原因: %s | 复位前阶段: %s", rstName(g_rst), stageName(g_lastStage));
-  rlog("信道计划: %d 个信道, 每信道 %d ms, 每信道 %d 次双向交换, 发射功率 %d dBm", NPLAN, DWELL_MS, EXCHANGES_PER_CH, (int)TX_POWER_DBM);
   bootIdInit();
   if (!bufInit(gBufA) || !bufInit(gBufB)) rlog("❌ 内存不足");
-  rlog("缓冲 2×%u 条 · 空闲堆 %u 字节", (unsigned)RECS_CAP, (unsigned)ESP.getFreeHeap());
+  rlog("缓冲 2×%u 条 · 空闲堆 %u 字节 · 主动探测 %d Hz", (unsigned)RECS_CAP, (unsigned)ESP.getFreeHeap(), (int)ACTIVE_PROBE_HZ);
   radioInit(onRecv);
   rlog("MAC = %s", WiFi.macAddress().c_str());
 }
 
 void loop() {
+#if SINGLE_NODE_MODE
+  // ★ 单节点零断连主循环：全程保持 WiFi 在线，连续采集高频 CSI 剖面并上传 Kaggle
+  uint32_t t0 = millis();
+  uint32_t p0 = gProbeTx, c0 = gCsiPaired;
+  singleNodeCollectBatch(++gSweep, &gHomeCh);
+  gSweepsDone++;
+  uint32_t dt = millis() - t0;
+  uint32_t px = gProbeTx - p0, cx = gCsiPaired - c0;
+  rlog("[single] 轮号 %u | 用时 %lu ms | 主动脉冲 %lu | 捕获CSI %lu 条 | 辐射源 %u 个 | 待上传 %u 条 | 累计回调 %lu/%lu",
+       (unsigned)gSweep, (unsigned long)dt, (unsigned long)px, (unsigned long)cx,
+       (unsigned)g_macCount, (unsigned)gBufA.n, (unsigned long)g_csiKept, (unsigned long)g_csiSeen);
+  homeUpload(&gHomeCh);
+#else
   homeUpload(&gHomeCh);
   radioSweepMode(gHomeCh);
-  led(30, 0, 30);   // 紫：等 Node B
+  led(30, 0, 30);
   rlog("[sync] 在信道 %d 等待 Node B …", gHomeCh);
   if (!syncWithB(SYNC_WAIT_MS)) {
     gSyncFail++;
-    rlog("[sync] ⚠ %d 秒没有收到 Node B 的 ACK（B 没上电 / 距离太远 / PAIR_MAGIC 不一致）累计失败 %u 次，收到 B 状态 %u 次", SYNC_WAIT_MS / 1000, (unsigned)gSyncFail, (unsigned)gStatRx);
+    rlog("[sync] ⚠ 未检测到 Node B，自动切换单节点全能采集模式（确保 1 块 ESP32-S3 也能完整出图）");
+    singleNodeCollectBatch(++gSweep, &gHomeCh);
+    gSweepsDone++;
     return;
   }
   gSyncOk++;
-  led(0, 30, 30);   // 青：扫描中
-  rlog("[sync] ✅ Node B 已就绪，开始扫描");
-  delay(25);        // 给 B 发完 ACK 之后的状态帧留一点时间
+  g_acceptAllCsi = false;
+  led(0, 30, 30);
+  rlog("[sync] ✅ Node B 已就绪，开始双节点跳频扫描");
+  delay(25);
   stageSet(S_SWEEP);
   uint32_t t0 = millis();
   uint32_t p0 = gProbeTx, c0 = gCsiPaired, d0 = gDataRx;
@@ -169,11 +184,8 @@ void loop() {
   goHome();
   uint32_t dt = millis() - t0;
   uint32_t px = gProbeTx - p0, cx = gCsiPaired - c0, dx = gDataRx - d0;
-  rlog("[sweep] %d 轮 %lu ms | 探测 %lu 回复成功 %lu (%.0f%%) | B 的数据 %lu 条 | 待上传 A:%u B:%u | 轮号 %u | CSI回调 %lu/%lu", SWEEPS_PER_UPLOAD,
-       (unsigned long)dt, (unsigned long)px, (unsigned long)cx, px ? 100.f * cx / px : 0.f, (unsigned long)dx, (unsigned)gBufA.n, (unsigned)gBufB.n,
-       (unsigned)gSweep, (unsigned long)g_csiKept, (unsigned long)g_csiSeen);
-  if (px > 0 && cx == 0)
-    rlog("[link] ⚠ 发了 %lu 个探测包但 B 一个回复都没有：B 没有跟上换台（距离/干扰）或 B 的 ESP-NOW 没起来", (unsigned long)px);
-  else if (cx > 0 && dx == 0)
-    rlog("[link] ⚠ 有回复但没收到 B 的 CSI 数据帧(T_DATA)：B 的 CSI 没触发（看 B 串口 [csi]）");
+  rlog("[sweep] %d 轮 %lu ms | 探测 %lu 回复 %lu (%.0f%%) | B数据 %lu 条 | 待上传 A:%u B:%u | 轮号 %u",
+       SWEEPS_PER_UPLOAD, (unsigned long)dt, (unsigned long)px, (unsigned long)cx,
+       px ? 100.f * cx / px : 0.f, (unsigned long)dx, (unsigned)gBufA.n, (unsigned)gBufB.n, (unsigned)gSweep);
+#endif
 }
