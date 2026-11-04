@@ -48,6 +48,7 @@ static void radioTask(void*) {
           gLastRx = millis();
           gSyncs++;
           gState = ST_FOLLOW;
+          led(0, 30, 30);   // 青：跟随扫描
         }
         break;
       case T_HOP:
@@ -101,6 +102,7 @@ static void scanForA() {
 void setup() {
   serialBegin();
   delay(300);
+  led(30, 30, 30);
   rlog("==== ESP32-S3 CSI Radar  Node B (响应端)  fw %s ====", FW_VERSION);
   if (!recsInit()) rlog("❌ 内存不足");
   gQ = xQueueCreate(24, sizeof(RxItem));
@@ -116,6 +118,7 @@ void loop() {
       radioSweepMode(gHomeCh);
       gReadySince = millis();
       gState = ST_READY;
+      led(30, 0, 30);   // 紫：等 Node A
       rlog("[ready] 在信道 %d 等待 Node A 的 SYNC", gHomeCh);
       break;
     }
