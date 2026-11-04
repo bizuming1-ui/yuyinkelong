@@ -1,57 +1,53 @@
-## 📡 ESP32-S3 双节点 WiFi CSI 全信道拼接雷达（v8）
+## 📡 ESP32-S3 双节点 WiFi CSI 全信道拼接雷达（v9）
 
-两块 ESP32-S3（N16R8，仅 2.4GHz 802.11b/g/n）+ Kaggle（T4×2）主机端 + 浏览器 3D 模拟器。
-**ESP32 不用接电脑**：烧录好后只要供电，数据通过 WiFi（HTTPS）上传到 Kaggle 输出框里打印的网址。
+两块 ESP32-S3（仅 2.4GHz 802.11b/g/n）+ Kaggle（T4×2）主机端 + 浏览器模拟器。**ESP32 不用接电脑**：烧录后只要供电，数据通过 WiFi（HTTPS）上传到 Kaggle。
 
 ```
-Node A (发起端)  ──ESP-NOW 广播 HOP/PROBE──▶  Node B (响应端)
-   ▲  H_BA (A 收到 B 的回复)                    │ H_AB (B 收到 A 的探测) + 立即 REPLY
-   └──────────────────────────────────────────┘
-        每个信道停留 55ms：3 次换台指令 + 8 次双向交换，13 个信道 ≈ 0.7s / 轮
-   扫完 SWEEPS_PER_UPLOAD 轮 → 两节点一起回到路由器信道 → 各自 HTTPS POST 二进制 CSI 到 Kaggle
-Kaggle(Flask + cloudflared + numpy/PyTorch)：配对 → 相位标定 → 帧对齐 → 重叠子载波拼接 → IFFT(GPU0) / MUSIC(GPU1) → 感知
-浏览器模拟器（Next.js + three.js）：轮询 Kaggle 的 /api/state → 距离-时间 3D 地形 + 路径椭圆 + 全能检测日志
+Node A ──ESP-NOW 跳频/探测──▶ Node B     （13 信道 × 8 次双向交换，每信道 55ms）
+   └── 扫完 SWEEPS_PER_UPLOAD 轮 → 一起回路由器信道 → 各自 HTTPS POST 二进制 CSI
+Kaggle：Flask + 内嵌网站 + 多隧道(cloudflared/pinggy/localhost.run) → 配对 → 相位标定 → 拼接 → IFFT(GPU0)/MUSIC+呼吸扫描(GPU1) → 感知
+输出框：绿色按钮「🚀 打开 WiFi 成像系统」→ 整个 3D 网站（同源，自动连接，无需粘贴网址）
 ```
+
+### v9 相对 v8 的改动（以及为什么）
+
+| 问题（批判性复盘） | v9 做法 |
+| --- | --- |
+| 网页报“请求超时(6s)”：原因可能是 ①Cell 停了/网址旧 ②cloudflared 默认 QUIC(UDP) 在 Kaggle 里不稳 ③**国内网络访问不了 trycloudflare.com**；v8 无法区分 | cloudflared 改 `--protocol http2 --edge-ip-version 4`；同时开 **pinggy + localhost.run** 备用隧道；Kaggle 内部每 15s 自检公网网址，连续失败自动重启并重新发布；网页超时 15s，并精确区分 **网络层不通 / 隧道已失效(530/1033) / 不是雷达主机**，每种给对应建议；网址框可一次粘贴多个网址，自动选通的 |
+| Kaggle 输出框只有文字网址，没有网站 | 网站内嵌进 Kaggle 单文件（gzip+base64，约 260KB），Flask 的 `/` 直接提供；输出框用 IPython.display 显示按钮 + 全部网址 + 内嵌小窗；从 Kaggle 页打开时同源自动连接 |
+| GPU 没用到 | 排查：Kaggle 没选 T4×2 时 torch 无 CUDA（网页和日志会明确提示）。v9：GPU0 做 16384 点 IFFT，GPU1 做 MUSIC + **全距离呼吸扫描**（256 个距离点一次矩阵乘），预留显存池，nvidia-smi 利用率/显存实时显示在网页。**诚实说明**：数据量约 40KB/s，GPU 不可能跑满，脚本不空转烧 GPU |
+| 通道相位自动聚焦（autofocus）试验 | 做了 GPU 版并用回归测试 A/B：**会损伤两目标分辨 → 默认关闭**（`RADAR_AF=1` 可开）。逐通道锁定参考 `RADAR_CHLOCK=1` 中性，默认关 |
+| ESP32 上传失败时不知道原因 | 固件失败时串口输出 DNS 体检与错误码含义，并把 `lerr`/当前网址随下一次上传带给 Kaggle（日志里直接看到）；DNS 备用 223.5.5.5；`KAGGLE_URL2/3` 备用网址失败自动轮换；ntfy 发现支持多网址 |
+| 板子只供电时看不出状态 | 板载 RGB 灯：蓝=连路由器 黄=上传 绿=成功 红=失败 紫=等对端 青=扫描 |
+| 磁盘 | 原始 CSI 落盘 `/tmp/radar_raw`（Kaggle `/tmp` 约 57GB），默认上限 min(40GB, 剩余−8GB)，滚动删除 |
 
 ### 怎么用（4 步）
-1. **Kaggle**：Settings → Accelerator `GPU T4 x2`，Internet `On`；新建 Code Cell，粘贴 `kaggle/csi_radar_kaggle.py` 全部内容，运行。约 20 秒后**输出框里的方框里会打印 `https://xxxx.trycloudflare.com`**。
-2. **复制代码界面**（浏览器模拟器右上角「📋 复制代码」或「进入复制代码界面」）→ ③ PlatformIO 代码：把 Kaggle 网址、WiFi 名/密码填进顶部输入框，config.h 自动带上；Node A、Node B 各 4 个文件复制进两个 PlatformIO 工程（Board: ESP32-S3-DevKitC-1，Framework: Arduino）→ Build → Upload。
-3. 两块板子**只供电**（不用接电脑）。串口监视器（可选）应依次看到：`[wifi] ✅` → `[upload] HTTP 200` → `[sync] ✅ Node B 已就绪` → `[sweep] 3 轮 …`。
-4. 浏览器模拟器顶部「Kaggle 网址」粘贴同一个网址 → 连接。出问题点右上角「🩺 检测日志」→ 复制日志（或「复制并去 GitHub 提交」）。
 
-> 没填 Kaggle 网址也行：固件会从 `https://ntfy.sh/<RADAR_TOPIC>` 自动读取 Kaggle 最新网址（Kaggle 脚本每 4 分钟发布一次）。
+1. **Kaggle**：Settings → Accelerator `GPU T4 x2`，Internet `On`；新建 Code Cell，粘贴 `kaggle/csi_radar_kaggle.py` 全部内容，运行。约 1 分钟后输出框出现绿色按钮和网址。
+2. **浏览器模拟器 →「📋 复制代码」→ ③ PlatformIO**：填 WiFi、粘贴 Kaggle 网址（可多个），复制 Node A / Node B 各 4 个文件到两个 PlatformIO 工程（Board: ESP32-S3-DevKitC-1，Framework: Arduino）→ Build → Upload。
+3. 两块板子只供电。串口（可选）：`[wifi] ✅` → `[upload] HTTP 200` → `[sync] ✅ Node B 已就绪` → `[sweep] …`。
+4. 点 Kaggle 输出框里的按钮（或把网址粘到模拟器顶部）→ 看实时 3D。出问题点右上角「🩺 检测日志」复制。
 
-### 为什么“一直等待 ESP32 数据”（v7 的根因）与 v8 的修法
-| 根因 | v8 修法 |
-|---|---|
-| 网页靠 USB 串口读数据，插错口/被占用/0 字节就永远在等 | **完全去掉 USB 依赖**：ESP32 → WiFi → Kaggle → 浏览器 |
-| 等待提示不说明卡在哪一步 | 状态条按 **网址→Kaggle 可达→节点上线→节点同步→首帧** 五个阶段给出具体原因；「检测日志」逐项 ✅/⚠️/❌ |
-| 3D 界面依赖数据才“出现” | three.js 打包在本站（无 CDN）；地面、椭圆刻度、节点、地形**无数据时也真实渲染**；WebGL 不可用会明确报错；渲染循环先排下一帧再 try/catch（不会冻结）；帧率低自动降像素比 |
-| 节点上线信息只在有 CSI 后才有 | 每次上传（含 0 条记录的心跳）都带固件/IP/RSSI/信道，主机立即显示“Node A/B 在线” |
+### 构建网页（Vite）
 
-### 物理与算法（第一性原理）
-* **信道栅格**：ESP32 CSI 子载波间隔 312.5kHz，信道间隔 5MHz = **16 个子载波**，所以 13 个信道落在同一频率栅格上，相邻信道重叠 36 个子载波 → 可以用重叠区**估计并消除**信道间的相位/斜率偏差（比纯“幅度拼接”更强）。全部 13 信道 ≈ 245 个频点 ≈ **76.6MHz**（理论上限 ≈ 80MHz）。
-* **双向相位标定**：A→B 与 B→A 的本振/采样偏移互为相反数：`H_AB = h·e^{+jθ}`、`H_BA = h·e^{-jθ}`。`Z = H_AB·conj(H_BA) = |h|²e^{j2θ}` 拟合出 θ(k)（常数 + 斜率），两个方向各自校正后平均。**不直接用乘积 h²**，因为 h² 会产生 τi+τj 的交叉项鬼影（沙盒仿真里实测会把 8m 的目标淹没）。
-* **帧间对齐** → **信道间重叠拼接**（相位增量估计，无需解卷绕）→ **锚定**（最强径放在两节点间距）→ **IFFT**（Kaiser 窗，8192 点零填充）→ **MUSIC**（前后向平滑，GPU1）。
-* **分辨率（诚实）**：路径长度分辨率 `c/B ≈ 3.9m`（等效单站距离 `R=L/2` 时 ≈ 2m）；MUSIC 在仿真里能分开 3m/8m/14m 路径。**2 个节点 = 1 条双基地链路**：得到的是“路径长度椭圆”（以 A、B 为焦点），**不能成像、不能测角度、不能定位到点**；要定位需要 ≥3 节点。
-* **感知**：存在/运动（相对基线的幅度谱变化，MAD 阈值）、呼吸（Lomb–Scargle，支持上传间隙造成的不等间隔采样，0.1–0.5Hz）。**呼吸需要平均采样率 ≳ 0.4 轮/秒**；每次上传窗口会打断采样，见 `SWEEPS_PER_UPLOAD`。
-* **WiFi 上传 vs 跳频的矛盾**：已连路由器的 STA 不能跳信道，所以每个周期“扫描 → 一起回家信道 → 上传 → 在家信道 SYNC/ACK 会合 → 再扫描”。`SWEEPS_PER_UPLOAD` 越大越连续但延迟越高（默认 3 轮：约 2.2s 扫描 + 1.5~2.5s 上传）。上传时复用 BSSID/信道/静态 IP，重连约 0.3~0.6s。
-
-### 固件要点（firmware/node_a、node_b）
-* ESP-NOW 广播换台：A 发 3 次 HOP（间隔 2ms）后自己换台，B 在专用高优先级任务里 `esp_wifi_set_channel`；B 400ms 没听到 A 即回家信道，READY 超过 4 秒会在 1..13 信道轮询监听 A 的 SYNC（会合机制）。
-* CSI 只取 L-LTF（6Mbps OFDM，`esp_wifi_config_espnow_rate(WIFI_PHY_RATE_6M)`），每条记录 144 字节：方向/信道/序号/RSSI/轮号/**硬件接收时间戳**/往返时间。CSI 与 ESP-NOW 帧用“回调时间最接近”配对（±1.5ms，帧间隔 5ms）。
-* 每个信道停留 55ms（≥50ms）；同时输出日志到 USB 口和 UART 口。
-* `CHANNEL_PLAN 0` 先跑 `[1,6,11]`，验证后改 `1` 用全信道；`ENABLE_UPLOAD 0` 可不联网只看同步统计。
-
-### 沙盒验证记录（均为实测）
-* **PlatformIO 真实编译**（espressif32@6.9.0 / Arduino 2.0.17）：Node A、Node B 的 `esp32s3` 环境均 SUCCESS（RAM 15%，Flash 26%）。
-* **主机端回归**：`python3 tools/test_host.py --seed N`（空场不误报 / 走动检出 / 呼吸 15BPM→15.0 / 两目标 8m·14m 分辨 / [1,6,11] 稀疏流程 / 单向退化 / 错误密钥 401 / 坏数据 400），共跑 3 轮不同随机种子。仿真包含：每信道随机 PLL 相位、每帧随机采样偏移(±30ns)/常数相位/增益、5% 丢包、28dB 信噪比、int8 量化；数据字节与固件结构体逐字节一致。
-* **浏览器**：无头 Chromium（SwiftShader WebGL）加载 3D 页面，无脚本错误；连上本地主机后出图；`/code` 三个标签页、每个文件都有「在 GitHub 编辑」「复制此文件」。
-* ⚠ **沙盒没有两块真实 ESP32 与 GPU**：ESP-NOW 同步成功率、真实环境下的相位残差、T4×2 实际占用只能在你的硬件上验证——请把「检测日志」贴回来，我据此继续调（重点看 `[sync]` 丢失率、拼接相干度、配对数）。
+```
+cd web && npm install
+node scripts/build-kaggle.mjs   # 先生成内嵌版网站并写入 generated/csi_radar_kaggle.py（= kaggle/csi_radar_kaggle.py）
+npm run build
+```
 
 ### 无硬件自测
-```bash
-RADAR_NO_TUNNEL=1 python3 kaggle/csi_radar_kaggle.py &           # 本地主机端
-python3 tools/sim_esp32_csi.py --scenario two --check            # 模拟两块 ESP32 上传
-python3 tools/test_host.py --seed 1                              # 全套回归
+
 ```
+python3 tools/test_host.py --seed 1      # 空场/走动/呼吸/两目标/稀疏/单向/401/400
+RADAR_NO_TUNNEL=1 python3 kaggle/csi_radar_kaggle.py &
+python3 tools/sim_esp32_csi.py --url http://127.0.0.1:8000 --scenario two --check
+```
+
+### 验证记录（沙盒实测）
+
+* PlatformIO 真实编译（espressif32@6.9.0 / Arduino 2.0.17）：Node A、Node B 的 `esp32s3` / `esp32s3_uart` / `esp32s3_n16r8` 均 SUCCESS（RAM 15% / Flash 26%）。
+* 主机回归 `test_host.py` 多轮不同随机种子全 PASS；cloudflared(http2) 与 localhost.run 在沙盒里真实建隧道并自检通过。
+* 无头 Chromium：Kaggle 主机直接提供网站 → 同源自动连接 → 3D 出图无脚本错误；坏网址给出“网络层不通”提示；多网址自动选通的；复制代码界面每个文件都有「在 GitHub 编辑」「复制此文件」。
+* ⚠ 沙盒没有两块真实 ESP32 与 GPU：ESP-NOW 同步率、真实相位残差、T4×2 实际占用只能在你的硬件上验证，请把「检测日志」贴回来。
+* 物理边界不变：2 节点 = 1 条双基地链路，只有路径长度剖面（椭圆），不能成像/测角度；合成带宽约 76.6MHz，路径长度分辨率约 3.9m。
