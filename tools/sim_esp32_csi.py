@@ -67,7 +67,7 @@ def main():
     d0 = a.baseline
     static = [(d0, 1.0, 0.3), (6.0, 0.35, 1.0), (11.0, 0.25, 2.0), (17.0, 0.15, 0.5)]
     hdr = {"X-Radar-Key": a.key, "Content-Type": "application/octet-stream"}
-    info = f"fw=sim;mac=SIM;rssi=-48;ch=6;ip=127.0.0.1;plan={len(plan)}"
+    info = f"fw=10.0.0-sim;mac=SIM;rssi=-48;ch=6;ip=127.0.0.1;plan={len(plan)};rst=poweron;last=none;lnk=sync:5/5,probe:400,reply:380,csi:370,data:360,stat:20,txerr:0;pwr=15"
     t_us = 1_000_000.0
     recA, recB = [], []
     BOOT = 4242
