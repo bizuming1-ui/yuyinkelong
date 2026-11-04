@@ -61,8 +61,9 @@ def main():
     try:
         code, out = sim(port, ["--plan", "sparse", "--scenario", "empty", "--sweeps", "30", "--seed", seed])
         st = requests.get(f"http://127.0.0.1:{port}/api/state?since=0").json()
-        ok = code == 0 and st["last"] is not None and st["last"]["mode"] == "two-way" and len(st["last"]["channelsOk"]) == 3
-        results.append(("[1,6,11] 稀疏流程跑通", ok, f"channels={st['last']['channelsOk'] if st['last'] else None} music={bool(st['last'] and st['last']['music'])}"))
+        objs = (st.get("last") or {}).get("objects") or []
+        ok = code == 0 and st["last"] is not None and st["last"]["mode"] == "two-way" and len(st["last"]["channelsOk"]) == 3 and len(objs) >= 2
+        results.append(("[1,6,11] 稀疏流程 + 空间物体检测输出", ok, f"channels={st['last']['channelsOk'] if st['last'] else None} objects={len(objs)}"))
     finally:
         stop(p)
     # 单向退化
