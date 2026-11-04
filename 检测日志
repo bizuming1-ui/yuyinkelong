@@ -1,1 +1,74 @@
+# ESP32-S3 双节点 CSI 雷达 · 检测日志  2026/11/4 11:14:26
+页面: https://goal-pee-backing-shift.trycloudflare.com/
+浏览器: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/159.0.0.0 Safari/537.36
 
+## 浏览器侧检测
+✅ 3D 渲染 (WebGL): ANGLE (AMD, AMD Radeon(TM) 780M (0x00001900) Direct3D11 vs_5_0 ps_5_0, D3D11) · 120 fps · 像素比 1.50
+✅ Kaggle 网址: https://goal-pee-backing-shift.trycloudflare.com
+✅ 主机 /api/health: HTTP 200 · 530ms · 主机 v9.0 已运行 1006s
+❌ 实时轮询: 状态 error · 延迟 408ms · 成功 31 次 / 失败 3 次 · 最近错误：请求超时(15s) · 最近成功 30.2s 前
+✅ Node A: 在线 · 17.7s 前上传 · 3 次/0 条 · 固件 9.1.1 · RSSI -22 · 缓冲丢弃 0
+✅ Node B: 在线 · 14.4s 前上传 · 4 次/0 条 · 固件 9.1.1 · RSSI -47 · 缓冲丢弃 0
+⚠️ CSI 剖面: 节点在线但还没有 CSI 记录：两块板子没同步（看串口 [sync]）
+✅ GPU: cuda:0 Tesla T4 14.6GiB | cuda:1 Tesla T4 14.6GiB · CIR 8.53ms · MUSIC 0ms
+
+## 主机(Kaggle)侧检测
+✅ 主机服务: 运行 1075s · Python 3.12.13 · numpy 2.0.2 · 端口 8000 · Kaggle
+✅ 公网隧道: cloudflared:✓ https://goal-pee-backing-shift.trycloudflare.com | pinggy:✓ https://ibpwl-35-199-8-42.run.pinggy-free.link | localhost.run:✓ https://736f957839ecf8.lhr.life
+✅ GPU 加速: cuda:0 Tesla T4 14.6GiB, cuda:1 Tesla T4 14.6GiB · IFFT/autofocus→cuda:0 · MUSIC→cuda:1 · 利用率 [0, 0] % · 显存池预留 [5219, 5219] MB · autofocus 0.0ms 锐度增益×1.0（0 次）
+ℹ️ 主机资源: 内存 2.0/31.3 GB · 磁盘剩余 966.9/8156.9 GB · CPU 4 核
+✅ Node A: 在线 · 15s 前 · 固件 9.1.1 · IP 172.20.10.3 · 路由器信道 6 · RSSI -22 · 上传 3 次 / 0 条 · 缓冲丢弃 0 · 重启 2
+✅ Node B: 在线 · 12s 前 · 固件 9.1.1 · IP 172.20.10.4 · 路由器信道 6 · RSSI -47 · 上传 4 次 / 0 条 · 缓冲丢弃 0 · 重启 3
+❌ CSI 数据: 两个节点都还没有上传 CSI 记录。节点在线但记录为 0 → 两块板子没有同步（看串口 [sync]）；都没在线 → 先解决上传
+✅ 错误计数: {} · 最近错误：无
+✅ 原始数据落盘: 0.0 MB 已写入 /tmp/radar_raw（上限 40.0 GB）
+
+## 主机事件(最近)
+10:55:58 [info] 服务启动 · numpy 2.0.2 · GPU 2 块 · NFFT=16384
+10:55:59 [warn] localhost.run: If you get a permission denied error check the faq for how to connect with a key or
+10:56:00 [info] localhost.run 给出网址 https://4385d429c1f7e5.lhr.life，正在自检…
+10:56:01 [info] pinggy 给出网址 https://ibpwl-35-199-8-42.run.pinggy-free.link，正在自检…
+10:56:02 [info] cloudflared 给出网址 https://goal-pee-backing-shift.trycloudflare.com，正在自检…
+10:56:15 [ok] cloudflared 公网自检通过 https://goal-pee-backing-shift.trycloudflare.com (351ms)
+10:56:15 [ok] pinggy 公网自检通过 https://ibpwl-35-199-8-42.run.pinggy-free.link (509ms)
+10:56:16 [ok] localhost.run 公网自检通过 https://4385d429c1f7e5.lhr.life (336ms)
+10:56:16 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
+11:00:16 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
+11:04:29 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
+11:08:43 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://4385d429c1f7e5.lhr.life
+11:08:45 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -24
+11:09:30 [warn] Node B 超过 45 秒没有上传，判定离线
+11:09:30 [ok] Node A 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -10
+11:09:40 [warn] Node B 重启过（boot 48565→39520）
+11:09:40 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -23
+11:10:15 [warn] Node A 超过 45 秒没有上传，判定离线
+11:10:25 [warn] Node B 超过 45 秒没有上传，判定离线
+11:10:49 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link
+11:10:53 [info] 收到校准指令：清空参考与基线，请保持房间安静约 20 秒
+11:10:53 [info] 两节点间距设为 0.50 m，重新校准
+11:10:53 [info] 收到校准指令：清空参考与基线，请保持房间安静约 20 秒
+11:10:53 [info] 收到校准指令：清空参考与基线，请保持房间安静约 20 秒
+11:11:13 [warn] Node B 重启过（boot 39520→16284）
+11:11:13 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -39
+11:11:17 [warn] Node A 重启过（boot 15728→26164）
+11:11:17 [ok] Node A 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -25
+11:11:21 [warn] localhost.run 自检连续失败（https://4385d429c1f7e5.lhr.life），重启隧道换新网址
+11:11:21 [warn] localhost.run: If you get a permission denied error check the faq for how to connect with a key or
+11:11:22 [info] localhost.run 给出网址 https://736f957839ecf8.lhr.life，正在自检…
+11:11:37 [ok] localhost.run 公网自检通过 https://736f957839ecf8.lhr.life (220ms)
+11:11:37 [info] 网址已发布到 ntfy.sh/wradar-bzm-5f2k9q7d（ESP32 可自动发现）：https://goal-pee-backing-shift.trycloudflare.com https://ibpwl-35-199-8-42.run.pinggy-free.link https://736f957839ecf8.lhr.life
+11:11:58 [warn] Node B 超过 45 秒没有上传，判定离线
+11:12:02 [warn] Node A 超过 45 秒没有上传，判定离线
+11:13:37 [warn] Node A 重启过（boot 26164→42641）
+11:13:37 [ok] Node A 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -22
+11:13:40 [warn] Node B 重启过（boot 16284→47614）
+11:13:40 [ok] Node B 上线 · 固件 9.1.1 · IP 112.96.90.230 · 信道 6 · RSSI -47
+
+## 浏览器事件
+11:12:43 [info] 开始连接：https://goal-pee-backing-shift.trycloudflare.com
+11:12:44 [ok] https://goal-pee-backing-shift.trycloudflare.com → HTTP 200 · 530ms · 主机 v9.0 已运行 1006s
+11:13:08 [fail] 轮询失败：请求超时(15s)
+11:13:13 [ok] 连接恢复
+11:13:38 [fail] 轮询失败：请求超时(15s)
+11:13:46 [ok] 连接恢复
+11:14:11 [fail] 轮询失败：请求超时(15s)
