@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- ESP32-S3 双节点 WiFi CSI 全信道拼接雷达 —— Kaggle 单文件主机端 (v9)
+ ESP32-S3 双节点 WiFi CSI 全信道拼接雷达 —— Kaggle 单文件主机端 (v10)
 ==============================================================================
 用法（Kaggle Notebook：Settings → Accelerator = GPU T4 x2，Internet = On）：
   1. 新建一个 Code Cell，把本文件【全部内容】粘贴进去，点运行。
@@ -27,7 +27,7 @@
 不是摄像头式的图像，也不能解算角度；合成带宽上限约 80MHz → 路径长度分辨率 c/B ≈ 3.9m（等效单站距离 R=L/2，分辨率 c/2B ≈ 2m）；MUSIC 超分辨可略好。
 """
 import os, sys, time, json, re, math, struct, threading, subprocess, shutil, collections, traceback, platform, logging, gzip, base64, html as _html
-VERSION = "9.0"
+VERSION = "10.0"
 
 def _ensure(pkg, mod=None):
     try:
@@ -4115,6 +4115,14 @@ class Core:
             lerr = info.get("lerr", "")
             if lerr and lerr != nd.info.get("lerr", "") and lerr != "0":
                 self.ev("warn", f"Node {name} 上报：上一次上传失败 → {lerr}（-1=连不上/DNS，-11=超时，-5=连接丢失，-2=发送失败）· 当前使用网址 {info.get('url','?')}")
+            if (nd.boot is None or nd.boot != boot) and info.get("rst"):
+                rr = info.get("rst", "")
+                hint = ""
+                if "BROWNOUT" in rr:
+                    hint = " → 欠压：换短而粗的 USB 线 / 充电头 / 带电源的 USB 集线器，不要两块板同时挂在笔记本一个口上；config.h 里 TX_POWER_DBM 再降低一点"
+                elif "PANIC" in rr or "wdt" in rr.lower():
+                    hint = " → 固件崩溃/看门狗：把串口日志里 Guru Meditation / Backtrace 那几行贴回来"
+                self.ev("info" if rr in ("poweron", "ext", "software") else "warn", f"Node {name} 本次启动 · 上次复位原因 {rr} · 复位前阶段 {info.get('last', '?')}{hint}")
             nd.boot = boot
             nd.online = True
             nd.last = time.time()
@@ -4450,7 +4458,8 @@ class Core:
                     age = now - nd.last
                     st = "ok" if age < 20 else ("warn" if age < 45 else "fail")
                     inf = nd.info
-                    add("node" + k, f"Node {k}", st, f"{'在线' if nd.online else '离线'} · {age:.0f}s 前 · 固件 {inf.get('fw','?')} · IP {inf.get('ip','?')} · 路由器信道 {inf.get('ch','?')} · RSSI {inf.get('rssi','?')} · 上传 {nd.uploads} 次 / {nd.recs} 条 · 缓冲丢弃 {nd.dropped} · 重启 {nd.boots}")
+                    add("node" + k, f"Node {k}", st, f"{'在线' if nd.online else '离线'} · {age:.0f}s 前 · 固件 {inf.get('fw','?')} · IP {inf.get('ip','?')} · 路由器信道 {inf.get('ch','?')} · RSSI {inf.get('rssi','?')} · 上传 {nd.uploads} 次 / {nd.recs} 条 · 缓冲丢弃 {nd.dropped} · 重启 {nd.boots}" + (f" · 复位原因 {inf.get('rst')}/{inf.get('last')}" if inf.get("rst") else "") + (f" · 链路 {inf.get('lnk')}" if inf.get("lnk") else "") + (f" · 发射 {inf.get('pwr')}dBm" if inf.get("pwr") else ""))
+            self._diag_link(add)
             L = self.last
             if not L:
                 if self.nodes["A"].recs == 0 and self.nodes["B"].recs == 0:
@@ -4474,6 +4483,47 @@ class Core:
             add("errors", "错误计数", "ok" if tot_err == 0 else "warn", f"{dict(self.errors)} · 最近错误：{self.last_error or '无'}")
             add("raw", "原始数据落盘", "ok" if self.raw.ok else "info", f"{self.raw.bytes/2**20:.1f} MB 已写入 {RAW_DIR}（上限 {RAW_MAX_GB} GB）" if self.raw.ok else "未启用")
             return {"ok": True, "now": now, "items": items, "events": list(self.events)[-120:], "client": list(self.client_logs)[-3:]}
+
+    @staticmethod
+    def _parse_lnk(txt):
+        """A 上报的 lnk=sync:3/5,probe:100,reply:80,csi:78,data:70,stat:12,txerr:0 → dict"""
+        d = {}
+        for kv in (txt or "").split(","):
+            if ":" in kv:
+                a, b = kv.split(":", 1)
+                d[a.strip()] = b.strip()
+        return d
+
+    def _diag_link(self, add):
+        """ESP-NOW 链路分层诊断（v10 固件上报）：一眼看出是 B 没应答 / 没回复 / CSI 没触发 / B 的数据没回到 A。"""
+        A, B = self.nodes["A"], self.nodes["B"]
+        if A.last == 0 or not A.info.get("lnk"):
+            if A.last and not A.info.get("lnk"):
+                add("link", "ESP-NOW 链路", "warn", f"Node A 固件 {A.info.get('fw', '?')} 没有上报链路计数 → 请把 Node A / Node B 都升级到 v10 固件（复制代码界面 ③）")
+            return
+        k = self._parse_lnk(A.info.get("lnk"))
+        try:
+            so, st = [int(x) for x in k.get("sync", "0/0").split("/")]
+            probe, reply, csi, data, stat = (int(k.get(x, 0)) for x in ("probe", "reply", "csi", "data", "stat"))
+            txerr = int(k.get("txerr", 0))
+            seen, kept = int(A.info.get("seen", 0)), int(A.info.get("kept", 0))
+        except Exception:
+            add("link", "ESP-NOW 链路", "info", f"A 上报 {A.info.get('lnk')}")
+            return
+        base = f"A 侧：同步成功 {so}/{st} 个窗口 · 探测 {probe} · 回复 {reply} · 配对 CSI {csi} · 收到 B 的数据帧 {data} · 收到 B 状态 {stat} · 发送错误 {txerr} · CSI 回调 {kept}/{seen}"
+        if st > 0 and so == 0 and stat == 0:
+            add("link", "ESP-NOW 链路", "fail", base + " → 【第 1 层不通】B 从未应答 A 的 SYNC：①B 没上电或没烧 v10 的 B 工程 ②两块板 config.h 的 PAIR_MAGIC 不同 ③板子距离 >3 米或被金属挡住 ④B 复位循环（看 Node B 的『复位原因』）")
+        elif so > 0 and probe > 0 and reply == 0:
+            add("link", "ESP-NOW 链路", "fail", base + " → 【第 2 层不通】A 发出探测包，B 没有回复：B 没有跟上换台。把两块板放近（<1 米）、远离路由器/手机再试；串口看 B 的 [stat] 收到探测 是否为 0")
+        elif reply > 0 and csi == 0:
+            add("link", "ESP-NOW 链路", "fail", base + " → 【第 3 层不通】收到回复但 A 的 CSI 回调没有对应数据：CSI 没触发（看 A 串口 [csi] 是否 ✅；固件/核心版本是否一致；CSI回调 kept=0 说明 WiFi 驱动没打开 CSI）")
+        elif reply > 0 and data == 0:
+            add("link", "ESP-NOW 链路", "warn", base + " → 【第 4 层】A 有数据，但 B 的 CSI 数据帧(T_DATA)没回到 A：B 的 CSI 没触发（看 B 串口 [stat] 的『CSI 回调』）或 B→A 单播失败")
+        elif so > 0 and reply > 0:
+            ratio = 100.0 * csi / max(probe, 1)
+            add("link", "ESP-NOW 链路", "ok" if ratio > 60 and data > 0 else "warn", base + f" → 双向配对成功率 {ratio:.0f}%")
+        else:
+            add("link", "ESP-NOW 链路", "info", base)
 
     def hz_text(self):
         h = getattr(self, "hz_hist", None)
