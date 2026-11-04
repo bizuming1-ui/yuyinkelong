@@ -7,7 +7,7 @@ const abs = (rel: string) => path.join(/*turbopackIgnore: true*/ process.cwd(), 
 const ROOT_FILES = ["README.md", "package.json", "next.config.ts", "tsconfig.json", "postcss.config.mjs", "eslint.config.mjs", ".gitignore"];
 const DIRS = ["firmware", "kaggle", "tools", "src"];
 const SKIP_DIR = new Set(["node_modules", ".next", ".pio", ".git", ".vscode", "__pycache__", "db"]);
-const TEXT_EXT = new Set([".ts", ".tsx", ".js", ".mjs", ".json", ".css", ".md", ".py", ".ini", ".h", ".cpp", ".txt"]);
+const TEXT_EXT = new Set([".ts", ".tsx", ".js", ".mjs", ".json", ".css", ".md", ".py", ".ini", ".h", ".cpp", ".txt", ".ps1", ".bat"]);
 const SKIP_FILE = new Set(["next-env.d.ts"]);
 
 async function walk(dir: string, out: string[]) {
@@ -48,5 +48,6 @@ export async function GET() {
     kaggle: "kaggle/csi_radar_kaggle.py",
     pioA: pioNames.map((n) => `firmware/node_a/${n}`),
     pioB: pioNames.map((n) => `firmware/node_b/${n}`),
+    fix: ["firmware/tools/fix_platformio.ps1", "firmware/tools/fix_platformio.bat"],
   });
 }
