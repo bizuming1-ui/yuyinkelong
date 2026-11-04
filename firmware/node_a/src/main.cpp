@@ -109,6 +109,7 @@ static bool syncWithB(uint32_t timeoutMs) {
 void setup() {
   serialBegin();
   delay(300);
+  led(30, 30, 30);
   rlog("==== ESP32-S3 CSI Radar  Node A (发起端)  fw %s ====", FW_VERSION);
   rlog("信道计划: %d 个信道, 每信道 %d ms, 每信道 %d 次双向交换", NPLAN, DWELL_MS, EXCHANGES_PER_CH);
   if (!recsInit()) rlog("❌ 内存不足");
@@ -119,12 +120,14 @@ void setup() {
 void loop() {
   homeUpload(0, &gHomeCh);
   radioSweepMode(gHomeCh);
+  led(30, 0, 30);   // 紫：等 Node B
   rlog("[sync] 在信道 %d 等待 Node B …", gHomeCh);
   if (!syncWithB(10000)) {
     gSyncFail++;
     rlog("[sync] ⚠ 10 秒没有收到 Node B 的 ACK（B 没上电 / B 在上传 / 距离太远）");
     return;
   }
+  led(0, 30, 30);   // 青：扫描中
   rlog("[sync] ✅ Node B 已就绪 (rssi 良好)，开始扫描");
   delay(15);
   uint32_t t0 = millis();
