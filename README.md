@@ -9,6 +9,16 @@ Kaggle：Flask + 内嵌网站 + 多隧道(cloudflared/pinggy/localhost.run) → 
 输出框：绿色按钮「🚀 打开 WiFi 成像系统」→ 整个 3D 网站（同源，自动连接，无需粘贴网址）
 ```
 
+### v9.1.1 —— 修复「编译报错路径在 .platformio\packages\framework-arduinoespressif32 里」（本次更新）
+
+| 问题（根因，沙盒已复现） | 修复 |
+| --- | --- |
+| 报错文件是 `...\.platformio\packages\framework-arduinoespressif32\libraries\WiFiClientSecure\src\WiFiClientSecure.h:303`，几百行 `'WiFiClientSecure' was not declared`，`HTTPClient.cpp`、`WiFiClientSecure.cpp` 连带失败。**这不是固件语法错误**：框架里的 `WiFiClientSecure.h` 被覆盖成了 `radar_common.h` 的内容（`postRecs` / `KAGGLE_URL` / `RADAR_TOPIC` 都是我们的代码）。常见原因：Ctrl+点击 `#include <WiFiClientSecure.h>` 跳进框架头文件后把代码粘贴进去了 | 新增 `firmware/tools/fix_platformio.ps1` + `fix_platformio.bat`：扫描框架里含本项目代码的文件，删除被污染的框架缓存，下次 Build 自动重新下载干净版本。也可手动：关闭 VSCode → 删除 `%USERPROFILE%\.platformio\packages\framework-arduinoespressif32` → 重新 Build |
+| 以后再被污染时看不出原因 | `radar_common.h` 增加自检：被二次加载时第一条编译错误就是中文 `#error` 提示（含修复方法）；`platformio.ini` 顶部增加排查第 0 条；复制代码界面 ③ 最上方新增红色修复卡片（命令一键复制） |
+| 预防 | VSCode 设置 `files.readonlyInclude` 添加 `**/.platformio/packages/**`，框架文件变只读 |
+
+沙盒实测（PlatformIO 6.2 + espressif32@6.9.0 / Arduino 2.0.17）：把 `radar_common.h` 覆盖进 `WiFiClientSecure.h` 后得到与你日志一致的报错 → 运行修复脚本（识别出被污染文件并删除框架）→ 重新 Build 成功（RAM 15.2% / Flash 26.2%）；连续 3 轮（含 HTTPClient.h 被污染、`esp32s3_core3`、`esp32s3_uart`、`esp32s3_n16r8`）全部通过。协议、Kaggle 主机端、`web/` 均未改动。
+
 ### v9.1 —— 修复 VSCode / PlatformIO 编译失败（本次更新）
 
 | 问题（根因） | 修复 |
