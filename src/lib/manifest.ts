@@ -16,7 +16,7 @@ const FILES = ["package.json", "tsconfig.json", "next.config.ts", "postcss.confi
 const SKIP = [/^src\/app\/api\/health\//, /(^|\/)node_modules\//, /(^|\/)\.pio\//, /(^|\/)\.next\//, /\.(png|jpg|ico|bin|elf)$/i];
 
 function walk(rel: string, out: string[]) {
-  const abs = path.join(ROOT, rel);
+  const abs = path.join(/*turbopackIgnore: true*/ ROOT, rel);
   let ents: fs.Dirent[] = [];
   try {
     ents = fs.readdirSync(abs, { withFileTypes: true });
@@ -42,11 +42,11 @@ function groupOf(p: string): CodeFile["group"] {
 export function loadFiles(): CodeFile[] {
   const list: string[] = [];
   for (const d of DIRS) walk(d, list);
-  for (const f of FILES) if (fs.existsSync(path.join(ROOT, f))) list.push(f);
+  for (const f of FILES) if (fs.existsSync(path.join(/*turbopackIgnore: true*/ ROOT, f))) list.push(f);
   const out: CodeFile[] = [];
   for (const p of Array.from(new Set(list)).sort()) {
     try {
-      const abs = path.join(ROOT, p);
+      const abs = path.join(/*turbopackIgnore: true*/ ROOT, p);
       const st = fs.statSync(abs);
       if (st.size > 600_000) continue;
       const content = fs.readFileSync(abs, "utf8").replace(/\r\n/g, "\n");
