@@ -15,7 +15,7 @@ ESP32-1 ◀══ ESP-NOW(HT MCS0 帧，每帧产生硬件 CSI) ══▶ ESP32-
 
 | 路径 | 说明 |
 | --- | --- |
-| `firmware/esp32-1/`、`firmware/esp32-2/` | 两块板子的 PlatformIO 工程，各 3 个文件：`platformio.ini`、`include/config.h`、`src/main.cpp`（只有 `NODE_ID` 不同） |
+| `firmware/esp32-1/`、`firmware/esp32-2/` | 两块板子的 PlatformIO 工程，各 4 个文件：`platformio.ini`、`upload_retry.py`（烧录防掉线）、`include/config.h`、`src/main.cpp`（只有 `NODE_ID` 不同） |
 | `src/app/page.tsx`、`src/components/RadarApp.tsx` | 3D 模拟器主界面（右上角「🔌 连接 ESP32」「🩺 检测日志」「📋 复制代码」） |
 | `src/components/Scene3D.tsx` | Three.js 场景：左键旋转 / 右键平移 / 滚轮缩放 |
 | `src/lib/dsp.ts` | 信号处理：相位去偏、信道链式对齐、IDFT 剖面、CLEAN、运动/呼吸检测 |
@@ -26,22 +26,21 @@ ESP32-1 ◀══ ESP-NOW(HT MCS0 帧，每帧产生硬件 CSI) ══▶ ESP32-
 ## 使用（4 步）
 
 1. **打开模拟器**网址（浏览器直接打开，无需安装）。右上角「📋 复制代码」或第二行「进入复制代码界面」。
-2. **烧录 ESP32-1**：复制界面 → 「PlatformIO · ESP32-1」→ 3 个文件逐个复制覆盖到 PlatformIO 工程 → 填 WiFi（页面里填，自动写进复制出来的 config.h）→ 环境 `n16r8` → Upload。
+2. **烧录 ESP32-1**：复制界面 → 「PlatformIO · ESP32-1」→ 4 个文件逐个复制覆盖到 PlatformIO 工程 → 填 WiFi（页面里填，自动写进复制出来的 config.h）→ 环境 `n16r8` → Upload。
 3. **烧录 ESP32-2**：同上，用「PlatformIO · ESP32-2」。
 4. 两块板子供电后，回到模拟器点「🔌 连接 ESP32」（页面打开时会自动连接）。看到 ESP32-1/2 变绿即可。
 
 > 想先看效果：左侧「▶ 启动演示数据」。命令行仿真：`npx tsx tools/sim_esp32.ts`。
 
-## 烧录报错：`Cannot configure port … OSError(22, '指定不存在的设备')` / `Please specify upload_port`
+## 你遇到的上传错误：`Cannot configure port … OSError(22, '指定不存在的设备')`
 
-含义：烧录写到约 60% 时，Windows 上这个 COM 口**突然消失**（USB 掉线 / 重新枚举），esptool 再配置串口就失败；随后第二个报错只是因为板子此时没有 COM 口。**不是代码错误**——固件已用 PlatformIO 在本地对 5 个环境全部编译通过（RAM 14.5%，Flash 10.9%）。
+含义：烧录写到 50% 时，Windows 上这个 COM 口**突然消失**（USB 设备掉线 / 重新枚举），esptool 再去配置串口就失败。这不是代码错误。本版本做了这些处理：
 
-v2.1 的处理（已逐项验证 esptool 参数能被正确解析）：
-
-1. 默认烧录速度 115200；新增 `n16r8_safe`（`--no-stub`：用芯片 ROM 下载器，不上传 stub、不切换波特率，避开 Windows 重配串口的那一步）、`n16r8_slow`（57600 + 15 次连接重试）、`n16r8_fast`（460800）、`n16r8_nopsram`。失败就按 `n16r8` → `n16r8_safe` → `n16r8_slow` 依次换。
-2. 固件 `ARDUINO_USB_CDC_ON_BOOT=1`：原生 USB 口运行时也是 COM 口，以后每次 Upload 都能自动识别端口；日志同时输出到 USB 口和 UART 口。
-3. 硬件侧（最关键）：用标 UART/COM 的口；换短的**数据线**；直插主板后置 USB-A，不要 HUB / Type-C 转接；关闭串口监视器；不行就**按住 BOOT → 点 RST → 松开 BOOT** 后把新出现的 COM 口写到 `platformio.ini` 的 `upload_port`。
-4. Windows 设备管理器 → USB 根集线器 → 电源管理，取消「允许计算机关闭此设备以节约电源」；CH340/CH343 驱动太新时回退旧版。
+1. 日志里板型是 `ESP32-S3-DevKitC-1-N8 (8MB QD, No PSRAM)`，说明 PSRAM 与 16MB Flash 没按 N16R8 配置。`platformio.ini` 已改为 `qio_opi` + `default_16MB.csv` + `board_upload.flash_size = 16MB`。
+2. 固件 `ARDUINO_USB_CDC_ON_BOOT=0`：应用程序不再接管原生 USB，减少 USB 重新枚举。
+3. **新增 `upload_retry.py`（`extra_scripts = post:upload_retry.py`）**：烧录失败后自动等待 COM 口重新出现（最长 30 秒），依次用 配置速度 → 115200 → ROM 直写(`--no-stub`) 重试，最多 4 次，无需再手动点 Upload，也不会再出现 “Please specify upload_port”。已用真实 PlatformIO + 假 esptool 验证重试流程。仍失败选 `n16r8_slow`（115200）。
+4. 硬件侧（最关键）：用标 **UART/COM** 的口；换短的**数据线**（很多线只能充电或接触差）；直插主板 USB，不要 HUB；关闭串口监视器/串口助手；不行就**按住 BOOT → 点 RST → 松开 BOOT**，再点 Upload。
+5. Windows 设备管理器 → 该 USB 设备属性 → 电源管理，取消「允许计算机关闭此设备以节约电源」。
 
 ## MQTT
 
