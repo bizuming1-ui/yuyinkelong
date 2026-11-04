@@ -1,4 +1,4 @@
-import { authInfo, cors, evt, evtRate, ingestFrame } from "@/lib/radar-store";
+import { authInfo, cors, evt, evtRate, ingestBinaryRc, ingestFrame } from "@/lib/radar-store";
 
 export const dynamic = "force-dynamic";
 
@@ -8,22 +8,30 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   const a = authInfo(req);
-  const src = a.same ? "网页USB转发" : "ESP32 WiFi直传";
+  const src = a.same ? "网页转发" : "ESP32 WiFi直传";
   if (!a.ok) {
-    evtRate("badkey", 5, "ERR", "ingest", `拒绝 ${a.ip} 的上传：API_KEY 不一致（收到 ${JSON.stringify(a.key)}）。请把 config.h 的 API_KEY 改成与服务器一致（默认 radar-key）`);
-    return Response.json({ ok: false, error: "bad key" }, { status: 401, headers: cors() });
+    evtRate("badkey", 5, "ERR", "ingest", `拒绝 ${a.ip} 上传：API_KEY 不一致`);
+    return Response.json({ ok: false, err: "key" }, { status: 401, headers: cors() });
   }
+
+  const ab = await req.arrayBuffer();
+  const u8 = new Uint8Array(ab);
+  // 支持二进制 'RC' 协议 (v11 ESP32 固件与 sim_esp32_csi.py)
+  if (u8.byteLength >= 16 && u8[0] === 0x52 && u8[1] === 0x43) {
+    const res = ingestBinaryRc(u8, req.headers.get("x-radar-info") || "", a.ip);
+    return Response.json({ ok: res.ok, why: res.why, seq: res.seq }, { status: res.ok ? 200 : 400, headers: cors() });
+  }
+
+  // 兼容 JSON 格式
   let f: unknown = null;
-  let raw = "";
   try {
-    raw = await req.text();
+    const raw = new TextDecoder().decode(u8);
     f = JSON.parse(raw);
   } catch {
     f = null;
   }
   if (!f || typeof f !== "object" || !Array.isArray((f as { aps?: unknown }).aps)) {
-    evtRate("badframe", 5, "ERR", "ingest", `收到格式错误的数据（${src}，${raw.length} 字节）：缺少 aps 数组`);
-    return Response.json({ ok: false, error: "bad frame" }, { status: 400, headers: cors() });
+    return Response.json({ ok: false, why: "bad_frame" }, { status: 400, headers: cors() });
   }
   const seq = ingestFrame(f as { aps: unknown[] }, a.ip, src);
   if (seq === 1) evt("OK", "ingest", `首次收到 ${src}：${a.ip}`);
