@@ -5,7 +5,7 @@ import { copyText } from "./DiagPanel";
 import { GH_REPO, KEY_KEY, URL_KEY, normUrl } from "@/lib/radar";
 
 type F = { path: string; content: string; lines: number; bytes: number };
-type Bundle = { files: F[]; kaggle: string; pioA: string[]; pioB: string[] };
+type Bundle = { files: F[]; kaggle: string; pioA: string[]; pioB: string[]; fix?: string[] };
 type Sync = "checking" | "same" | "diff" | "missing" | "unknown";
 type Tab = "github" | "kaggle" | "pio";
 
@@ -25,6 +25,16 @@ const LEGACY = [
   "src/app/api/bundle/route.ts",
   "tools/test_llm_mock.py",
   "tools/test_csi_server.py",
+];
+const PS_CMDS: [string, string][] = [
+  [
+    "① 只检查（不删除）：列出被污染的框架文件",
+    'Get-ChildItem "$env:USERPROFILE\\.platformio\\packages\\framework-arduinoespressif32\\libraries" -Recurse -File | Select-String -Pattern "postRecs|KAGGLE_URL|RADAR_TOPIC" -List | Select-Object -ExpandProperty Path',
+  ],
+  [
+    "② 修复：删除被污染的框架缓存（下次 Build 自动重新下载）",
+    'Remove-Item -Recurse -Force "$env:USERPROFILE\\.platformio\\packages\\framework-arduinoespressif32"',
+  ],
 ];
 const kb = (n: number) => (n > 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`);
 
@@ -171,6 +181,7 @@ export default function CodeBrowser() {
   const groups: [string, F[]][] = [
     ["firmware/node_a — Node A 发起端", ghFiles.filter((f) => f.path.startsWith("firmware/node_a/"))],
     ["firmware/node_b — Node B 响应端", ghFiles.filter((f) => f.path.startsWith("firmware/node_b/"))],
+    ["firmware/tools — PlatformIO 框架损坏一键修复", ghFiles.filter((f) => f.path.startsWith("firmware/tools/"))],
     ["kaggle — 主机端单文件", ghFiles.filter((f) => f.path.startsWith("kaggle/"))],
     ["tools — 无硬件仿真/验证", ghFiles.filter((f) => f.path.startsWith("tools/"))],
     ["src — 浏览器模拟器 / 3D 网页", ghFiles.filter((f) => f.path.startsWith("src/"))],
@@ -195,6 +206,29 @@ export default function CodeBrowser() {
 
         {bundle && tab === "pio" && (
           <>
+            <div className="rounded-2xl border border-rose-400/50 bg-[#1a0d12] p-5 text-[14px] leading-relaxed text-slate-200">
+              <h3 className="text-base font-bold text-rose-300">🚨 编译报错一大堆，而且文件路径是 …\.platformio\packages\framework-arduinoespressif32\libraries\WiFiClientSecure\src\WiFiClientSecure.h ？</h3>
+              <p className="mt-2"><b>根因（已在沙盒复现）</b>：这不是固件代码的问题。报错路径在 PlatformIO 的<b>框架缓存</b>里，说明框架里的 <code>WiFiClientSecure.h</code> 被覆盖成了我们的代码（<code>postRecs</code>、<code>KAGGLE_URL</code>、<code>RADAR_TOPIC</code> 就是 radar_common.h 里的内容），于是 WiFiClientSecure.cpp / HTTPClient.cpp 全部连带报 <code>&apos;WiFiClientSecure&apos; was not declared</code>。最常见的原因：在 VSCode 里按住 Ctrl 点了 <code>#include &lt;WiFiClientSecure.h&gt;</code> 跳进了框架头文件，随后把 radar_common.h 粘贴进了那个标签页。</p>
+              <ol className="mt-2 list-decimal space-y-1 pl-5">
+                <li><b>关闭 VSCode</b>（避免文件占用）。</li>
+                <li>打开 Windows PowerShell，粘贴下面<b>第一条</b>命令，看有没有「POLLUTED」（只检查不删除）；再粘贴<b>第二条</b>删除被污染的框架缓存（它只是下载缓存，删除后下次 Build 自动重新下载干净版本，需联网）。</li>
+                <li>重新打开 VSCode，<b>只打开 node_a（或 node_b）文件夹</b> → PlatformIO Build。首次会重新下载框架，等它完成。</li>
+                <li>防止再次发生：VSCode 设置里搜索 <code>files.readonlyInclude</code>，添加 <code>**/.platformio/packages/**</code> = true（框架文件变只读）；以后不要点进 #include 的框架头文件去粘贴。</li>
+              </ol>
+              <div className="mt-3 space-y-2">
+                {PS_CMDS.map(([label, cmd]) => (
+                  <div key={label} className="rounded-lg border border-white/10 bg-[#0b0508] p-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[13px] font-semibold text-rose-200">{label}</span>
+                      <button onClick={async () => flash((await copyText(cmd)) ? "已复制命令：粘贴到 PowerShell 回车" : "复制失败")} className="ml-auto rounded-lg bg-rose-300 px-3 py-1 text-[13px] font-bold text-slate-900 hover:bg-rose-200">📋 复制命令</button>
+                    </div>
+                    <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[12px] text-slate-300">{cmd}</pre>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-3 text-[13px] text-slate-300">不想手敲命令？把下面两个文件保存到同一个文件夹，<b>双击 fix_platformio.bat</b>：自动扫描全部框架文件、列出被污染的文件并删除受污染的框架缓存。固件 v9.1.1 也加了自检：如果以后再次发生，编译日志<b>第一条</b>就是中文 <code>#error</code> 提示，而不是几百行乱报错。</p>
+              <div className="mt-3 space-y-3">{(bundle.fix ?? []).map((p) => renderCard(p, false, false))}</div>
+            </div>
             <div className="rounded-2xl border border-cyan-400/20 bg-[#0a121f] p-5">
               <h2 className="text-xl font-bold text-cyan-300">PlatformIO（VSCode）代码：两块 ESP32 各 4 个文件</h2>
               <ol className="mt-3 list-decimal space-y-1.5 pl-5 text-[15px] leading-relaxed text-slate-200">
