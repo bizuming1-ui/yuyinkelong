@@ -6,6 +6,16 @@
 //  两端本振/PLL 的随机相位互相抵消（Chronos 思路），再用相邻信道重叠子载波做相位拼接。
 //  CSI 只取 L-LTF（64 子载波，128 字节 int8：每子载波 [imag, real]）。
 // ============================================================================
+// ---- 自检：如果下面这行 #error 在编译时出现，说明 PlatformIO 的框架文件被误粘贴成了本文件的内容 ----
+// 典型现象：报错路径指向 ...\.platformio\packages\framework-arduinoespressif32\libraries\...\WiFiClientSecure.h 等框架文件，
+//           且几百行 "'WiFiClientSecure' was not declared in this scope"。这不是代码问题，是框架被污染。
+// 修复：删除文件夹 %USERPROFILE%\.platformio\packages\framework-arduinoespressif32 后重新 Build（会自动重新下载），
+//       或运行 firmware/tools/fix_platformio.ps1；详见复制代码界面 ③ 最上方红色卡片。
+#ifdef RADAR_COMMON_LOADED
+#error "radar_common.h 被第二次加载：PlatformIO 框架文件（如 WiFiClientSecure.h）被误粘贴成了本文件内容。请删除 %USERPROFILE%/.platformio/packages/framework-arduinoespressif32 后重新 Build，并且不要点进 #include <...> 的框架头文件去粘贴代码。"
+#endif
+#define RADAR_COMMON_LOADED 1
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -17,7 +27,7 @@
 #include <stdarg.h>
 #include "config.h"
 
-#define FW_VERSION "9.1.0"
+#define FW_VERSION "9.1.1"
 #ifndef PAIR_MAGIC
 #define PAIR_MAGIC 0xC5   // 同一空间有多套雷达时，给每套改成不同的数（Node A/B 必须一致）
 #endif
