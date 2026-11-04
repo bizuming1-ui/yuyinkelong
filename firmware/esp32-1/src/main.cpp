@@ -1,5 +1,5 @@
 // ============================================================================
-//  ESP32-S3 N16R8 · 双节点 WiFi CSI 雷达固件 v2.0（ESP32-1 / ESP32-2 共用同一份代码）
+//  ESP32-S3 N16R8 · 双节点 WiFi CSI 雷达固件 v2.1（ESP32-1 / ESP32-2 共用同一份代码）
 //
 //  数据流（全程无线，不需要 USB 连电脑）：
 //    ESP32-1 <== ESP-NOW(HT MCS0 帧，每帧触发硬件 CSI) ==> ESP32-2
@@ -22,8 +22,24 @@
 #include <esp_task_wdt.h>
 #include "config.h"
 
+
+// ---------------------------------------------------------------- 日志：USB(原生口) 与 UART 口同时输出
+// ARDUINO_USB_CDC_ON_BOOT=1 时 Serial = 原生 USB 口，Serial0 = UART 口（CH343/CP210x）；两个口都能看到日志。
+// Serial.setTxTimeoutMs(0)：没有电脑打开串口监视器时也绝不阻塞主循环（否则会影响 MQTT/CSI 实时性）。
+#if ARDUINO_USB_CDC_ON_BOOT
+static void logOut(const char* s) { Serial.print(s); Serial0.print(s); }
+static void logf_both(const char* fmt, ...) {
+  char b[384]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap); logOut(b);
+}
+#define LOGF logf_both
+#define LOGLN(s) do { logOut(s); logOut("\n"); } while (0)
+#else
+#define LOGF Serial.printf
+#define LOGLN(s) Serial.println(s)
+#endif
+
 // ---------------------------------------------------------------- 常量与数据结构
-#define FW_VERSION      "2.0"
+#define FW_VERSION      "2.1"
 #define PKT_MAGIC       0xB7
 #define PKT_PROBE       1
 #define PKT_SWEEP       2
@@ -182,7 +198,7 @@ static bool initNow() {
   if (esp_now_add_peer(&peer) != ESP_OK) return false;
   // 关键：ESP-NOW 默认 1Mbps 的 11b 帧没有 OFDM 训练序列，不会产生 CSI；改成 HT MCS0 才有 L-LTF
   esp_err_t e = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_MCS0_LGI);
-  if (e != ESP_OK) Serial.printf("[NOW] 设置速率失败 %d\n", (int)e);
+  if (e != ESP_OK) LOGF("[NOW] 设置速率失败 %d\n", (int)e);
   return true;
 }
 
@@ -268,7 +284,7 @@ static void onWiFiEvent(WiFiEvent_t ev) {
       if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) memcpy(apBssid, ap.bssid, 6);
       wifiUp = true;
       wifiSince = millis();
-      Serial.printf("[WiFi] 已连接 %s 信道=%u IP=%s\n", WiFi.SSID().c_str(), homeCh, WiFi.localIP().toString().c_str());
+      LOGF("[WiFi] 已连接 %s 信道=%u IP=%s\n", WiFi.SSID().c_str(), homeCh, WiFi.localIP().toString().c_str());
       break;
     }
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -281,7 +297,7 @@ static void onWiFiEvent(WiFiEvent_t ev) {
 static void wifiBegin() {
   const char* ssid = WIFI_SSID; const char* pass = WIFI_PASS;
   if (wifiSlot == 1 && strlen(WIFI2_SSID) > 0) { ssid = WIFI2_SSID; pass = WIFI2_PASS; }
-  Serial.printf("[WiFi] 连接 %s ...\n", ssid);
+  LOGF("[WiFi] 连接 %s ...\n", ssid);
   WiFi.disconnect(false, false);
   WiFi.begin(ssid, pass);
   wifiTryAt = millis();
@@ -327,17 +343,17 @@ static void mqttMaintain() {
   if (now < mqttRetryAt) return;
   const Broker& b = BROKERS[brokerIdx];
   mqtt.setServer(b.host, b.port);
-  Serial.printf("[MQTT] 连接 %s:%u ...\n", b.host, b.port);
+  LOGF("[MQTT] 连接 %s:%u ...\n", b.host, b.port);
   led(255, 160, 0);
   esp_task_wdt_reset();
   if (mqtt.connect(clientId, nullptr, nullptr, topicStatus, 0, true, willMsg, true)) {
-    Serial.printf("[MQTT] 已连接 %s\n", b.host);
+    LOGF("[MQTT] 已连接 %s\n", b.host);
     mqtt.subscribe(topicCmd, 0);
     mqttBackoff = 1000;
     publishStatus();
     lastStatusMs = millis();
   } else {
-    Serial.printf("[MQTT] 失败 rc=%d，换下一个服务器\n", mqtt.state());
+    LOGF("[MQTT] 失败 rc=%d，换下一个服务器\n", mqtt.state());
     brokerIdx = (brokerIdx + 1) % MQTT_BROKER_COUNT;
     mqttRetryAt = millis() + mqttBackoff;
     mqttBackoff = mqttBackoff < 5000 ? mqttBackoff * 2 : 5000;
@@ -378,16 +394,20 @@ static void drainAndPublish() {
 // ---------------------------------------------------------------- setup / loop
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.setTxTimeoutMs(0);
+  Serial0.begin(115200);
+#endif
   delay(200);
-  Serial.printf("\n=== ESP32-S3 CSI 雷达 v%s · 节点 ESP32-%d ===\n", FW_VERSION, NODE_ID);
+  LOGF("\n=== ESP32-S3 CSI 雷达 v%s · 节点 ESP32-%d ===\n", FW_VERSION, NODE_ID);
 
   esp_task_wdt_init(WDT_TIMEOUT_S, true);
   esp_task_wdt_add(NULL);
 
   ring = (CsiRec*)ps_malloc(sizeof(CsiRec) * RING_N);
   if (!ring) ring = (CsiRec*)malloc(sizeof(CsiRec) * RING_N);
-  if (!ring) { Serial.println("内存不足，重启"); delay(500); ESP.restart(); }
-  Serial.printf("[MEM] 环形缓冲 %u 字节 (%s) 空闲堆=%u PSRAM=%u\n", (unsigned)(sizeof(CsiRec) * RING_N),
+  if (!ring) { LOGLN("内存不足，重启"); delay(500); ESP.restart(); }
+  LOGF("[MEM] 环形缓冲 %u 字节 (%s) 空闲堆=%u PSRAM=%u\n", (unsigned)(sizeof(CsiRec) * RING_N),
                 psramFound() ? "PSRAM" : "内部RAM", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
 
   uint64_t mac = ESP.getEfuseMac();
@@ -408,7 +428,7 @@ void setup() {
   esp_wifi_set_max_tx_power(TX_POWER_QDBM);
   WiFi.setHostname(NODE_ID == 1 ? "esp32-csi-1" : "esp32-csi-2");
 
-  if (!initNow()) Serial.println("[NOW] ESP-NOW 初始化失败！");
+  if (!initNow()) LOGLN("[NOW] ESP-NOW 初始化失败！");
 
   wifi_csi_config_t cfg = {};
   cfg.lltf_en = true;
@@ -422,7 +442,7 @@ void setup() {
   esp_err_t e2 = esp_wifi_set_csi_rx_cb(csiCb, nullptr);
   esp_err_t e3 = esp_wifi_set_csi(true);
   csiOk = (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK);
-  Serial.printf("[CSI] 配置=%d 回调=%d 使能=%d %s\n", (int)e1, (int)e2, (int)e3, csiOk ? "OK" : "失败(固件库未开启CSI?)");
+  LOGF("[CSI] 配置=%d 回调=%d 使能=%d %s\n", (int)e1, (int)e2, (int)e3, csiOk ? "OK" : "失败(固件库未开启CSI?)");
 
   mqtt.setBufferSize(sizeof(txbuf) + 128);
   mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
@@ -462,7 +482,7 @@ void loop() {
 
   if (millis() - lastLogMs > 3000) {
     lastLogMs = millis();
-    Serial.printf("[状态] wifi=%d mqtt=%d ch=%u rssi=%d 对端=%d csi=%lu 发布=%lu 失败=%lu 丢=%lu 扫频=%lu 堆=%u\n",
+    LOGF("[状态] wifi=%d mqtt=%d ch=%u rssi=%d 对端=%d csi=%lu 发布=%lu 失败=%lu 丢=%lu 扫频=%lu 堆=%u\n",
                   (int)wifiUp, (int)mqtt.connected(), homeCh, (int)WiFi.RSSI(), (int)(peerKnown && millis() - peerLastMs < 3000),
                   (unsigned long)statCsi, (unsigned long)statPub, (unsigned long)statPubFail, (unsigned long)statDrop,
                   (unsigned long)statSweeps, (unsigned)ESP.getFreeHeap());
