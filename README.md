@@ -32,15 +32,16 @@ ESP32-1 ◀══ ESP-NOW(HT MCS0 帧，每帧产生硬件 CSI) ══▶ ESP32-
 
 > 想先看效果：左侧「▶ 启动演示数据」。命令行仿真：`npx tsx tools/sim_esp32.ts`。
 
-## 你遇到的上传错误：`Cannot configure port … OSError(22, '指定不存在的设备')`
+## 烧录报错：`Cannot configure port … OSError(22, '指定不存在的设备')` / `Please specify upload_port`
 
-含义：烧录写到 50% 时，Windows 上这个 COM 口**突然消失**（USB 设备掉线 / 重新枚举），esptool 再去配置串口就失败。这不是代码错误。本版本做了这些处理：
+含义：烧录写到约 60% 时，Windows 上这个 COM 口**突然消失**（USB 掉线 / 重新枚举），esptool 再配置串口就失败；随后第二个报错只是因为板子此时没有 COM 口。**不是代码错误**——固件已用 PlatformIO 在本地对 5 个环境全部编译通过（RAM 14.5%，Flash 10.9%）。
 
-1. 日志里板型是 `ESP32-S3-DevKitC-1-N8 (8MB QD, No PSRAM)`，说明 PSRAM 与 16MB Flash 没按 N16R8 配置。`platformio.ini` 已改为 `qio_opi` + `default_16MB.csv` + `board_upload.flash_size = 16MB`。
-2. 固件 `ARDUINO_USB_CDC_ON_BOOT=0`：应用程序不再接管原生 USB，减少 USB 重新枚举。
-3. 烧录速度默认 230400；仍失败选 `n16r8_slow`（115200）。
-4. 硬件侧（最关键）：用标 **UART/COM** 的口；换短的**数据线**（很多线只能充电或接触差）；直插主板 USB，不要 HUB；关闭串口监视器/串口助手；不行就**按住 BOOT → 点 RST → 松开 BOOT**，再点 Upload。
-5. Windows 设备管理器 → 该 USB 设备属性 → 电源管理，取消「允许计算机关闭此设备以节约电源」。
+v2.1 的处理（已逐项验证 esptool 参数能被正确解析）：
+
+1. 默认烧录速度 115200；新增 `n16r8_safe`（`--no-stub`：用芯片 ROM 下载器，不上传 stub、不切换波特率，避开 Windows 重配串口的那一步）、`n16r8_slow`（57600 + 15 次连接重试）、`n16r8_fast`（460800）、`n16r8_nopsram`。失败就按 `n16r8` → `n16r8_safe` → `n16r8_slow` 依次换。
+2. 固件 `ARDUINO_USB_CDC_ON_BOOT=1`：原生 USB 口运行时也是 COM 口，以后每次 Upload 都能自动识别端口；日志同时输出到 USB 口和 UART 口。
+3. 硬件侧（最关键）：用标 UART/COM 的口；换短的**数据线**；直插主板后置 USB-A，不要 HUB / Type-C 转接；关闭串口监视器；不行就**按住 BOOT → 点 RST → 松开 BOOT** 后把新出现的 COM 口写到 `platformio.ini` 的 `upload_port`。
+4. Windows 设备管理器 → USB 根集线器 → 电源管理，取消「允许计算机关闭此设备以节约电源」；CH340/CH343 驱动太新时回退旧版。
 
 ## MQTT
 
