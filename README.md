@@ -9,6 +9,18 @@ Kaggle：Flask + 内嵌网站 + 多隧道(cloudflared/pinggy/localhost.run) → 
 输出框：绿色按钮「🚀 打开 WiFi 成像系统」→ 整个 3D 网站（同源，自动连接，无需粘贴网址）
 ```
 
+### v9.1 —— 修复 VSCode / PlatformIO 编译失败（本次更新）
+
+| 问题（根因） | 修复 |
+| --- | --- |
+| **根因（沙盒复现）**：新版 PlatformIO / pioarduino 使用 Arduino-ESP32 **core 3.x（ESP-IDF 5）**，`esp_now_register_recv_cb` 的回调签名变成 `(const esp_now_recv_info_t*, data, len)`，旧写法报 `invalid conversion from 'void (*)(const uint8_t*, ...)' to 'esp_now_recv_cb_t'`，编译失败 | `radar_common.h` 加入 core 2.x / 3.x 兼容层（`RADAR_CORE3` + 回调适配器）；LED 在 core 3 用 `rgbLedWrite`；去掉 `volatile++`、`esp_wifi_config_espnow_rate` 弃用警告 |
+| 仓库 `firmware/` 根目录还留着旧的单节点工程（platformio.ini + src + include），VSCode 打开 firmware 时会编译到旧工程 | 删除旧工程；复制代码界面里提供“在 GitHub 删除”旧文件按钮 |
+| platformio.ini 含中文注释，个别 Windows 环境读取异常 | 两个 platformio.ini 改为纯 ASCII；新增 `esp32s3_core3` 环境（pioarduino），VSCode 底部切换即可 |
+| 板子只供电、不接电脑时偶发卡死 | 无人值守看门狗：连续上传失败 40 次或堆内存 <16KB 自动重启 |
+| 附近有多套雷达互相干扰 | `config.h` 新增 `PAIR_MAGIC`（配对编号），A/B 必须相同 |
+
+沙盒实测：Node A / Node B × `esp32s3`、`esp32s3_core3`、`esp32s3_uart`、`esp32s3_n16r8` 共 8 个环境，连续 3 轮全部 SUCCESS（RAM 15% / Flash 26~30%）。协议、Kaggle 主机端与 `web/` 未改动，`tools/test_host.py` 3 个随机种子全 PASS。
+
 ### v9 相对 v8 的改动（以及为什么）
 
 | 问题（批判性复盘） | v9 做法 |
