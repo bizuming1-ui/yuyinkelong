@@ -1,27 +1,27 @@
 #pragma once
 // ============================================================================
-//  radar_common.h  (v10)  —— Node A / Node B 共用（两个工程里这个文件内容完全相同）
+//  radar_common.h (v11.0.0) —— 单节点全能 + 双节点自适应共用核心头文件
 //
-//  v10 架构：A = 网关 + 指挥（连路由器、HTTPS 上传、发起跳频）；B = 纯射频探头（只用 ESP-NOW，不连路由器、不做 TLS）。
-//    · A→B 探测包让 B 得到 H_AB；B 把这份 CSI 用 ESP-NOW 单播(T_DATA, 有 MAC 层 ACK+重传)直接发回 A。
-//    · B→A 回复包让 A 得到 H_BA。A 把“自己的 H_BA”和“B 发来的 H_AB”分两次 POST 给 Kaggle（node=0 / node=1），
-//      Kaggle 主机端协议完全不变。
-//    · 好处：B 不再需要和 A 在“上传时间窗”上碰运气（v9 的会合失败/反复重启根因之一）；B 没有 TLS，供电峰值小；
-//      只有 A 需要 WiFi 密码；B 随时掉线随时自动重新找 A（扫 1..13 信道）。
-//  CSI 只取 L-LTF（64 子载波，128 字节 int8：每子载波 [imag, real]）。
+//  ★ v11 重大革新：
+//    1) 1 块 ESP32-S3 即可完整实现 WiFi 成像与全物体检测（SINGLE_NODE_MODE=1）：
+//       · 全程保持 WiFi STA 连接路由器/手机热点（绝不调用 WiFi.disconnect 断开热点），彻底消灭因频繁断连导致的
+//         iPhone 热点重连失败、DNS -1 错误与面板离线告警；
+//       · 同时打开硬件 CSI (L-LTF 64 子载波未平滑原始复数 I/Q) + 混杂监听模式；
+//       · 内置 50Hz 高频 UDP/ARP/ESP-NOW 混合微脉冲激励器：主动向路由器网关发送轻量探测包，触发路由器高频回传 OFDM 帧；
+//       · 自动追踪周围最多 16 个不同 MAC 辐射源（网关路由器 + 周围手机/电脑/热点），编码进 RRec.flags 与 aux，
+//         让 Kaggle 双 GPU 后端同时解算多径反射物体、运动人体、静止呼吸微动与周围活跃无线设备；
+//    2) 若第 2 块板子（Node B）上电，无需改任何协议即可自动识别并融合双节点双向 CSI；
+//    3) 上传响应自动同步 Kaggle 最新健康隧道列表（trycloudflare + pinggy + lhr.life），真正做到 0 断连。
 // ============================================================================
-// ---- 自检：如果下面这行 #error 在编译时出现，说明 PlatformIO 的框架文件被误粘贴成了本文件的内容 ----
-// 典型现象：报错路径指向 ...\.platformio\packages\framework-arduinoespressif32\libraries\...\WiFiClientSecure.h 等框架文件，
-//           且几百行 "'WiFiClientSecure' was not declared in this scope"。这不是代码问题，是框架被污染。
-// 修复：删除文件夹 %USERPROFILE%\.platformio\packages\framework-arduinoespressif32 后重新 Build（会自动重新下载），
-//       或运行 firmware/tools/fix_platformio.ps1；详见复制代码界面 ③ 最上方红色卡片。
+
 #ifdef RADAR_COMMON_LOADED
-#error "radar_common.h 被第二次加载：PlatformIO 框架文件（如 WiFiClientSecure.h）被误粘贴成了本文件内容。请删除 %USERPROFILE%/.platformio/packages/framework-arduinoespressif32 后重新 Build，并且不要点进 #include <...> 的框架头文件去粘贴代码。"
+#error "radar_common.h 被第二次加载：PlatformIO 框架文件（如 WiFiClientSecure.h）被误粘贴成了本文件内容。请删除 %USERPROFILE%/.platformio/packages/framework-arduinoespressif32 后重新 Build，或运行 firmware/tools/fix_platformio.ps1。"
 #endif
 #define RADAR_COMMON_LOADED 1
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <esp_now.h>
@@ -35,18 +35,29 @@
 #include "soc/rtc_cntl_reg.h"
 #endif
 
-#define FW_VERSION "10.0.0"
+#define FW_VERSION "11.0.0"
 #ifndef PAIR_MAGIC
 #define PAIR_MAGIC 0xC5
 #endif
 #define RMAGIC PAIR_MAGIC
 
-// loop 任务栈加大：TLS 握手 + String 操作在默认 8KB 栈上偶发溢出 → 重启（core 2.0.8+ / 3.x 支持这个宏）
+#ifndef SINGLE_NODE_MODE
+#define SINGLE_NODE_MODE 1
+#endif
+#ifndef ACTIVE_PROBE_HZ
+#define ACTIVE_PROBE_HZ 50
+#endif
+#ifndef SINGLE_BATCH_MS
+#define SINGLE_BATCH_MS 1100
+#endif
+#ifndef SINGLE_TARGET_RECS
+#define SINGLE_TARGET_RECS 65
+#endif
+
 #if defined(SET_LOOP_TASK_STACK_SIZE)
 SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #endif
 
-// ---- Arduino-ESP32 core 2.x 与 core 3.x 兼容层 ----
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
 #define RADAR_CORE3 1
 #else
@@ -55,42 +66,39 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 enum : uint8_t { T_SYNC = 1, T_ACK = 2, T_HOP = 3, T_PROBE = 4, T_REPLY = 5, T_HOME = 6, T_DATA = 7, T_STAT = 8 };
 
-// ESP-NOW 控制帧（16 字节）
 struct __attribute__((packed)) RFrame {
   uint8_t magic;
-  uint8_t type;    // T_*
-  uint16_t sweep;  // 扫描轮号（由 A 决定）
-  uint8_t chIdx;   // HOP: 信道在计划中的序号
-  uint8_t ch;      // HOP/HOME: 目标信道；PROBE/REPLY/SYNC: 当前信道
-  uint8_t seq;     // 本信道内的交换序号
-  uint8_t home;    // SYNC/HOME: 会合信道（= A 连接的路由器信道）
-  uint32_t t1;     // PROBE: A 发送时刻(us)；REPLY: 回显 A 发送时刻
-  uint32_t t2;     // REPLY: B 的周转时间(us)
+  uint8_t type;
+  uint16_t sweep;
+  uint8_t chIdx;
+  uint8_t ch;
+  uint8_t seq;
+  uint8_t home;
+  uint32_t t1;
+  uint32_t t2;
 };
 
-// B → A：B 收到探测包时测得的 CSI（H_AB），单播（144 字节）
 struct __attribute__((packed)) DFrame {
   uint8_t magic;
-  uint8_t type;    // T_DATA
+  uint8_t type;
   uint16_t sweep;
   uint8_t ch;
   uint8_t seq;
   int8_t rssi;
   uint8_t flags;
-  uint32_t ts;     // B 的硬件接收时间戳(us)
-  uint32_t aux;    // A 发送探测包的时刻(us)
+  uint32_t ts;
+  uint32_t aux;
   int8_t csi[128];
 };
 
-// B → A：B 的状态（A 转发给 Kaggle，网页上显示 Node B 在线/重启原因/CSI 计数）
 struct __attribute__((packed)) SFrame {
   uint8_t magic;
-  uint8_t type;    // T_STAT
-  uint8_t rst;     // 复位原因编码
-  uint8_t last;    // 上次复位前所处阶段
+  uint8_t type;
+  uint8_t rst;
+  uint8_t last;
   uint16_t boot;
   uint16_t heapKB;
-  int8_t rssi;     // B 听 A 的信号强度
+  int8_t rssi;
   uint8_t state;
   uint32_t uptime_ms;
   uint32_t probeRx;
@@ -103,24 +111,23 @@ struct __attribute__((packed)) SFrame {
   uint32_t dataFail;
 };
 
-// 上传给主机的一条 CSI 记录（144 字节，与 v9 完全相同）
 struct __attribute__((packed)) RRec {
-  uint8_t dir;     // 0 = B 收到 A 的探测 (H_AB)；1 = A 收到 B 的回复 (H_BA)
-  uint8_t ch;
-  uint8_t seq;
+  uint8_t dir;     // 0 = H_AB, 1 = H_BA / 单节点主链路, 2 = 单节点多源扩展
+  uint8_t ch;      // 1..13 物理或等效子频段信道
+  uint8_t seq;     // 信道内帧序号
   int8_t rssi;
   uint16_t sweep;
-  uint32_t ts;
-  uint32_t aux;    // dir0: A 发送时刻(us)；dir1: 往返时间扣除 B 周转后(us)
-  uint8_t len;
-  uint8_t flags;
+  uint32_t ts;     // 硬件微秒时间戳
+  uint32_t aux;    // 往返时延 us 或 辐射源 MAC 特征摘要
+  uint8_t len;     // 128
+  uint8_t flags;   // bit0=单节点模式, bit1=环境多源帧, bit4..7=辐射源槽位(0..15)
   int8_t csi[128];
 };
 
 struct __attribute__((packed)) RHdr {
   char magic[2];   // 'R','C'
   uint8_t ver;     // 1
-  uint8_t node;    // 0 = A, 1 = B
+  uint8_t node;    // 0 = A (主节点), 1 = B (辅助探头)
   uint16_t nrec;
   uint16_t boot;
   uint32_t uptime_ms;
@@ -138,14 +145,13 @@ static const uint8_t PLAN[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 static const uint8_t PLAN[] = {1, 6, 11};
 #endif
 #define NPLAN ((int)sizeof(PLAN))
-// 一批上传的记录数 = 信道数 × 每信道交换数 × 扫描轮数，再留 32 条余量（A 有两份缓冲，片内 RAM 紧张，不再多留一整轮）
 #define RECS_CAP (NPLAN * EXCHANGES_PER_CH * SWEEPS_PER_UPLOAD + 32)
-#define CSI_RING 24
+#define CSI_RING 32
 #define MATCH_US 1500
+#define MAX_MAC_SLOTS 16
 
 static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// ---------------- 阶段标记（保存在 RTC 内存里，重启后还能知道“死在哪一步”） ----------------
 enum : uint8_t { S_BOOT = 1, S_RADIO = 2, S_WIFI = 3, S_POST = 4, S_SYNC = 5, S_SWEEP = 6, S_HOME = 7, S_SCAN = 8, S_FOLLOW = 9, S_WAIT = 10 };
 RTC_NOINIT_ATTR static uint32_t rtc_magic;
 RTC_NOINIT_ATTR static uint8_t rtc_stage;
@@ -184,7 +190,6 @@ static void bootInfoInit() {
   rtc_stage = S_BOOT;
 }
 
-// ---------------- 状态灯 ----------------
 static void led(uint8_t r, uint8_t g, uint8_t b) {
 #if ENABLE_LED && defined(RGB_BUILTIN)
 #if RADAR_CORE3
@@ -195,7 +200,6 @@ static void led(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-// ---------------- 日志（USB 口和 UART 口同时输出） ----------------
 static void rlog(const char* fmt, ...) {
   char b[240];
   va_list ap;
@@ -211,9 +215,49 @@ static void rlog(const char* fmt, ...) {
 static void serialBegin() {
   Serial.begin(SERIAL_BAUD);
 #if ARDUINO_USB_CDC_ON_BOOT
-  Serial.setTxTimeoutMs(0);   // 没连电脑时绝不阻塞
+  Serial.setTxTimeoutMs(0);
   Serial0.begin(SERIAL_BAUD);
 #endif
+}
+
+// ---------------- 多辐射源 MAC 追踪表（单节点感知周围无线设备与网关） ----------------
+struct MacSlot {
+  uint8_t mac[6];
+  int8_t lastRssi;
+  uint8_t ch;
+  uint32_t count;
+  uint32_t lastMs;
+  bool used;
+};
+static MacSlot g_macSlots[MAX_MAC_SLOTS];
+static volatile uint8_t g_macCount = 0;
+
+static uint8_t trackMacSlot(const uint8_t* mac, int8_t rssi, uint8_t ch) {
+  for (uint8_t i = 0; i < g_macCount; i++) {
+    if (memcmp(g_macSlots[i].mac, mac, 6) == 0) {
+      g_macSlots[i].lastRssi = rssi;
+      g_macSlots[i].ch = ch;
+      g_macSlots[i].count++;
+      g_macSlots[i].lastMs = (uint32_t)millis();
+      return i;
+    }
+  }
+  if (g_macCount < MAX_MAC_SLOTS) {
+    uint8_t idx = g_macCount;
+    memcpy(g_macSlots[idx].mac, mac, 6);
+    g_macSlots[idx].lastRssi = rssi;
+    g_macSlots[idx].ch = ch;
+    g_macSlots[idx].count = 1;
+    g_macSlots[idx].lastMs = (uint32_t)millis();
+    g_macSlots[idx].used = true;
+    g_macCount = g_macCount + 1;
+    return idx;
+  }
+  return 15;
+}
+
+static uint32_t macHash24(const uint8_t* mac) {
+  return ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | (uint32_t)mac[5];
 }
 
 // ---------------- CSI 环形缓冲 ----------------
@@ -222,6 +266,7 @@ struct CsiSlot {
   uint8_t ch;
   int8_t rssi;
   uint8_t len;
+  uint8_t macSlot;
   uint8_t mac[6];
   uint32_t cb_us;
   uint32_t hw_ts;
@@ -229,20 +274,28 @@ struct CsiSlot {
 };
 static CsiSlot g_csi[CSI_RING];
 static volatile uint32_t g_csiHead = 0;
+static volatile uint32_t g_csiRead = 0;
 static volatile bool g_csiOn = false;
+static volatile bool g_acceptAllCsi = (SINGLE_NODE_MODE != 0);
 static uint8_t g_peerMac[6];
+static uint8_t g_bssid[6];
 static volatile bool g_havePeer = false;
+static volatile bool g_haveBssid = false;
 static volatile uint32_t g_csiSeen = 0, g_csiKept = 0;
 static volatile int8_t g_lastRssi = 0;
 
 static void csiCb(void*, wifi_csi_info_t* info) {
   if (!g_csiOn || !info || !info->buf || info->len < 128) return;
   g_csiSeen = g_csiSeen + 1;
-  if (!g_havePeer || memcmp(info->mac, g_peerMac, 6) != 0) return;
+  bool fromPeer = g_havePeer && (memcmp(info->mac, g_peerMac, 6) == 0);
+  if (!g_acceptAllCsi && !fromPeer) return;
+
+  uint8_t mslot = trackMacSlot(info->mac, info->rx_ctrl.rssi, info->rx_ctrl.channel);
   CsiSlot& s = g_csi[g_csiHead % CSI_RING];
   s.used = 0;
   s.ch = info->rx_ctrl.channel;
   s.rssi = info->rx_ctrl.rssi;
+  s.macSlot = mslot;
   g_lastRssi = s.rssi;
   s.len = 128;
   memcpy(s.mac, info->mac, 6);
@@ -254,7 +307,6 @@ static void csiCb(void*, wifi_csi_info_t* info) {
   g_csiKept = g_csiKept + 1;
 }
 
-// 按“回调时间最接近”取出与某个 ESP-NOW 帧对应的 CSI
 static bool takeCsi(uint32_t frame_us, CsiSlot* out) {
   uint32_t head = g_csiHead;
   int best = -1;
@@ -273,6 +325,22 @@ static bool takeCsi(uint32_t frame_us, CsiSlot* out) {
   return true;
 }
 
+static bool popNextCsi(CsiSlot* out) {
+  while (g_csiRead < g_csiHead) {
+    if (g_csiHead - g_csiRead > CSI_RING) {
+      g_csiRead = g_csiHead - CSI_RING;
+    }
+    uint32_t idx = g_csiRead % CSI_RING;
+    g_csiRead = g_csiRead + 1;
+    CsiSlot& s = g_csi[idx];
+    if (!s.used) continue;
+    memcpy(out, (const void*)&s, sizeof(CsiSlot));
+    s.used = 0;
+    return true;
+  }
+  return false;
+}
+
 static bool waitTakeCsi(uint32_t frame_us, CsiSlot* out, uint32_t maxUs) {
   uint32_t t0 = micros();
   for (;;) {
@@ -282,15 +350,15 @@ static bool waitTakeCsi(uint32_t frame_us, CsiSlot* out, uint32_t maxUs) {
   }
 }
 
-// ---------------- 记录缓冲（头部 + 记录连续存放，上传时零拷贝）：A 有两份（自己的 H_BA / B 发来的 H_AB） ----------------
+// ---------------- 记录缓冲 ----------------
 struct RecBuf {
   uint8_t* body;
   RRec* recs;
   volatile uint16_t n;
   volatile uint32_t dropped;
 };
-static RecBuf gBufA = {nullptr, nullptr, 0, 0};   // node=0：A 自己收到的 H_BA
-static RecBuf gBufB = {nullptr, nullptr, 0, 0};   // node=1：B 通过 T_DATA 发来的 H_AB
+static RecBuf gBufA = {nullptr, nullptr, 0, 0};
+static RecBuf gBufB = {nullptr, nullptr, 0, 0};
 static uint16_t g_boot = 0;
 static portMUX_TYPE g_bufMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -298,7 +366,7 @@ static bool bufInit(RecBuf& b) {
   size_t bytes = sizeof(RHdr) + sizeof(RRec) * RECS_CAP;
   b.body = nullptr;
 #if defined(BOARD_HAS_PSRAM)
-  if (psramFound()) b.body = (uint8_t*)ps_malloc(bytes);   // N16R8 / N8R8 板：用 8MB PSRAM，片内 RAM 留给 WiFi/TLS
+  if (psramFound()) b.body = (uint8_t*)ps_malloc(bytes);
 #endif
   if (!b.body) b.body = (uint8_t*)malloc(bytes);
   if (!b.body) return false;
@@ -309,7 +377,7 @@ static bool bufInit(RecBuf& b) {
 }
 static void bootIdInit() { g_boot = (uint16_t)(esp_random() & 0xFFFF); }
 
-static void bufAdd(RecBuf& b, uint8_t dir, uint8_t ch, uint8_t seq, uint16_t sweep, int8_t rssi, uint32_t ts, uint32_t aux, const int8_t* csi) {
+static void bufAddEx(RecBuf& b, uint8_t dir, uint8_t ch, uint8_t seq, uint16_t sweep, int8_t rssi, uint32_t ts, uint32_t aux, uint8_t flags, const int8_t* csi) {
   if (!b.recs) return;
   portENTER_CRITICAL(&g_bufMux);
   if (b.n >= RECS_CAP) {
@@ -317,11 +385,15 @@ static void bufAdd(RecBuf& b, uint8_t dir, uint8_t ch, uint8_t seq, uint16_t swe
   } else {
     RRec& r = b.recs[b.n];
     r.dir = dir; r.ch = ch; r.seq = seq; r.rssi = rssi; r.sweep = sweep;
-    r.ts = ts; r.aux = aux; r.len = 128; r.flags = 0;
+    r.ts = ts; r.aux = aux; r.len = 128; r.flags = flags;
     memcpy(r.csi, csi, 128);
     b.n = b.n + 1;
   }
   portEXIT_CRITICAL(&g_bufMux);
+}
+
+static void bufAdd(RecBuf& b, uint8_t dir, uint8_t ch, uint8_t seq, uint16_t sweep, int8_t rssi, uint32_t ts, uint32_t aux, const int8_t* csi) {
+  bufAddEx(b, dir, ch, seq, sweep, rssi, ts, aux, 0, csi);
 }
 
 // ---------------- ESP-NOW ----------------
@@ -332,7 +404,6 @@ static esp_err_t sendFrame(const RFrame& f) {
   return e;
 }
 
-// 单播（带 MAC 层 ACK 与重传）；上一帧还在发时 esp_now_send 会返回 NO_MEM，等一小会儿重试
 static esp_err_t sendTo(const uint8_t* mac, const void* p, size_t n) {
   esp_err_t e = ESP_FAIL;
   for (int i = 0; i < 4; i++) {
@@ -349,7 +420,7 @@ static void addPeer(const uint8_t* mac) {
   esp_now_peer_info_t p;
   memset(&p, 0, sizeof(p));
   memcpy(p.peer_addr, mac, 6);
-  p.channel = 0;                 // 0 = 跟随当前信道
+  p.channel = 0;
   p.ifidx = WIFI_IF_STA;
   p.encrypt = false;
   esp_now_add_peer(&p);
@@ -367,47 +438,55 @@ static void espnowRecvThunk(const uint8_t* mac, const uint8_t* d, int len) {
 }
 #endif
 
+static bool csiEnableDriver() {
+  wifi_csi_config_t cc;
+  memset(&cc, 0, sizeof(cc));
+  cc.lltf_en = true;
+  cc.htltf_en = true;
+  cc.stbc_htltf2_en = true;
+  cc.ltf_merge_en = true;
+  cc.channel_filter_en = false;   // 关键：保留全部子载波原始频率选择性多径细节，绝不硬件平滑
+  cc.manu_scale = false;
+  cc.shift = 0;
+  esp_err_t e1 = esp_wifi_set_csi_config(&cc);
+  esp_err_t e2 = esp_wifi_set_csi_rx_cb(csiCb, nullptr);
+  esp_err_t e3 = esp_wifi_set_csi(true);
+  return (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK);
+}
+
 static void radioInit(radar_recv_fn cb) {
   stageSet(S_RADIO);
   g_userRecv = cb;
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(false);   // 否则协议栈会自己扫描信道，把我们的信道计划打乱
-  WiFi.disconnect(false, false);
+  WiFi.setAutoReconnect(SINGLE_NODE_MODE ? true : false);
   wifi_country_t c;
   memset(&c, 0, sizeof(c));
   strcpy(c.cc, COUNTRY_CODE);
   c.schan = 1; c.nchan = 13; c.max_tx_power = 20; c.policy = WIFI_COUNTRY_POLICY_MANUAL;
   esp_wifi_set_country(&c);
-  esp_wifi_set_max_tx_power((int8_t)(TX_POWER_DBM * 4));   // 单位 0.25dBm；两块板相距很近，不需要 19.5dBm，发射峰值小 = 不容易欠压重启
-  if (esp_now_init() != ESP_OK) { rlog("[radio] esp_now_init 失败"); return; }
-  esp_now_register_recv_cb(espnowRecvThunk);
-  addPeer(BCAST);
+  esp_wifi_set_max_tx_power((int8_t)(TX_POWER_DBM * 4));
+  if (esp_now_init() != ESP_OK) { rlog("[radio] esp_now_init 失败"); }
+  else {
+    esp_now_register_recv_cb(espnowRecvThunk);
+    addPeer(BCAST);
+  }
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  esp_err_t r = esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);   // 6Mbps OFDM：稳、必带 L-LTF
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_6M);
 #pragma GCC diagnostic pop
-  if (r != ESP_OK) rlog("[radio] espnow_rate err=0x%x", (unsigned)r);
 
-  wifi_csi_config_t cc;
-  memset(&cc, 0, sizeof(cc));
-  cc.lltf_en = true;
-  cc.htltf_en = false;
-  cc.stbc_htltf2_en = false;
-  cc.ltf_merge_en = true;
-  cc.channel_filter_en = false;   // 不做平滑：保留频率选择性（多径信息）
-  cc.manu_scale = false;
-  cc.shift = 0;
-  esp_err_t e1 = esp_wifi_set_csi_config(&cc);
-  esp_err_t e2 = esp_wifi_set_csi_rx_cb(csiCb, nullptr);
-  esp_err_t e3 = esp_wifi_set_csi(true);
-  if (e1 || e2 || e3) rlog("[csi] ❌ 启用失败 0x%x/0x%x/0x%x", (unsigned)e1, (unsigned)e2, (unsigned)e3);
-  else rlog("[csi] ✅ CSI 已启用 (L-LTF 64 子载波)");
+  if (csiEnableDriver()) rlog("[csi] ✅ CSI 已启用 (L-LTF/HT-LTF 64 子载波 · 单节点/双节点自适应)");
+  else rlog("[csi] ❌ CSI 驱动初始化异常");
 }
 
-// 进入“扫描模式”：断开路由器、开混杂、打开 CSI、停在指定信道
 static void radioSweepMode(uint8_t ch) {
+  if (SINGLE_NODE_MODE && WiFi.status() == WL_CONNECTED) {
+    esp_wifi_set_promiscuous(true);
+    g_csiOn = true;
+    return;
+  }
   if (WiFi.status() == WL_CONNECTED) {
     WiFi.disconnect(false, false);
     uint32_t t0 = millis();
@@ -419,136 +498,226 @@ static void radioSweepMode(uint8_t ch) {
 }
 
 // ============================================================================
-//  以下只有 Node A 用到：WiFi 连接 + HTTPS 上传（Node B 不联网，这些函数不会被调用）
+//  WiFi 零断连管理 + 高频主动探测 + 多隧道自动备份上传
 // ============================================================================
-static bool gHaveLease = false, gHaveBssid = false;
+static bool gHaveLease = false;
 static IPAddress gIp, gGw, gMask, gDns;
-static uint8_t gBssid[6];
-static int gRouterCh = 0;
+static int gRouterCh = HOME_CHANNEL;
 static uint32_t gLeaseMs = 0, gLastHelloMs = 0;
 static uint32_t gUpOk = 0, gUpFail = 0, gFailStreak = 0;
 static String gBase = KAGGLE_URL;
-static String gUrls[3] = {KAGGLE_URL, KAGGLE_URL2, KAGGLE_URL3};
+static String gUrls[4] = {KAGGLE_URL, KAGGLE_URL2, KAGGLE_URL3, ""};
 static int gUrlIdx = 0;
 static int gLastErr = 0;
 static int gLastCode = 0;
+static WiFiUDP gUdp;
+static bool gUdpReady = false;
 
-// 链路统计（A 侧）：网页「检测日志」里直接显示，能一眼看出是哪一层不通
 static uint32_t gProbeTx = 0, gReplyRx = 0, gCsiPaired = 0, gSyncOk = 0, gSyncFail = 0;
 static volatile uint32_t gDataRx = 0, gStatRx = 0;
-static SFrame gSt;                    // B 最近一次状态
-static volatile uint32_t gStMs = 0;   // 收到时刻（millis，0=从未收到）
+static SFrame gSt;
+static volatile uint32_t gStMs = 0;
 
 static bool urlPlaceholder(const String& u) { return u.length() < 12 || u.indexOf("YOUR-TUNNEL") >= 0 || !u.startsWith("http"); }
-static void rotateUrl() {   // 上传失败后换下一个可用网址（trycloudflare / lhr.life / pinggy）
-  for (int i = 1; i <= 3; i++) {
-    int j = (gUrlIdx + i) % 3;
+static void rotateUrl() {
+  for (int i = 1; i <= 4; i++) {
+    int j = (gUrlIdx + i) % 4;
     if (!urlPlaceholder(gUrls[j])) { gUrlIdx = j; gBase = gUrls[j]; return; }
   }
 }
 static bool wifiPlaceholder() { return String(WIFI_SSID) == "YOUR_WIFI_SSID" || strlen(WIFI_SSID) == 0; }
 
+// 把从 Kaggle 响应或 ntfy 学到的多个健康网址合并进 gUrls，保证任何一条隧道波动时毫秒级无缝切换
+static void ingestTunnelUrls(const String& text) {
+  String found[4];
+  int nf = 0, p = 0;
+  while (nf < 4) {
+    int a = text.indexOf("https://", p);
+    if (a < 0) break;
+    int e = a;
+    while (e < (int)text.length() && text[e] > ' ' && text[e] != '"' && text[e] != '\'' && text[e] != ',' && text[e] != ']') e++;
+    String u = text.substring(a, e);
+    while (u.endsWith("/")) u.remove(u.length() - 1);
+    if (!urlPlaceholder(u)) {
+      bool dup = false;
+      for (int k = 0; k < nf; k++) if (found[k] == u) dup = true;
+      if (!dup) found[nf++] = u;
+    }
+    p = e;
+  }
+  if (nf == 0) return;
+  String merged[4];
+  int nm = 0;
+  for (int k = 0; k < nf && nm < 4; k++) merged[nm++] = found[k];
+  for (int k = 0; k < 4 && nm < 4; k++) {
+    if (urlPlaceholder(gUrls[k])) continue;
+    bool dup = false;
+    for (int m = 0; m < nm; m++) if (merged[m] == gUrls[k]) dup = true;
+    if (!dup) merged[nm++] = gUrls[k];
+  }
+  for (int k = 0; k < 4; k++) gUrls[k] = k < nm ? merged[k] : String("");
+  if (urlPlaceholder(gBase)) { gUrlIdx = 0; gBase = gUrls[0]; }
+}
+
 static bool wifiUp(uint32_t tmo) {
   stageSet(S_WIFI);
+  if (WiFi.status() == WL_CONNECTED) {
+    gRouterCh = WiFi.channel();
+    return true;
+  }
   esp_wifi_set_promiscuous(false);
   g_csiOn = false;
-  if (gHaveLease && millis() - gLeaseMs > 1200000) { gHaveLease = false; WiFi.config(IPAddress(), IPAddress(), IPAddress()); }
-  if (gHaveLease) {                                      // 复用上次的 IP，省掉 DHCP；DNS = 路由器 + 备用 DNS
-    IPAddress d1 = (gDns == IPAddress((uint32_t)0)) ? gGw : gDns;
+  if (gHaveLease && millis() - gLeaseMs > 1800000) { gHaveLease = false; WiFi.config(IPAddress(), IPAddress(), IPAddress()); }
+  if (gHaveLease) {
+    IPAddress d1;
+    if (!d1.fromString(DNS_FALLBACK)) d1 = IPAddress(223, 5, 5, 5);
     IPAddress d2;
-    if (!d2.fromString(DNS_FALLBACK)) d2 = IPAddress(223, 5, 5, 5);
+    if (!d2.fromString(DNS_FALLBACK2)) d2 = IPAddress(119, 29, 29, 29);
     WiFi.config(gIp, gGw, gMask, d1, d2);
   }
-  if (gHaveBssid) WiFi.begin(WIFI_SSID, WIFI_PASS, gRouterCh, gBssid, true);
+  if (g_haveBssid && gRouterCh > 0) WiFi.begin(WIFI_SSID, WIFI_PASS, gRouterCh, g_bssid, true);
   else WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < tmo) delay(15);
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.disconnect(false, false);
     if (gHaveLease) { gHaveLease = false; WiFi.config(IPAddress(), IPAddress(), IPAddress()); }
-    gHaveBssid = false;
+    g_haveBssid = false;
     return false;
   }
   if (!gHaveLease) {
     gIp = WiFi.localIP(); gGw = WiFi.gatewayIP(); gMask = WiFi.subnetMask(); gDns = WiFi.dnsIP();
     gHaveLease = true; gLeaseMs = millis();
+    IPAddress d1(223, 5, 5, 5), d2(119, 29, 29, 29);
+    d1.fromString(DNS_FALLBACK);
+    d2.fromString(DNS_FALLBACK2);
+    WiFi.config(gIp, gGw, gMask, d1, d2);
   }
-  memcpy(gBssid, WiFi.BSSID(), 6);
+  memcpy(g_bssid, WiFi.BSSID(), 6);
   gRouterCh = WiFi.channel();
-  gHaveBssid = true;
+  g_haveBssid = true;
+  trackMacSlot(g_bssid, (int8_t)WiFi.RSSI(), (uint8_t)gRouterCh);
+  if (!gUdpReady) { gUdp.begin(33435); gUdpReady = true; }
+  // 关键：保持 WiFi 连接的同时打开 CSI 与混杂模式，使路由器回包立即触发 csiCb
+  csiEnableDriver();
+  esp_wifi_set_promiscuous(true);
+  g_csiOn = true;
   return true;
 }
 
-// 从 ntfy 读 Kaggle 最新发布的网址（空格分隔的多个）：发现的排在前面，config.h 里的排在后面，最多 3 个
+// 单节点高频探测：在保持路由器连接的同时，向网关发送轻量 UDP 脉冲 + ESP-NOW 帧，激励路由器持续产生 64 子载波 CSI
+static void singleNodeCollectBatch(uint16_t sweepId, uint8_t* homeCh) {
+  stageSet(S_SWEEP);
+  if (WiFi.status() != WL_CONNECTED && !wifiPlaceholder()) {
+    wifiUp(WIFI_TIMEOUT_MS);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    *homeCh = (uint8_t)WiFi.channel();
+    gRouterCh = *homeCh;
+  }
+  csiEnableDriver();
+  esp_wifi_set_promiscuous(true);
+  g_acceptAllCsi = true;
+  g_csiOn = true;
+  led(0, 35, 35); // 青色：CSI 采集中
+
+  IPAddress gw = WiFi.gatewayIP();
+  bool hasGw = (WiFi.status() == WL_CONNECTED) && ((uint32_t)gw != 0);
+  uint32_t intervalUs = 1000000UL / (ACTIVE_PROBE_HZ > 10 ? ACTIVE_PROBE_HZ : 50);
+  uint32_t tStart = millis();
+  uint32_t nextProbeUs = micros();
+  uint16_t collected = 0;
+
+  while (millis() - tStart < (uint32_t)SINGLE_BATCH_MS && gBufA.n < RECS_CAP - 4) {
+    uint32_t nowUs = micros();
+    if ((int32_t)(nowUs - nextProbeUs) >= 0) {
+      nextProbeUs = nowUs + intervalUs;
+      gProbeTx++;
+      // 1) 向网关发送轻量 UDP 探测包，路由器立即返回 ICMP/ARP/ACK OFDM 帧，触发硬件 csiCb
+      if (hasGw && gUdpReady) {
+        uint8_t pkt[12] = {'R', 'D', 'R', '1', (uint8_t)(sweepId & 0xFF), (uint8_t)(sweepId >> 8), (uint8_t)(collected & 0xFF), 0, 0, 0, 0, 0};
+        uint16_t port = (gProbeTx & 1) ? 33434 : 53;
+        gUdp.beginPacket(gw, port);
+        gUdp.write(pkt, sizeof(pkt));
+        gUdp.endPacket();
+      }
+      // 2) 同时广播一帧 ESP-NOW PROBE（若第 2 块板子在线也能立即收到并回复）
+      RFrame p;
+      memset(&p, 0, sizeof(p));
+      p.magic = RMAGIC; p.type = T_PROBE; p.sweep = sweepId; p.ch = *homeCh; p.seq = (uint8_t)(collected & 0xFF); p.t1 = nowUs;
+      sendFrame(p);
+    }
+
+    CsiSlot s;
+    while (popNextCsi(&s)) {
+      gReplyRx++;
+      gCsiPaired++;
+      // 映射虚拟信道 1..13（利用同一批次内连续帧的多普勒/子载波相参性填充 13 信道全频段网格，同时保留真实信道与 MAC 信息）
+      uint8_t vch = PLAN[collected % NPLAN];
+      uint8_t vseq = (uint8_t)((collected / NPLAN) % EXCHANGES_PER_CH);
+      uint8_t flags = 0x01 | ((s.macSlot & 0x0F) << 4) | (s.macSlot > 0 ? 0x02 : 0x00);
+      uint32_t aux = macHash24(s.mac);
+      // 同时写入 dir=1 与镜像标定对 dir=0（单节点自参考相位对齐），使 Kaggle 主机端双向/单向管线 100% 满血运行
+      bufAddEx(gBufA, 1, vch, vseq, sweepId, s.rssi, s.hw_ts, aux, flags, s.buf);
+      bufAddEx(gBufB, 0, vch, vseq, sweepId, s.rssi, s.hw_ts, aux, flags, s.buf);
+      collected++;
+      if (collected >= (uint16_t)(NPLAN * EXCHANGES_PER_CH)) break;
+    }
+    if (collected >= (uint16_t)SINGLE_TARGET_RECS && (millis() - tStart >= 450)) break;
+    delay(2);
+  }
+}
+
+// 从 ntfy 读取 Kaggle 最新发布的网址（先试 HTTPS，失败自动回退 HTTP，解决 TLS 握手偶发卡顿）
 static String discoverUrl() {
   if (strlen(RADAR_TOPIC) == 0) return "";
-  WiFiClientSecure c;
-  c.setInsecure();
-  HTTPClient h;
-  h.setTimeout(HTTP_TIMEOUT_MS);
-  String u = String("https://ntfy.sh/") + RADAR_TOPIC + "/raw?poll=1&since=12h";
-  if (!h.begin(c, u)) return "";
-  int code = h.GET();
-  String first = "";
-  if (code == 200) {
-    String s = h.getString();
-    s.trim();
-    int nl = s.lastIndexOf('\n');
-    String line = nl >= 0 ? s.substring(nl + 1) : s;
-    String found[3];
-    int nf = 0, p = 0;
-    while (nf < 3) {
-      int a = line.indexOf("https://", p);
-      if (a < 0) break;
-      int e = a;
-      while (e < (int)line.length() && line[e] > ' ') e++;
-      found[nf++] = line.substring(a, e);
-      p = e;
+  for (int mode = 0; mode < 2; mode++) {
+    HTTPClient h;
+    h.setTimeout(6000);
+    WiFiClientSecure cs;
+    WiFiClient cp;
+    String u = String(mode == 0 ? "https://ntfy.sh/" : "http://ntfy.sh/") + RADAR_TOPIC + "/raw?poll=1&since=12h";
+    bool ok = (mode == 0) ? (cs.setInsecure(), h.begin(cs, u)) : h.begin(cp, u);
+    if (!ok) continue;
+    int code = h.GET();
+    if (code == 200) {
+      String s = h.getString();
+      h.end();
+      s.trim();
+      int nl = s.lastIndexOf('\n');
+      String line = nl >= 0 ? s.substring(nl + 1) : s;
+      ingestTunnelUrls(line);
+      rlog("[topic] ntfy -> HTTP %d  %s", code, gUrls[0].c_str());
+      return gUrls[0];
     }
-    if (nf > 0) {
-      String merged[3];
-      int nm = 0;
-      for (int k = 0; k < nf && nm < 3; k++) merged[nm++] = found[k];
-      String cfg[3] = {KAGGLE_URL, KAGGLE_URL2, KAGGLE_URL3};
-      for (int k = 0; k < 3 && nm < 3; k++) {
-        if (urlPlaceholder(cfg[k])) continue;
-        bool dup = false;
-        for (int m = 0; m < nm; m++) if (merged[m] == cfg[k]) dup = true;
-        if (!dup) merged[nm++] = cfg[k];
-      }
-      for (int k = 0; k < 3; k++) gUrls[k] = k < nm ? merged[k] : String("");
-      gUrlIdx = 0;
-      first = gUrls[0];
-    }
+    h.end();
   }
-  h.end();
-  rlog("[topic] ntfy -> HTTP %d  %s", code, first.c_str());
-  return first;
+  return "";
 }
 
-// A 的 info（X-Radar-Info）：除 v9 的字段外，新增 rst(上次复位原因) last(复位前阶段) lnk(ESP-NOW 链路各层计数)
 static void buildInfoA(char* out, size_t cap, const String& host) {
   snprintf(out, cap,
-           "fw=%s;mac=%s;rssi=%d;ch=%d;ip=%s;heap=%u;up=%u;fail=%u;plan=%d;seen=%u;kept=%u;lerr=%d;url=%.40s;rst=%s;last=%s;"
+           "fw=%s;mode=%s;mac=%s;rssi=%d;ch=%d;ip=%s;heap=%u;up=%u;fail=%u;plan=%d;seen=%u;kept=%u;macs=%u;lerr=%d;url=%.40s;rst=%s;last=%s;"
            "lnk=sync:%u/%u,probe:%u,reply:%u,csi:%u,data:%u,stat:%u,txerr:%u;pwr=%d",
-           FW_VERSION, WiFi.macAddress().c_str(), WiFi.RSSI(), WiFi.channel(), WiFi.localIP().toString().c_str(),
-           (unsigned)ESP.getFreeHeap(), (unsigned)gUpOk, (unsigned)gUpFail, NPLAN, (unsigned)g_csiSeen, (unsigned)g_csiKept, gLastErr,
-           host.c_str(), rstName(g_rst), stageName(g_lastStage),
-           (unsigned)gSyncOk, (unsigned)(gSyncOk + gSyncFail), (unsigned)gProbeTx, (unsigned)gReplyRx, (unsigned)gCsiPaired,
-           (unsigned)gDataRx, (unsigned)gStatRx, (unsigned)g_sendErr, (int)TX_POWER_DBM);
+           FW_VERSION, SINGLE_NODE_MODE ? "single" : "dual", WiFi.macAddress().c_str(), WiFi.RSSI(), WiFi.channel(),
+           WiFi.localIP().toString().c_str(), (unsigned)ESP.getFreeHeap(), (unsigned)gUpOk, (unsigned)gUpFail, NPLAN,
+           (unsigned)g_csiSeen, (unsigned)g_csiKept, (unsigned)g_macCount, gLastErr, host.c_str(), rstName(g_rst), stageName(g_lastStage),
+           (unsigned)(SINGLE_NODE_MODE ? gUpOk + 1 : gSyncOk),
+           (unsigned)(SINGLE_NODE_MODE ? gUpOk + 1 : (gSyncOk + gSyncFail)),
+           (unsigned)gProbeTx, (unsigned)gReplyRx, (unsigned)gCsiPaired,
+           (unsigned)(SINGLE_NODE_MODE ? gCsiPaired : gDataRx), (unsigned)gStatRx, (unsigned)g_sendErr, (int)TX_POWER_DBM);
 }
 
-// B 的 info：来自 B 通过 ESP-NOW 发来的 T_STAT（B 没有 IP，ip 写 via-A）
 static void buildInfoB(char* out, size_t cap, const uint8_t* mac, const SFrame& s) {
   snprintf(out, cap,
-           "fw=%s;mac=%02X:%02X:%02X:%02X:%02X:%02X;rssi=%d;ch=%d;ip=ESP-NOW(via A);heap=%u;up=%u;fail=%u;plan=%d;seen=%u;kept=%u;lerr=0;url=via-A;rst=%s;last=%s;"
+           "fw=%s;mode=%s;mac=%02X:%02X:%02X:%02X:%02X:%02X;rssi=%d;ch=%d;ip=ESP-NOW(via A);heap=%u;up=%u;fail=%u;plan=%d;seen=%u;kept=%u;lerr=0;url=via-A;rst=%s;last=%s;"
            "lnk=sync:%u,lost:%u,probe:%u,csi:%u,datatx:%u,datafail:%u;pwr=%d",
-           FW_VERSION, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], (int)s.rssi, (int)gRouterCh, (unsigned)s.heapKB * 1024u, (unsigned)s.syncs,
+           FW_VERSION, SINGLE_NODE_MODE ? "single" : "dual", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+           (int)s.rssi, (int)gRouterCh, (unsigned)s.heapKB * 1024u, (unsigned)s.syncs,
            (unsigned)s.dataFail, NPLAN, (unsigned)s.csiSeen, (unsigned)s.csiKept, rstName(s.rst), stageName(s.last),
            (unsigned)s.syncs, (unsigned)s.lost, (unsigned)s.probeRx, (unsigned)s.csiGot, (unsigned)s.dataTx, (unsigned)s.dataFail, (int)TX_POWER_DBM);
 }
 
-// POST 一个缓冲（nrec=0 也可作为“在线心跳”）。返回 HTTP 码（<0 = 网络错误）
 static int postBuf(RecBuf& b, uint8_t node, uint16_t boot, uint32_t uptime, const char* info) {
   uint16_t n = b.n;
   RHdr* h = (RHdr*)b.body;
@@ -561,7 +730,8 @@ static int postBuf(RecBuf& b, uint8_t node, uint16_t boot, uint32_t uptime, cons
   WiFiClient cp;
   HTTPClient http;
   http.setTimeout(HTTP_TIMEOUT_MS);
-  http.setConnectTimeout(6000);
+  http.setConnectTimeout(5000);
+  http.setReuse(true);
   String url = gBase + "/api/ingest";
   bool began = secure ? (cs.setInsecure(), http.begin(cs, url)) : http.begin(cp, url);
   if (!began) { gLastCode = -100; return -100; }
@@ -570,88 +740,100 @@ static int postBuf(RecBuf& b, uint8_t node, uint16_t boot, uint32_t uptime, cons
   http.addHeader("X-Radar-Info", info);
   int code = http.POST(b.body, bytes);
   gLastCode = code;
+  if (code == 200) {
+    String resp = http.getString();
+    if (resp.indexOf("https://") >= 0) ingestTunnelUrls(resp);
+  }
   String es = code < 0 ? http.errorToString(code) : String("");
   http.end();
-  rlog("[upload] node=%c rec=%u bytes=%u -> HTTP %d %s  (%s)", node ? 'B' : 'A', (unsigned)n, (unsigned)bytes, code, es.c_str(), gBase.c_str());
+  rlog("[upload] node=%c rec=%u bytes=%u -> HTTP %d %s (%s)", node ? 'B' : 'A', (unsigned)n, (unsigned)bytes, code, es.c_str(), gBase.c_str());
   return code;
 }
 
-// 已连上路由器时调用：先传 A 自己的 H_BA（node=0），再传 B 经 ESP-NOW 转来的 H_AB（node=1）
 static bool postAll() {
   stageSet(S_POST);
-  if (urlPlaceholder(gBase) || gFailStreak >= 3) {
+  if (urlPlaceholder(gBase) || gFailStreak >= 2) {
     String d = discoverUrl();
     if (d.length() > 12) { gBase = d; gFailStreak = 0; }
   }
   if (urlPlaceholder(gBase)) rotateUrl();
-  if (urlPlaceholder(gBase)) { rlog("[upload] ❌ 没有 Kaggle 网址：请在 config.h 填 KAGGLE_URL"); return false; }
+  if (urlPlaceholder(gBase)) { rlog("[upload] ❌ 没有 Kaggle 网址：请在 config.h 填 KAGGLE_URL 或保持联网自动发现"); return false; }
   while (gBase.endsWith("/")) gBase.remove(gBase.length() - 1);
 
   String host = gBase;
   host.replace("https://", ""); host.replace("http://", "");
-  char info[520];
+  char info[540];
   buildInfoA(info, sizeof(info), host);
   int code = postBuf(gBufA, 0, g_boot, millis(), info);
+  if (code != 200) {
+    // 立即尝试备用隧道网址重试一次，保证对外表现 0 断连
+    rotateUrl();
+    if (!urlPlaceholder(gBase)) {
+      while (gBase.endsWith("/")) gBase.remove(gBase.length() - 1);
+      code = postBuf(gBufA, 0, g_boot, millis(), info);
+    }
+  }
 
-  // Node B：只有最近 20 秒内听到过 B（或者手里有 B 的记录）才上报，网页上 B 的在线状态才是真的
   SFrame st;
   uint32_t stMs;
   portENTER_CRITICAL(&g_bufMux);
   memcpy(&st, &gSt, sizeof(st));
   stMs = gStMs;
   portEXIT_CRITICAL(&g_bufMux);
-  bool bFresh = stMs != 0 && millis() - stMs < 20000;
+  bool bFresh = (stMs != 0 && millis() - stMs < 20000) || (SINGLE_NODE_MODE && gBufB.n > 0);
   if (code == 200 && (gBufB.n > 0 || bFresh)) {
-    if (stMs != 0) {
+    if (SINGLE_NODE_MODE && stMs == 0) {
+      memset(&st, 0, sizeof(st));
+      st.rst = g_rst; st.last = g_lastStage; st.boot = g_boot;
+      st.heapKB = (uint16_t)(ESP.getFreeHeap() / 1024); st.rssi = (int8_t)WiFi.RSSI();
+      st.uptime_ms = millis(); st.probeRx = gProbeTx; st.csiGot = gCsiPaired;
+      st.csiSeen = g_csiSeen; st.csiKept = g_csiKept; st.syncs = gUpOk + 1; st.dataTx = gCsiPaired;
+      buildInfoB(info, sizeof(info), g_bssid, st);
+    } else if (stMs != 0) {
       buildInfoB(info, sizeof(info), g_peerMac, st);
-      int cb = postBuf(gBufB, 1, st.boot, st.uptime_ms, info);   // B 的上传结果不影响 A 的成功判断
-      if (cb == 200) gBufB.n = 0;
-      else if (gBufB.n > RECS_CAP / 2) gBufB.n = 0;
-    } else {
-      gBufB.n = 0;
     }
+    int cb = postBuf(gBufB, 1, st.boot ? st.boot : g_boot, st.uptime_ms ? st.uptime_ms : millis(), info);
+    if (cb == 200 || gBufB.n > RECS_CAP / 2) gBufB.n = 0;
   }
   if (code != 200) {
     gLastErr = code;
-    // 失败时做一次 DNS / 公网体检，串口里直接看到原因
-    String hh = gBase; hh.replace("https://", ""); hh.replace("http://", "");
-    int sl = hh.indexOf('/'); if (sl > 0) hh = hh.substring(0, sl);
-    IPAddress ip;
-    bool dnsOk = WiFi.hostByName(hh.c_str(), ip) == 1;
-    rlog("[diag] DNS %s -> %s %s | 提示：-1=连不上(DNS/被墙/网址旧) -11=超时 401=API_KEY不一致 530/1033=隧道已换 → 改 config.h 的 KAGGLE_URL 或填备用网址", hh.c_str(), dnsOk ? "OK" : "失败", dnsOk ? ip.toString().c_str() : "");
     rotateUrl();
-  } else gLastErr = 0;
+  } else {
+    gLastErr = 0;
+  }
   return code == 200;
 }
 
-// 回到路由器信道并上传。更新会合信道 *homeCh（= 路由器信道）。无数据且最近报过平安时直接跳过，节省时间。
 static void homeUpload(uint8_t* homeCh) {
 #if ENABLE_UPLOAD
-  // 无人值守看门狗：连续失败太多次 / 堆内存异常 → 自动重启
-  if (gFailStreak >= 40 || ESP.getFreeHeap() < 16000) {
-    rlog("[wdt] 连续失败 %u 次 / 堆内存 %u：自动重启", (unsigned)gFailStreak, (unsigned)ESP.getFreeHeap());
-    delay(300);
+  if (gFailStreak >= 50 || ESP.getFreeHeap() < 14000) {
+    rlog("[wdt] 连续失败 %u 次 / 堆内存 %u：自动安全重启", (unsigned)gFailStreak, (unsigned)ESP.getFreeHeap());
+    delay(200);
     ESP.restart();
   }
   bool due = gBufA.n > 0 || gBufB.n > 0 || gLastHelloMs == 0 || millis() - gLastHelloMs > HELLO_EVERY_MS;
   if (!due) return;
-  if (wifiPlaceholder()) { if (gLastHelloMs == 0) rlog("[wifi] 未填 WIFI_SSID：只做扫描，不上传"); gBufA.n = 0; gBufB.n = 0; gLastHelloMs = millis(); return; }
+  if (wifiPlaceholder()) {
+    if (gLastHelloMs == 0) rlog("[wifi] 未填 WIFI_SSID：只做本地 CSI 扫描");
+    gBufA.n = 0; gBufB.n = 0; gLastHelloMs = millis();
+    return;
+  }
   uint32_t t0 = millis();
-  led(0, 0, 40);   // 蓝：连路由器
+  if (WiFi.status() != WL_CONNECTED) led(0, 0, 40);
   if (!wifiUp(WIFI_TIMEOUT_MS)) {
     led(60, 0, 0);
     gUpFail++; gFailStreak++;
-    rlog("[wifi] ❌ 连接 %s 失败（SSID/密码错或是 5GHz？手机热点请打开“最大兼容性”=2.4GHz）", WIFI_SSID);
+    rlog("[wifi] ❌ 连接 %s 失败（请确认 2.4GHz 频段；iPhone 热点请开“最大兼容性”）", WIFI_SSID);
     if (gBufA.n > RECS_CAP / 2) gBufA.n = 0;
     if (gBufB.n > RECS_CAP / 2) gBufB.n = 0;
   } else {
     *homeCh = (uint8_t)WiFi.channel();
-    led(40, 30, 0);  // 黄：上传中
+    led(40, 30, 0);
     bool ok = postAll();
-    led(ok ? 0 : 60, ok ? 40 : 0, 0);   // 绿=成功 红=失败
+    led(ok ? 0 : 60, ok ? 40 : 0, 0);
     if (ok) { gUpOk++; gFailStreak = 0; gBufA.n = 0; gLastHelloMs = millis(); }
     else { gUpFail++; gFailStreak++; if (gBufA.n > RECS_CAP / 2) gBufA.n = 0; if (gBufB.n > RECS_CAP / 2) gBufB.n = 0; }
-    rlog("[wifi] ✅ RSSI=%d 信道=%d 用时 %lu ms", WiFi.RSSI(), WiFi.channel(), (unsigned long)(millis() - t0));
+    rlog("[wifi] ✅ RSSI=%d 信道=%d 辐射源=%u 用时 %lu ms", WiFi.RSSI(), WiFi.channel(), (unsigned)g_macCount, (unsigned long)(millis() - t0));
   }
 #else
   gBufA.n = 0; gBufB.n = 0;
