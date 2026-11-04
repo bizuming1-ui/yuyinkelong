@@ -2,7 +2,7 @@
 // 复制代码界面：每个文件都有「在 GitHub 编辑」+「复制此文件」，并实时检测 GitHub 上是否已是最新。
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { GITHUB_BRANCH, GITHUB_REPO } from "@/lib/config";
+import { GITHUB_BRANCH, GITHUB_REPO, OLD_FILE_HINTS } from "@/lib/config";
 import { gitShaVariants } from "@/lib/sha1";
 
 interface CodeFile {
@@ -17,35 +17,6 @@ type Sync = "unknown" | "synced" | "modified" | "missing";
 type Tab = "github" | "esp32-1" | "esp32-2" | "clean";
 
 const REPO_URL = `https://github.com/${GITHUB_REPO}`;
-
-// 旧版（Kaggle + Vite）遗留文件：新版已不再使用。即使 GitHub API 限流(403)，也能逐个用 raw 地址探测它们是否还在仓库里。
-const LEGACY_PATHS = [
-  "提示词",
-  "检测日志",
-  "web/index.html",
-  "web/package.json",
-  "web/tsconfig.json",
-  "web/scripts/build-kaggle.mjs",
-  "web/src/App.tsx",
-  "web/src/main.tsx",
-  "web/src/index.css",
-  "web/src/vite-env.d.ts",
-  "web/src/components/CodeBrowser.tsx",
-  "web/src/components/DiagPanel.tsx",
-  "web/src/components/Radar3D.tsx",
-  "web/src/components/SimulatorShell.tsx",
-  "web/src/lib/advisor.ts",
-  "web/src/lib/diag.ts",
-  "web/src/lib/radar.ts",
-  "web/src/lib/useRadar.ts",
-  "web/src/utils/cn.ts",
-  "tools/sim_esp32_csi.py",
-  "tools/test_host.py",
-  "tools/test_scene_server.py",
-  "tools/test_next_server.py",
-  "src/lib/diag.ts",
-  "src/lib/radar-store.ts",
-];
 const editUrl = (p: string, exists: boolean) =>
   exists
     ? `${REPO_URL}/edit/${GITHUB_BRANCH}/${p}`
@@ -92,10 +63,10 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
   const [tab, setTab] = useState<Tab>("github");
   const [remote, setRemote] = useState<Map<string, string> | null>(null);
   const [rawStatus, setRawStatus] = useState<Map<string, Sync> | null>(null);
+  const [hintOld, setHintOld] = useState<string[] | null>(null);
   const [checkedAt, setCheckedAt] = useState<string>("");
   const [checking, setChecking] = useState(false);
   const [err, setErr] = useState("");
-  const [legacyFound, setLegacyFound] = useState<string[] | null>(null);
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [toast, setToast] = useState("");
   const [ssid, setSsid] = useState("");
@@ -128,16 +99,31 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
     setChecking(true);
     setErr("");
     try {
-      const r = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/git/trees/${GITHUB_BRANCH}?recursive=1`, {
-        cache: "no-store",
-        headers: { Accept: "application/vnd.github+json" },
-      });
-      if (!r.ok) throw new Error(`GitHub API ${r.status}`);
-      const j = (await r.json()) as { tree: { path: string; type: string; sha: string }[] };
+      // 三级兜底：① 浏览器直连 GitHub API ② 本站服务器代理（可配 GITHUB_TOKEN）③ raw 文件逐个对比
+      let tree: { path: string; type: string; sha: string }[] | null = null;
+      let lastErr = "";
+      for (const url of [`https://api.github.com/repos/${GITHUB_REPO}/git/trees/${GITHUB_BRANCH}?recursive=1`, "/api/github-tree"]) {
+        try {
+          const r = await fetch(url, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
+          if (!r.ok) {
+            lastErr = `GitHub API ${r.status}`;
+            continue;
+          }
+          const j = (await r.json()) as { tree?: { path: string; type: string; sha: string }[] };
+          if (Array.isArray(j.tree)) {
+            tree = j.tree;
+            break;
+          }
+        } catch (e2) {
+          lastErr = String(e2 instanceof Error ? e2.message : e2);
+        }
+      }
+      if (!tree) throw new Error(lastErr || "GitHub API 不可用");
       const m = new Map<string, string>();
-      for (const t of j.tree) if (t.type === "blob") m.set(t.path, t.sha);
+      for (const t of tree) if (t.type === "blob") m.set(t.path, t.sha);
       setRemote(m);
       setRawStatus(null);
+      setHintOld(null);
     } catch (e) {
       // 兜底：API 限流/失败时，逐个下载 raw 文件对比内容
       try {
@@ -159,6 +145,22 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
           }
         };
         await Promise.all([worker(), worker(), worker(), worker()]);
+        // 顺便探测"已知旧文件"是否还在仓库里（raw 返回 200 即存在）
+        const found: string[] = [];
+        let k = 0;
+        const probe = async () => {
+          while (k < OLD_FILE_HINTS.length) {
+            const p = OLD_FILE_HINTS[k++];
+            try {
+              const rr = await fetch(`https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${p.split("/").map(encodeURIComponent).join("/")}?t=${Date.now()}`, { cache: "no-store" });
+              if (rr.ok) found.push(p);
+            } catch {
+              /* ignore */
+            }
+          }
+        };
+        await Promise.all([probe(), probe(), probe(), probe()]);
+        setHintOld(found.sort());
         setRawStatus(res);
         setRemote(null);
         setErr(`GitHub API 暂不可用（${String(e instanceof Error ? e.message : e)}），已改用 raw 文件对比（GitHub 缓存可能有几分钟延迟）`);
@@ -166,26 +168,6 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
         setErr("无法连接 GitHub（网络问题）。请稍后点「立即检测」。");
       }
     } finally {
-      // 旧文件探测（不依赖 GitHub API）：并发 6 个，raw 地址返回 200 就说明 GitHub 上还有这个旧文件
-      try {
-        const found: string[] = [];
-        let k = 0;
-        const probe = async () => {
-          while (k < LEGACY_PATHS.length) {
-            const lp = LEGACY_PATHS[k++];
-            try {
-              const rr = await fetch(`https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/${lp.split("/").map(encodeURIComponent).join("/")}?t=${Date.now()}`, { cache: "no-store" });
-              if (rr.ok) found.push(lp);
-            } catch {
-              /* 网络问题：忽略 */
-            }
-          }
-        };
-        await Promise.all([probe(), probe(), probe(), probe(), probe(), probe()]);
-        setLegacyFound(found.sort());
-      } catch {
-        /* ignore */
-      }
       setChecking(false);
       setCheckedAt(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
     }
@@ -230,11 +212,11 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
 
   const obsolete = useMemo(() => {
     const local = new Set(files.map((f) => f.path));
-    if (!remote) return (legacyFound ?? []).filter((p) => !local.has(p));
+    if (!remote) return (hintOld ?? []).filter((p) => !local.has(p));
     return Array.from(remote.keys())
       .filter((p) => !local.has(p) && !/^(LICENSE|\.github\/)/i.test(p))
       .sort();
-  }, [remote, legacyFound, files]);
+  }, [remote, files, hintOld]);
 
   const applyWifi = (f: CodeFile) => {
     if (!f.path.endsWith("include/config.h")) return f.content;
@@ -250,7 +232,7 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
     return false;
   });
 
-  const pioOrder = (p: string) => (p.endsWith("platformio.ini") ? 0 : p.endsWith("config.h") ? 1 : 2);
+  const pioOrder = (p: string) => (p.endsWith("platformio.ini") ? 0 : p.endsWith("upload_retry.py") ? 1 : p.endsWith("config.h") ? 2 : 3);
   const list = tab === "esp32-1" || tab === "esp32-2" ? [...visible].sort((a, b) => pioOrder(a.path) - pioOrder(b.path)) : visible;
   const isPio = tab === "esp32-1" || tab === "esp32-2";
 
@@ -342,11 +324,7 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
             <span className="rounded-full bg-orange-500/15 px-3 py-1 text-orange-300">需要更新 {counts.modified}</span>
             <span className="rounded-full bg-rose-500/15 px-3 py-1 text-rose-300">需要新建 {counts.missing}</span>
             <span className="rounded-full bg-slate-500/15 px-3 py-1 text-slate-300">共 {files.length} 个文件</span>
-            {obsolete.length > 0 && (
-              <button onClick={() => setTab("clean")} className="rounded-full bg-yellow-500/15 px-3 py-1 text-yellow-300 hover:bg-yellow-500/25">
-                GitHub 上有 {obsolete.length} 个旧文件待清理 →
-              </button>
-            )}
+            {obsolete.length > 0 && <span className="rounded-full bg-yellow-500/15 px-3 py-1 text-yellow-300">GitHub 上有 {obsolete.length} 个旧文件待清理</span>}
           </div>
           {err && <p className="mt-2 text-xs text-yellow-300">{err}</p>}
           {pending.length > 0 ? (
@@ -415,32 +393,30 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
             <h2 className="text-base font-bold text-white">烧录 {tab === "esp32-1" ? "ESP32-1（NODE_ID=1，主节点）" : "ESP32-2（NODE_ID=2，从节点）"}</h2>
             <ol className="list-decimal space-y-1 pl-5 text-sm leading-relaxed text-slate-300">
               <li>
-                VS Code → PlatformIO → 新建一个空文件夹工程（或直接用「下载 ZIP」解压后用 VS Code 打开），把下面 3 个文件<b>逐个复制并覆盖</b>：
+                VS Code → PlatformIO → 新建一个空文件夹工程（或直接用「下载 ZIP」解压后用 VS Code 打开），把下面 4 个文件<b>逐个复制并覆盖</b>（<b>4 个都要</b>，缺 upload_retry.py 编译会报错）：
                 <code className="mx-1 rounded bg-slate-800 px-1">platformio.ini</code>、
+                <code className="mx-1 rounded bg-slate-800 px-1">upload_retry.py</code>、
                 <code className="mx-1 rounded bg-slate-800 px-1">include/config.h</code>、
                 <code className="mx-1 rounded bg-slate-800 px-1">src/main.cpp</code>
               </li>
               <li>在下面填 WiFi 名称和密码（只保存在你浏览器里，复制出来的 config.h 会自动带上；GitHub 版本保持占位符，不会泄露密码）。</li>
               <li>
-                底部状态栏选环境 <b>n16r8</b> → Build → Upload（默认已是 115200 稳定速度）。上传前关闭串口监视器；优先用板子标 <b>UART</b> 的 USB 口。
-                失败就依次换环境：<b>n16r8_safe</b>（不压缩）→ <b>n16r8_slow</b>（57600）。
+                底部状态栏选环境 <b>n16r8</b> → Build → Upload。上传前关闭串口监视器；优先用板子标 <b>UART</b> 的 USB 口。烧录中途掉线时，<b>upload_retry.py 会自动等 COM 口恢复并降速重试最多 4 次</b>（日志里能看到 [upload_retry]）。仍失败 → 选 <b>n16r8_slow</b>，或按住 BOOT 点 RST 再 Upload。
               </li>
               <li>另一块板子重复，只是用 ESP32-2 的 config.h（NODE_ID=2）。两块都上电后，回到模拟器点「🔌 连接 ESP32」。</li>
             </ol>
-            <details className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-slate-300">
-              <summary className="cursor-pointer text-sm font-bold text-amber-300">🛠 烧录到一半报 OSError(22 指定不存在的设备) / 找不到 upload_port？点开看解决办法</summary>
-              <div className="mt-2 space-y-1.5">
-                <p><b>原因</b>：写到一半时 Windows 上这个 COM 口突然消失（USB 掉线/重新枚举），esptool 再配置串口就报错；第二次报「Please specify upload_port」是因为板子此时已经没有 COM 口。<b>不是代码错误</b>（固件已在本地用 PlatformIO 编译通过，RAM 14.5% / Flash 10.9%）。</p>
-                <ol className="list-decimal space-y-1 pl-5">
-                  <li>换一根<b>确定能传数据</b>的短 USB 线，直插电脑主板后置 USB-A 口（不要 HUB / 不要 Type-C 转接 / 不要前置面板口）。</li>
-                  <li>两个 USB 口里用标 <b>UART</b> 或 <b>COM</b> 的那个；关闭串口监视器、串口助手、Arduino IDE。</li>
-                  <li>手动进下载模式：<b>按住 BOOT 不放 → 点一下 RST → 松开 BOOT</b>。设备管理器会出现新的 COM 口，把它写进 platformio.ini 的 <code>upload_port = COMxx</code>（去掉行首分号）。</li>
-                  <li>依次尝试环境 <b>n16r8</b> → <b>n16r8_safe</b>（115200 + 不压缩）→ <b>n16r8_slow</b>（57600 + 不压缩）。</li>
-                  <li>设备管理器 → 通用串行总线控制器 → 每个「USB 根集线器」→ 电源管理 → 取消「允许计算机关闭此设备以节约电源」；控制面板 → 电源选项 → USB 选择性暂停设置 → 已禁用。</li>
-                  <li>CH340/CH343 驱动太新也会这样：卸载后装 2023 年以前的旧版驱动。仍不行就换电脑 USB 口或换线。</li>
-                  <li>烧录成功后：固件已启用 USB CDC，原生口一直保持为 COM 口，以后 Upload 会自动识别并自动复位，不再需要手动按键。</li>
-                </ol>
-              </div>
+            <details className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed text-amber-100">
+              <summary className="cursor-pointer text-sm font-semibold text-amber-300">
+                🛠 烧录写到一半报 “Cannot configure port … OSError(22, 指定不存在的设备)” / “Please specify upload_port” 怎么办？
+              </summary>
+              <ul className="mt-2 list-disc space-y-1 pl-5">
+                <li>含义：写入中途 Windows 的 COM 口消失（USB 掉线/重新枚举），第二次点 Upload 时电脑里根本没有端口，所以报 “Please specify upload_port”。不是代码错误。</li>
+                <li>软件侧：已内置 upload_retry.py，自动等端口回来 → 降速 → 改 ROM 直写，最多 4 次，全程不用你再点。</li>
+                <li>硬件侧（最关键）：换<b>带数据的短线</b>；<b>直插主板后面板 USB-A 口</b>（不要 HUB / Type-C 转接）；用标 <b>UART/COM</b> 的口，不要用标 USB 的原生口；只插当前要烧的一块板子。</li>
+                <li>关闭串口监视器 / 串口助手 / Arduino IDE；设备管理器 → USB 根集线器 → 电源管理，取消“允许计算机关闭此设备以节约电源”。</li>
+                <li>手动进下载模式：按住 BOOT → 点 RST → 松开 BOOT → 再点 Upload（日志出现 “Chip is ESP32-S3” 即成功连接）。</li>
+                <li>板子名称显示 “DevKitC-1-N8 (8 MB QD, No PSRAM)” 只是 PlatformIO 内置板卡的标题，实际由 platformio.ini 的 qio_opi + 16MB 配置覆盖，不影响 N16R8。</li>
+              </ul>
             </details>
             <div className="grid gap-2 sm:grid-cols-2">
               <input
@@ -475,7 +451,7 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
                 className="btn-primary"
                 onClick={async () => {
                   const ok = await copyText(list.map((f) => `// ======== ${f.path.replace(/^firmware\/esp32-\d\//, "")} ========\n${applyWifi(f)}`).join("\n\n"));
-                  say(ok ? "已复制全部 3 个文件（含分隔注释，建议还是逐个文件粘贴）" : "复制失败");
+                  say(ok ? "已复制全部 4 个文件（含分隔注释，建议还是逐个文件粘贴）" : "复制失败");
                 }}
               >
                 📋 复制全部（合并）
@@ -499,9 +475,9 @@ export default function CodeBrowser({ files }: { files: CodeFile[] }) {
             <p className="text-xs leading-relaxed text-slate-400">
               旧版是 Kaggle + Vite 方案（kaggle/、web/、旧的 src/、tools/*.py 等）。新版是 Next.js + MQTT，不再使用 Kaggle。这些旧文件留着不会报错，但会让仓库混乱；其中旧的 package.json / tsconfig.json 会被新版覆盖。点「删除」会打开 GitHub 的删除页面，滚到底点 Commit。
             </p>
-            {!remote && legacyFound === null && <p className="text-sm text-yellow-300">正在检测旧文件…（GitHub API 限流时改用 raw 逐个探测已知旧文件）</p>}
-            {!remote && legacyFound !== null && <p className="text-xs text-yellow-300">GitHub API 暂不可用，已用 raw 地址探测「已知旧文件」；不在已知清单里的多余文件需要 API 恢复后才能列出。</p>}
-            {(remote || legacyFound !== null) && obsolete.length === 0 && <p className="text-sm text-emerald-300">没有多余文件 🎉</p>}
+            {!remote && !hintOld && <p className="text-sm text-yellow-300">正在检测旧文件…（如长时间无结果请点「立即检测 GitHub」）</p>}
+            {!remote && hintOld && <p className="text-sm text-yellow-300">GitHub API 被限流，已用 raw 逐个探测「已知旧文件」（列表可能不完整，API 恢复后会自动列出全部）。</p>}
+            {(remote || hintOld) && obsolete.length === 0 && <p className="text-sm text-emerald-300">没有多余文件 🎉</p>}
             <ul className="space-y-1">
               {obsolete.map((p) => (
                 <li key={p} className="flex items-center gap-2 rounded border border-slate-800 bg-[#0a1322] px-3 py-1.5 text-sm">
