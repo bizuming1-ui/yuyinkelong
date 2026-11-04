@@ -1,6 +1,10 @@
-.pio/
-.vscode/
 node_modules/
 .next/
+.pio/
 __pycache__/
+*.pyc
+.DS_Store
 .env
+.env.*
+dist/
+generated/
