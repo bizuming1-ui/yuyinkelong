@@ -1,12 +1,12 @@
 // 复制代码界面：每个文件都有「在 GitHub 编辑」+「复制此文件」，并实时检测 GitHub 上是否已是最新。
-// 分三类：GitHub 全部文件 / PlatformIO · ESP32-1 / PlatformIO · ESP32-2（复制到 PlatformIO 烧录用）。
+// 分类：GitHub 全部文件 / PlatformIO · ESP32-A（发射端）/ ESP32-B（接收端1）/ ESP32-C（接收端2） / Kaggle（粘贴到 Notebook 运行）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GITHUB_BRANCH, GITHUB_REPO, OLD_FILE_HINTS } from "@/lib/config";
 import { gitShaVariants } from "@/lib/sha1";
 import { FILES, type CodeFile } from "@/lib/manifest";
 
 type Sync = "unknown" | "synced" | "modified" | "missing";
-type Tab = "github" | "esp32-1" | "esp32-2" | "clean";
+type Tab = "github" | "esp32-a" | "esp32-b" | "esp32-c" | "kaggle" | "clean";
 
 const REPO_URL = `https://github.com/${GITHUB_REPO}`;
 const editUrl = (p: string, exists: boolean) => (exists ? `${REPO_URL}/edit/${GITHUB_BRANCH}/${p}` : `${REPO_URL}/new/${GITHUB_BRANCH}?filename=${encodeURIComponent(p)}`);
@@ -37,16 +37,37 @@ async function downloadZip(name: string, entries: { path: string; content: strin
   const zip = new JSZip();
   for (const e of entries) zip.file(e.path, e.content);
   const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } catch {
+    window.open(url, "_blank"); // 兜底：个别浏览器拦截 download 属性时，在新标签页打开 blob
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+function downloadText(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = name;
   document.body.appendChild(a);
   a.click();
-  setTimeout(() => {
-    URL.revokeObjectURL(a.href);
-    a.remove();
-  }, 2000);
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
+
+const PIO_TABS: Record<string, { title: string; dir: string; role: string; node: string }> = {
+  "esp32-a": { title: "ESP32-A · 发射端 TX", dir: "firmware/esp32-a/", role: "NODE_ROLE = ROLE_A", node: "探测发射端：以 100Hz 向 B/C 广播带序列号的 ESP-NOW(HT MCS0) 探测帧" },
+  "esp32-b": { title: "ESP32-B · 接收端 RX1", dir: "firmware/esp32-b/", role: "NODE_ROLE = ROLE_B", node: "接收 A 的探测帧 → CSI → MQTT 上传" },
+  "esp32-c": { title: "ESP32-C · 接收端 RX2", dir: "firmware/esp32-c/", role: "NODE_ROLE = ROLE_C", node: "接收 A 的探测帧 → CSI → MQTT 上传" },
+};
 
 export default function CodeBrowser() {
   const files = FILES;
@@ -207,11 +228,12 @@ export default function CodeBrowser() {
     return c;
   };
 
-  const isPio = tab === "esp32-1" || tab === "esp32-2";
+  const isPio = tab === "esp32-a" || tab === "esp32-b" || tab === "esp32-c";
   const pioOrder = (p: string) => (p.endsWith("platformio.ini") ? 0 : p.endsWith("upload_retry.py") ? 1 : p.endsWith("config.h") ? 2 : 3);
+  const siteUrl = typeof window !== "undefined" ? window.location.href.split("#")[0] : "";
   const visible = files.filter((f) => {
     if (tab === "github") return !q || f.path.toLowerCase().includes(q.toLowerCase());
-    if (isPio) return f.group === tab;
+    if (isPio || tab === "kaggle") return f.group === tab;
     return false;
   });
   const list = isPio ? [...visible].sort((a, b) => pioOrder(a.path) - pioOrder(b.path)) : visible;
@@ -229,7 +251,7 @@ export default function CodeBrowser() {
 
   const renderCard = (f: CodeFile) => {
     const s = statusOf(f.path);
-    const text = isPio ? applyWifi(f) : f.content;
+    const text = isPio || tab === "kaggle" ? applyWifi(f) : f.content;
     const isOpen = !!open[f.path];
     const exists = s !== "missing";
     return (
@@ -306,6 +328,16 @@ export default function CodeBrowser() {
               {obsolete.length > 0 && <span className="rounded-full bg-purple-500/15 px-3 py-1 font-bold text-purple-300">🗑 GitHub 上多余 {obsolete.length}</span>}
             </div>
             {err && <div className="mt-2 text-xs text-amber-300">{err}</div>}
+            <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-cyan-500/30 bg-cyan-950/10 p-3 text-xs">
+              <span className="font-bold text-cyan-300">🌐 本模拟器网址</span>
+              <code className="min-w-0 flex-1 break-all rounded bg-slate-900 px-2 py-1 text-cyan-100">{siteUrl}</code>
+              <button className="rounded-lg bg-cyan-400 px-3 py-1.5 font-bold text-slate-900 hover:bg-cyan-300" onClick={async () => say((await copyText(siteUrl)) ? "已复制网址" : "复制失败")}>
+                复制网址
+              </button>
+              <a className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-1.5 font-bold text-slate-100 hover:bg-slate-700" href={siteUrl} target="_blank" rel="noreferrer">
+                新标签页打开
+              </a>
+            </div>
             {pending.length > 0 ? (
               <div className="mt-3 rounded-xl border border-orange-500/40 bg-orange-950/20 p-3">
                 <div className="mb-2 text-sm font-bold text-orange-300">⚠️ 这 {pending.length} 个文件还没更新到 GitHub（点文件名跳到 GitHub 编辑）：</div>
@@ -324,32 +356,45 @@ export default function CodeBrowser() {
               <button className="rounded-lg bg-cyan-400 px-3 py-2 text-sm font-bold text-slate-900 hover:bg-cyan-300" onClick={() => downloadZip("yuyinkelong-all.zip", files.map((f) => ({ path: f.path, content: f.content }))).then(() => say("已开始下载 yuyinkelong-all.zip"))}>
                 ⬇️ 下载全部代码 ZIP
               </button>
-              <button className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700" onClick={() => downloadZip("platformio-esp32-1.zip", files.filter((f) => f.group === "esp32-1").map((f) => ({ path: f.path.replace("firmware/esp32-1/", ""), content: applyWifi(f) }))).then(() => say("已开始下载 ESP32-1 工程"))}>
-                ⬇️ ESP32-1 PlatformIO 工程 ZIP
-              </button>
-              <button className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700" onClick={() => downloadZip("platformio-esp32-2.zip", files.filter((f) => f.group === "esp32-2").map((f) => ({ path: f.path.replace("firmware/esp32-2/", ""), content: applyWifi(f) }))).then(() => say("已开始下载 ESP32-2 工程"))}>
-                ⬇️ ESP32-2 PlatformIO 工程 ZIP
+              {(["esp32-a", "esp32-b", "esp32-c"] as const).map((k) => (
+                <button
+                  key={k}
+                  className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700"
+                  onClick={() =>
+                    downloadZip(
+                      `platformio-${k}.zip`,
+                      files.filter((f) => f.group === k).map((f) => ({ path: f.path.replace(PIO_TABS[k].dir, ""), content: applyWifi(f) })),
+                    ).then(() => say(`已开始下载 ${PIO_TABS[k].title} 工程`))
+                  }
+                >
+                  ⬇️ {PIO_TABS[k].title.split(" · ")[0]} PlatformIO 工程 ZIP
+                </button>
+              ))}
+              <button className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700" onClick={() => files.filter((f) => f.group === "kaggle").forEach((f) => downloadText(f.path.split("/").pop() || "kaggle.py", f.content))}>
+                ⬇️ Kaggle 文件
               </button>
             </div>
           </section>
 
           <div className="flex flex-wrap gap-2">
             {tabBtn("github", "📁 GitHub 代码文件", <span className="opacity-70">({files.length})</span>)}
-            {tabBtn("esp32-1", "🔵 PlatformIO · ESP32-1")}
-            {tabBtn("esp32-2", "🟣 PlatformIO · ESP32-2")}
+            {tabBtn("esp32-a", "🔵 PlatformIO · ESP32-A 发射端")}
+            {tabBtn("esp32-b", "🟢 PlatformIO · ESP32-B 接收端1")}
+            {tabBtn("esp32-c", "🟢 PlatformIO · ESP32-C 接收端2")}
+            {tabBtn("kaggle", "🟠 Kaggle 运行代码")}
             {tabBtn("clean", "🗑 GitHub 上多余的旧文件", <span className="opacity-70">({obsolete.length})</span>)}
           </div>
 
           {isPio && (
             <section className="rounded-2xl border border-cyan-500/30 bg-cyan-950/10 p-4 text-sm">
-              <div className="mb-2 font-bold text-cyan-300">{tab === "esp32-1" ? "ESP32-1（NODE_ID = 1，主节点：发起 13 信道扫频）" : "ESP32-2（NODE_ID = 2，从节点：跟随扫频）"} · 烧录步骤</div>
+              <div className="mb-2 font-bold text-cyan-300">{PIO_TABS[tab]?.title}（{PIO_TABS[tab]?.role}）· {PIO_TABS[tab]?.node}</div>
               <ol className="list-decimal space-y-1 pl-5 text-slate-300">
                 <li>VS Code → PlatformIO → 新建一个空工程文件夹（板子随便选，下面的 platformio.ini 会覆盖）。</li>
                 <li>
-                  下面 4 个文件逐个「复制此文件」，粘贴覆盖到工程里对应路径（也可点上面的 <b>ZIP</b> 一次性下载整个工程）。
+                  下面 4 个文件（platformio.ini / upload_retry.py / include/config.h / src/main.cpp）逐个「复制此文件」，粘贴覆盖到工程里对应路径（也可点上面的 <b>ZIP</b> 一次性下载整个工程）。
                 </li>
                 <li>在下面填好 2.4GHz WiFi，复制出来的 config.h 会自动带上（只保存在你自己的浏览器里）。</li>
-                <li>环境选 n16r8 → Upload。成功后串口应显示「[PING] 开始 ping 网关」。</li>
+                <li>环境选 n16r8 → Upload。成功后串口监视器应出现「[BOOT] ESP32-S3 CSI v4」和「[状态] …」行。三块板必须使用同一个 WiFi，且配置里的 MQTT_ROOT 保持一致。</li>
               </ol>
               <div className="mt-3 grid gap-2 sm:grid-cols-2">
                 <label className="text-xs text-slate-400">
@@ -385,6 +430,18 @@ export default function CodeBrowser() {
                   />
                 </label>
               </div>
+            </section>
+          )}
+
+          {tab === "kaggle" && (
+            <section className="rounded-2xl border border-amber-500/30 bg-amber-950/10 p-4 text-sm">
+              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle（T4×2）运行步骤</div>
+              <ol className="list-decimal space-y-1 pl-5 text-slate-300">
+                <li>Kaggle → New Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 ×2</b>，<b>Internet 打开 (On)</b>。</li>
+                <li>下面的 <code>kaggle/kaggle_cell.py</code>「复制此文件」，粘贴进 Notebook 的<b>第一个代码单元</b>，点 Run。</li>
+                <li>单元输出框里会打印一个 <b>https://xxxx.trycloudflare.com</b> 网址（点开就是本 3D 浏览器模拟器），单元会一直运行并每 30 秒打印健康统计。</li>
+                <li>Kaggle 会话有时长上限、可能被回收：它只提供网页托管 + GPU 离线分析 + 原始 CSI 落盘；<b>设备→浏览器的 MQTT 链路不依赖 Kaggle</b>，Kaggle 停了也不会让 ESP32 断连。</li>
+              </ol>
             </section>
           )}
 
