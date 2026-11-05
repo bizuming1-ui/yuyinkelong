@@ -23,6 +23,7 @@ export interface NodeStatus {
   nowTx?: number;
   nowTxFail?: number;
   sweeps?: number;
+  ap?: number;
   peer?: boolean;
   broker?: number;
   csiOk?: boolean;
