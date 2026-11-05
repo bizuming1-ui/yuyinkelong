@@ -18,17 +18,21 @@
 #define MQTT_ROOT "bzm-csi/s3r-7f3a9c2e"
 // 公共 MQTT 服务器列表：第一个连不上自动换下一个；浏览器同时连接这三个，所以无论 ESP32 走哪个都能收到。
 // 实测：EMQX 公共服务器对单个连接限流约 10 条消息/秒，HiveMQ 可到 40+ 条/秒，所以 HiveMQ 放第一；
-// 同时固件把发布频率限制在 ≤7.7 条/秒、每条合并多帧 CSI，任何服务器都不会因限流丢数据。
+// 同时固件把发布频率限制在 ≤9 条/秒、每条合并多帧 CSI，任何服务器都不会因限流丢数据。
 #define MQTT_BROKER_COUNT 3
 #define MQTT_BROKERS { {"broker.hivemq.com", 1883}, {"broker.emqx.io", 1883}, {"test.mosquitto.org", 1883} }
 #define MQTT_KEEPALIVE_S 20
 
 // ---------------- CSI 采集 ----------------
 #define PROBE_HZ           50            // 两节点之间互发 ESP-NOW 探测帧频率（每个节点每秒发多少帧）
-#define AP_CSI_MAX_HZ       5            // 路由器信标 CSI 的最大上报频率
+// ★ v3 新增：路由器链路（人体检测灵敏度的关键）。ESP32 每秒 ping 路由器网关 AP_PING_HZ 次，
+//   路由器的每个回包都会产生一条 CSI（链路 = 路由器→本板，路径穿过整个房间，比 0.3m 的板间短链路灵敏得多）。
+//   设为 0 则只用路由器信标(约 10Hz)。
+#define AP_PING_HZ         30            // ping 路由器频率（0 = 关闭）
+#define AP_CSI_MAX_HZ      40            // 路由器 CSI 的最大上报频率（≥ AP_PING_HZ）
 #define BATCH_MAX          14            // 每个 MQTT 包最多合并几条 CSI（14 条 ≈ 1.9KB）
 #define BATCH_MAX_AGE_MS  100            // 最长等待多久必须发出
-#define PUBLISH_MIN_MS    130            // 两次发布的最小间隔（≈7.7 条/秒，低于公共服务器限流）
+#define PUBLISH_MIN_MS    110            // 两次发布的最小间隔（≈9 条/秒，低于公共服务器限流；越小画面越跟手）
 
 // ---------------- 多信道拼接（扫频）：1..13 信道，拼出约 76MHz 合成带宽 ----------------
 #define SWEEP_ENABLE        1            // 1 = 开启；0 = 只在路由器信道工作（最稳，但只有 20MHz 带宽）
