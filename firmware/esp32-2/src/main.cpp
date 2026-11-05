@@ -20,10 +20,12 @@
 #include <esp_wifi.h>
 #include <esp_now.h>
 #include <esp_task_wdt.h>
+#include "ping/ping_sock.h"
+#include "lwip/ip_addr.h"
 #include "config.h"
 
 // ---------------------------------------------------------------- 常量与数据结构
-#define FW_VERSION      "2.0"
+#define FW_VERSION      "3.0"
 #define PKT_MAGIC       0xB7
 #define PKT_PROBE       1
 #define PKT_SWEEP       2
@@ -78,6 +80,9 @@ static volatile bool wifiUp = false;
 static uint8_t apBssid[6] = {0};
 static volatile uint32_t lastApMs = 0;
 static volatile bool csiOk = false;
+static volatile uint32_t statAp = 0;     // 收到并上报的路由器 CSI 条数
+static esp_ping_handle_t pingH = nullptr;
+static uint32_t pingGw = 0;
 
 static WiFiClient net;
 static PubSubClient mqtt(net);
@@ -109,7 +114,7 @@ static void hopTo(uint8_t ch) {
 // ---------------------------------------------------------------- CSI 回调（WiFi 任务里，必须极快）
 static void csiCb(void* ctx, wifi_csi_info_t* info) {
   (void)ctx;
-  if (!info || !info->buf || info->len != CSI_BYTES) return;
+  if (!info || !info->buf || info->len < CSI_BYTES) return;   // LLTF 在缓冲区最前面 128 字节
   uint8_t link;
   uint32_t now = millis();
   if (peerKnown && memcmp(info->mac, peerMac, 6) == 0) {
@@ -119,6 +124,7 @@ static void csiCb(void* ctx, wifi_csi_info_t* info) {
     if (now - lastApMs < (1000 / AP_CSI_MAX_HZ)) return;
     lastApMs = now;
     link = LINK_AP;
+    statAp++;
   } else {
     return;
   }
@@ -296,6 +302,36 @@ static void wifiMaintain() {
   }
 }
 
+// ---------------------------------------------------------------- 路由器链路：周期 ping 网关，路由器回包 → CSI
+static void pingMaintain() {
+#if AP_PING_HZ > 0
+  if (!wifiUp) return;
+  IPAddress gw = WiFi.gatewayIP();
+  uint32_t g = (uint32_t)gw;
+  if (g == 0) return;
+  if (pingH && g == pingGw) return;
+  if (pingH) { esp_ping_stop(pingH); esp_ping_delete_session(pingH); pingH = nullptr; }
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  cfg.count = ESP_PING_COUNT_INFINITE;
+  cfg.interval_ms = 1000 / AP_PING_HZ;
+  cfg.timeout_ms = 150;            // 路由器不回 ICMP 时也不会拖慢发送节奏
+  cfg.data_size = 8;
+  cfg.task_stack_size = 3072;
+  cfg.task_prio = 2;
+  ip_addr_t target;
+  ip_addr_set_ip4_u32(&target, g);
+  cfg.target_addr = target;
+  esp_ping_callbacks_t cbs = {};
+  if (esp_ping_new_session(&cfg, &cbs, &pingH) == ESP_OK && esp_ping_start(pingH) == ESP_OK) {
+    pingGw = g;
+    Serial.printf("[PING] 开始 ping 网关 %s，%d 次/秒（用于路由器链路 CSI）\n", gw.toString().c_str(), AP_PING_HZ);
+  } else {
+    pingH = nullptr;
+    Serial.println("[PING] 创建失败，仅使用路由器信标 CSI");
+  }
+#endif
+}
+
 // ---------------------------------------------------------------- MQTT
 static void onMqtt(char* topic, uint8_t* payload, unsigned int len) {
   (void)topic;
@@ -307,16 +343,16 @@ static void onMqtt(char* topic, uint8_t* payload, unsigned int len) {
 }
 
 static void publishStatus() {
-  char js[420];
+  char js[460];
   uint32_t up = millis() / 1000;
   int n = snprintf(js, sizeof(js),
     "{\"id\":%d,\"online\":true,\"fw\":\"%s\",\"up\":%lu,\"heap\":%u,\"psram\":%u,\"rssi\":%d,\"ch\":%u,\"ip\":\"%s\","
-    "\"csi\":%lu,\"drop\":%lu,\"pub\":%lu,\"pubFail\":%lu,\"nowRx\":%lu,\"nowTx\":%lu,\"nowTxFail\":%lu,\"sweeps\":%lu,"
+    "\"csi\":%lu,\"drop\":%lu,\"pub\":%lu,\"pubFail\":%lu,\"nowRx\":%lu,\"nowTx\":%lu,\"nowTxFail\":%lu,\"sweeps\":%lu,\"ap\":%lu,"
     "\"peer\":%s,\"broker\":%u,\"sweepOn\":%d,\"csiOk\":%s}",
     NODE_ID, FW_VERSION, (unsigned long)up, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(), (int)WiFi.RSSI(), homeCh,
     WiFi.localIP().toString().c_str(),
     (unsigned long)statCsi, (unsigned long)statDrop, (unsigned long)statPub, (unsigned long)statPubFail,
-    (unsigned long)statNowRx, (unsigned long)statNowTx, (unsigned long)statNowTxFail, (unsigned long)statSweeps,
+    (unsigned long)statNowRx, (unsigned long)statNowTx, (unsigned long)statNowTxFail, (unsigned long)statSweeps, (unsigned long)statAp,
     (peerKnown && millis() - peerLastMs < 3000) ? "true" : "false", brokerIdx, SWEEP_ENABLE, csiOk ? "true" : "false");
   if (n > 0) mqtt.publish(topicStatus, (const uint8_t*)js, (unsigned)n, true);
 }
@@ -441,6 +477,7 @@ void loop() {
   wifiMaintain();
 
   if (wifiUp) {
+    pingMaintain();
     mqttMaintain();
     if (mqtt.connected()) {
       mqtt.loop();
@@ -462,8 +499,8 @@ void loop() {
 
   if (millis() - lastLogMs > 3000) {
     lastLogMs = millis();
-    Serial.printf("[状态] wifi=%d mqtt=%d ch=%u rssi=%d 对端=%d csi=%lu 发布=%lu 失败=%lu 丢=%lu 扫频=%lu 堆=%u\n",
-                  (int)wifiUp, (int)mqtt.connected(), homeCh, (int)WiFi.RSSI(), (int)(peerKnown && millis() - peerLastMs < 3000),
+    Serial.printf("[状态] wifi=%d mqtt=%d ch=%u rssi=%d 对端=%d 路由器CSI=%lu csi=%lu 发布=%lu 失败=%lu 丢=%lu 扫频=%lu 堆=%u\n",
+                  (int)wifiUp, (int)mqtt.connected(), homeCh, (int)WiFi.RSSI(), (int)(peerKnown && millis() - peerLastMs < 3000), (unsigned long)statAp,
                   (unsigned long)statCsi, (unsigned long)statPub, (unsigned long)statPubFail, (unsigned long)statDrop,
                   (unsigned long)statSweeps, (unsigned)ESP.getFreeHeap());
   }
