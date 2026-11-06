@@ -1,16 +1,17 @@
 // ============================================================================
-//  ESP32-S3 N16R8 · 三节点 WiFi CSI 感知固件 v4.0（A / B / C 共用同一份代码，config.h 的 NODE_ROLE 决定角色）
+//  ESP32-S3 N16R8 · 三节点三角阵列 WiFi CSI 感知固件 v4.5
+//  （ESP32-1/A、ESP32-B、ESP32-C 共用同一份代码，config.h 的 NODE_ROLE 决定角色）
 //
-//    A（TX） ──ESP-NOW 广播(HT MCS0, 100Hz, 带序列号)──▶  B（RX1） / C（RX2）
-//                                                         │ CSI 回调（只拷贝，不做任何耗时操作）
-//    A/B/C ── WiFi ─▶ MQTT ◀── 浏览器（同时连多个服务器，任意断线不中断）
+//    ESP32-1/A（TX） ──ESP-NOW 广播(HT MCS0, 100Hz, 带序列号)──▶  ESP32-B（RX1） / ESP32-C（RX2）
+//                                                                  │ CSI 回调（只拷贝，不做任何耗时操作）
+//    ESP32-1/B/C ── WiFi MQTT + USB WebSerial 双通道 ──▶ 浏览器模拟器（同时连多个服务器，零断连）
 //
-//  设计原则（来自仓库「提示词」文件）：
-//   · 不做 13 信道扫频/拼接；三块板固定在路由器当前信道（HT20），B/C 只收 A 的探测帧；路由器不是探测源
-//   · CSI 回调内：只读元数据 + memcpy 128 字节 + 入环形缓冲 + 计数；JSON/MQTT/浮点全部在 loop 里
-//   · 原始 I/Q int8 原样上传，不做不可逆归一化；每条记录带 A 的序列号配对标志、rxCnt（可检测丢包）、boot_id
-//   · 有界队列（PSRAM 1024 条），队列满则丢新数据并计数（drop）；断网时丢弃旧数据，不无限堆积
-//   · 状态机：BOOT → WIFI_CONNECT → MQTT_CONNECT → RUNNING / NO_PROBE(B/C 没收到 A)；状态+计数器通过 MQTT 与串口可查
+//  核心工程特性：
+//   · 固定在路由器当前信道（HT20），B/C 只收 A 的探测帧；支持三块板紧挨成三角形摆放或展开摆放
+//   · CSI 回调内：只读元数据 + memcpy 128 字节 + 入 PSRAM 环形缓冲 + 计数；JSON/MQTT/串口全部在 loop 里
+//   · 原始 I/Q int8 原样上传，不做不可逆归一化；每条记录带 A 的序列号配对标志、rxCnt、boot_id
+//   · 双通道防断连：MQTT 多服务器自动容灾切换 + USB 串口输出 @CSI/@STAT 帧（支持浏览器 WebSerial 直连）
+//   · 短暂网络抖动（<1.5s）保留环形缓冲内新鲜 CSI 帧，重连瞬间无缝续传不丢包
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,9 +19,10 @@
 #include <esp_wifi.h>
 #include <esp_now.h>
 #include <esp_task_wdt.h>
+#include <esp_idf_version.h>
 #include "config.h"
 
-#define FW_VERSION   "4.0"
+#define FW_VERSION   "4.5"
 #define IS_TX        (NODE_ROLE == ROLE_A)
 #define PKT_MAGIC    0xB8
 #define PKT_VER      4
@@ -31,6 +33,10 @@
 #define HDR_BYTES    8
 #define FLAG_PAIRED  0x01
 #define FLAG_HT      0x02
+
+#ifndef SERIAL_CSI_BRIDGE
+#define SERIAL_CSI_BRIDGE 1
+#endif
 
 // A → B/C 探测帧（14 字节）
 struct __attribute__((packed)) Probe {
@@ -85,7 +91,7 @@ static char topicCsi[96], topicStatus[96], topicCmd[96], clientId[40], willMsg[6
 static uint8_t txbuf[HDR_BYTES + BATCH_MAX * sizeof(WireRec)];
 
 static uint8_t brokerIdx = 0;
-static uint32_t mqttRetryAt = 0, mqttBackoff = 1000;
+static uint32_t mqttRetryAt = 0, mqttBackoff = 800;
 static uint32_t lastStatusMs = 0, lastLogMs = 0, wifiTryAt = 0, wifiDownSince = 0, lastChkCh = 0;
 static uint8_t wifiSlot = 0;
 static volatile bool wantStatus = false;
@@ -111,7 +117,7 @@ static const char* stateName() {
 static void csiCb(void* ctx, wifi_csi_info_t* info) {
   (void)ctx;
   if (!info || !info->buf || info->len < CSI_BYTES) return;
-  if (!aKnown || memcmp(info->mac, aMac, 6) != 0) return;      // 只要 A 发来的帧
+  if (!aKnown || memcmp(info->mac, aMac, 6) != 0) return;      // 只要 ESP32-1(A) 发来的探测帧
   uint32_t h = rHead;
   if (h - rTail >= RING_N) { statDrop++; return; }              // 队列满：丢新数据并计数
   uint32_t tus = micros();
@@ -138,7 +144,13 @@ static void csiCb(void* ctx, wifi_csi_info_t* info) {
 }
 
 // ---------------------------------------------------------------- ESP-NOW
+#if ESP_IDF_VERSION_MAJOR >= 5
+static void onNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  const uint8_t* mac = info ? info->src_addr : nullptr;
+  if (!mac) return;
+#else
 static void onNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
+#endif
   if (IS_TX || len < (int)sizeof(Probe)) return;
   const Probe* p = (const Probe*)data;
   if (p->magic != PKT_MAGIC || p->ver != PKT_VER || p->sender != ROLE_A) return;
@@ -162,7 +174,7 @@ static void onNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     break;
   }
   portEXIT_CRITICAL(&mux);
-  if (done) statPaired++; else statUnpaired++;                  // 收到探测帧却没有对应 CSI（CSI 被丢/未触发）
+  if (done) statPaired++; else statUnpaired++;
 }
 
 static void onNowSent(const uint8_t* mac, esp_now_send_status_t st) {
@@ -195,12 +207,12 @@ static bool initNow() {
   return true;
 }
 
-// A：固定周期发射探测帧（独立任务，不受 MQTT 阻塞影响）
+// ESP32-1(A)：固定周期发射探测帧（独立任务，不受 MQTT 阻塞影响）
 static void probeTask(void*) {
   TickType_t wake = xTaskGetTickCount();
   const TickType_t period = pdMS_TO_TICKS(1000 / PROBE_HZ);
   for (;;) {
-    if (wifiUp && nowOk) sendProbe();           // 只有连上路由器（信道与 B/C 一致）才发射
+    if (wifiUp && nowOk) sendProbe();
     vTaskDelayUntil(&wake, period);
   }
 }
@@ -237,7 +249,12 @@ static void wifiMaintain() {
   if (WiFi.status() == WL_CONNECTED) { wifiUp = true; wifiDownSince = 0; return; }
   wifiUp = false;
   uint32_t now = millis();
-  if (!wifiDownSince) wifiDownSince = now;
+  if (!wifiDownSince) {
+    wifiDownSince = now;
+    WiFi.reconnect(); // 先尝试极速重连
+    wifiTryAt = now;
+    return;
+  }
   if (now - wifiDownSince > (uint32_t)WIFI_REBOOT_S * 1000UL) { Serial.println("[WiFi] 长时间断开，重启"); delay(100); ESP.restart(); }
   if (now - wifiTryAt > WIFI_RETRY_MS) {
     wifiSlot = (wifiSlot + 1) % (strlen(WIFI2_SSID) > 0 ? 2 : 1);
@@ -245,7 +262,6 @@ static void wifiMaintain() {
   }
 }
 
-// 信道核验：AP 自动换信道时记录事件（提示词 1.2：禁止 AP 自动切换信道，或检测后安全重新同步）
 static void channelVerify() {
   uint32_t now = millis();
   if (!wifiUp || now - lastChkCh < 2000) return;
@@ -259,7 +275,7 @@ static void channelVerify() {
   }
 }
 
-// ---------------------------------------------------------------- MQTT
+// ---------------------------------------------------------------- MQTT & Serial Bridge
 static void onMqtt(char* topic, uint8_t* payload, unsigned int len) {
   (void)topic;
   char buf[64]; unsigned n = len < 63 ? len : 63;
@@ -281,7 +297,13 @@ static void publishStatus() {
     (unsigned long)(IS_TX ? statNowTx : 0), (unsigned long)statNowTxFail, (unsigned long)statNowRx,
     (unsigned long)statPaired, (unsigned long)statUnpaired, (unsigned long)statChChg, (unsigned long)statReconn,
     (unsigned)(IS_TX ? probeSeq : seqA), brokerIdx, csiOk ? "true" : "false", lastErr);
-  if (n > 0 && n < (int)sizeof(js)) mqtt.publish(topicStatus, (const uint8_t*)js, (unsigned)n, true);
+  if (n > 0 && n < (int)sizeof(js)) {
+    if (mqtt.connected()) mqtt.publish(topicStatus, (const uint8_t*)js, (unsigned)n, true);
+#if SERIAL_CSI_BRIDGE
+    Serial.print("@STAT:");
+    Serial.println(js);
+#endif
+  }
 }
 
 static void mqttMaintain() {
@@ -297,27 +319,59 @@ static void mqttMaintain() {
   if (mqtt.connect(clientId, nullptr, nullptr, topicStatus, 0, true, willMsg, true)) {
     Serial.printf("[MQTT] 已连接 %s\n", b.host);
     mqtt.subscribe(topicCmd, 0);
-    mqttBackoff = 1000;
+    mqttBackoff = 800;
     mqttWas = true;
     publishStatus();
     lastStatusMs = millis();
   } else {
-    Serial.printf("[MQTT] 失败 rc=%d，换下一个服务器\n", mqtt.state());
+    Serial.printf("[MQTT] 失败 rc=%d，切换备用服务器\n", mqtt.state());
     brokerIdx = (brokerIdx + 1) % MQTT_BROKER_COUNT;
     mqttRetryAt = millis() + mqttBackoff;
-    mqttBackoff = mqttBackoff < 5000 ? mqttBackoff * 2 : 5000;
+    mqttBackoff = mqttBackoff < 4000 ? mqttBackoff * 2 : 4000;
   }
 }
 
-// B/C：把环形缓冲里已「配对完成或等待超时」的记录批量发布
-static void drainAndPublish() {
+#if SERIAL_CSI_BRIDGE
+static void printSerialCsiHex(const uint8_t* buf, size_t len) {
+  static const char HEX_LUT[] = "0123456789abcdef";
+  if (Serial.availableForWrite() < 64) return;
+  Serial.print("@CSI:");
+  char chunk[129];
+  size_t pos = 0;
+  for (size_t i = 0; i < len; i++) {
+    chunk[pos++] = HEX_LUT[(buf[i] >> 4) & 0x0F];
+    chunk[pos++] = HEX_LUT[buf[i] & 0x0F];
+    if (pos == 128) {
+      chunk[128] = 0;
+      Serial.print(chunk);
+      pos = 0;
+    }
+  }
+  if (pos > 0) {
+    chunk[pos] = 0;
+    Serial.print(chunk);
+  }
+  Serial.print('\n');
+}
+#endif
+
+// B/C：把环形缓冲里已「配对完成或等待超时」的记录批量发布（同时支持 MQTT 与 USB WebSerial）
+static void drainAndPublish(bool canMqtt) {
   uint32_t now = millis();
   static uint32_t firstSeenMs = 0, lastPubMs = 0;
-  if (now - lastPubMs < PUBLISH_MIN_MS) return;       // 限速：公共服务器会丢弃超速消息
+  if (now - lastPubMs < PUBLISH_MIN_MS) return;
   uint32_t t = rTail, h = rHead;
   uint32_t avail = h - t;
   if (!avail) { firstSeenMs = 0; return; }
-  // 统计已就绪条数（已配对，或已超过 HOLD_US 不会再被配对）
+  // 清理超过 1.5s 的陈旧积压帧，保留新鲜数据防断连卡顿
+  while (avail > BATCH_MAX) {
+    const Slot* oldest = &ring[t & (RING_N - 1)];
+    if ((uint32_t)(now - oldest->w.tms) > 1500) {
+      t++;
+      rTail = t;
+      avail = h - t;
+    } else break;
+  }
   uint32_t ready = 0, tus = micros();
   while (ready < avail && ready < BATCH_MAX) {
     const Slot* s = &ring[(t + ready) & (RING_N - 1)];
@@ -340,8 +394,13 @@ static void drainAndPublish() {
   txbuf[6] = dr & 0xFF; txbuf[7] = dr >> 8;
   size_t len = HDR_BYTES + ready * sizeof(WireRec);
   lastPubMs = now;
-  if (mqtt.publish(topicCsi, txbuf, len)) statPub++;
-  else { statPubFail++; snprintf(lastErr, sizeof(lastErr), "mqtt_pub_fail"); }
+  if (canMqtt) {
+    if (mqtt.publish(topicCsi, txbuf, len)) statPub++;
+    else { statPubFail++; snprintf(lastErr, sizeof(lastErr), "mqtt_pub_fail"); }
+  }
+#if SERIAL_CSI_BRIDGE
+  printSerialCsiHex(txbuf, len);
+#endif
 }
 
 // ---------------------------------------------------------------- setup / loop
@@ -351,8 +410,14 @@ void setup() {
   bootId = (uint16_t)(esp_random() & 0xFFFF);
   Serial.printf("\n[BOOT] ESP32-S3 CSI v%s role=%c node=%d boot_id=%u\n", FW_VERSION, 'A' + NODE_ROLE - 1, NODE_ROLE, (unsigned)bootId);
 
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t wdt_cfg = { .timeout_ms = WDT_TIMEOUT_S * 1000, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdt_cfg);
+  esp_task_wdt_add(NULL);
+#else
   esp_task_wdt_init(WDT_TIMEOUT_S, true);
   esp_task_wdt_add(NULL);
+#endif
 
   if (!IS_TX) {
     ring = (Slot*)ps_malloc(sizeof(Slot) * RING_N);
@@ -376,10 +441,10 @@ void setup() {
   WiFi.setAutoReconnect(true);
   WiFi.onEvent(onWiFiEvent);
   esp_wifi_set_ps(WIFI_PS_NONE);
-  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);            // 先固定 HT20（提示词 1.2）
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
   esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   esp_wifi_set_max_tx_power(TX_POWER_QDBM);
-  static const char* hn[] = {"", "esp32-csi-a", "esp32-csi-b", "esp32-csi-c"};
+  static const char* hn[] = {"", "esp32-csi-1a", "esp32-csi-b", "esp32-csi-c"};
   WiFi.setHostname(hn[NODE_ROLE]);
 
   nowOk = initNow();
@@ -391,7 +456,7 @@ void setup() {
     cfg.htltf_en = false;
     cfg.stbc_htltf2_en = false;
     cfg.ltf_merge_en = false;
-    cfg.channel_filter_en = false;   // 不做平滑：保留原始每包 CSI
+    cfg.channel_filter_en = false;
     cfg.manu_scale = false;
     cfg.shift = 0;
     esp_err_t e1 = esp_wifi_set_csi_config(&cfg);
@@ -404,9 +469,9 @@ void setup() {
 
   mqtt.setBufferSize(sizeof(txbuf) + 128);
   mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
-  mqtt.setSocketTimeout(4);
+  mqtt.setSocketTimeout(2);
   mqtt.setCallback(onMqtt);
-  net.setTimeout(4);
+  net.setTimeout(2);
 
   wifiBegin();
   if (IS_TX) xTaskCreatePinnedToCore(probeTask, "probe", 4096, nullptr, 3, nullptr, 1);
@@ -420,28 +485,26 @@ void loop() {
 
   if (wifiUp) {
     mqttMaintain();
-    if (mqtt.connected()) {
-      mqtt.loop();
-      if (!IS_TX) drainAndPublish();
-      uint32_t now = millis();
-      if (wantStatus || now - lastStatusMs > STATUS_EVERY_MS) {
-        wantStatus = false;
-        lastStatusMs = now;
-        publishStatus();
-      }
-      bool ok = IS_TX || (aKnown && (now - aLastMs) < 3000);
+    bool mqOk = mqtt.connected();
+    if (mqOk) mqtt.loop();
+    if (!IS_TX) drainAndPublish(mqOk);
+    uint32_t now = millis();
+    if (wantStatus || now - lastStatusMs > STATUS_EVERY_MS) {
+      wantStatus = false;
+      lastStatusMs = now;
+      publishStatus();
+    }
+    bool ok = IS_TX || (aKnown && (now - aLastMs) < 3000);
+    if (mqOk) {
       if (ok) led(0, 255, 40); else led(0, 200, 200);
-    } else if (!IS_TX) {
-      rTail = rHead;                 // MQTT 断开：丢弃旧数据，避免恢复后发送过期数据
     }
   } else {
-    if (!IS_TX) rTail = rHead;       // 没有 WiFi：丢弃旧数据，避免缓冲堆积
+    if (!IS_TX) drainAndPublish(false); // 即使 WiFi 断开，USB 串口仍可输出 CSI
     led(0, 0, 255);
   }
 
   if (millis() - lastLogMs > 3000) {
     lastLogMs = millis();
-    // 机器可解析：key=value
     Serial.printf("[状态] role=%c boot=%u state=%s wifi=%d mqtt=%d ch=%u rssi=%d A=%d csi=%lu paired=%lu unpaired=%lu drop=%lu pub=%lu pubFail=%lu nowTx=%lu nowTxFail=%lu reconn=%lu heap=%u err=%s\n",
                   'A' + NODE_ROLE - 1, (unsigned)bootId, stateName(), (int)wifiUp, (int)mqtt.connected(), homeCh, (int)WiFi.RSSI(),
                   (int)(IS_TX || (aKnown && millis() - aLastMs < 3000)), (unsigned long)statCsi, (unsigned long)statPaired, (unsigned long)statUnpaired,
