@@ -14,6 +14,19 @@ A/B/C ── WiFi ─▶ MQTT 公共服务器(hivemq / emqx / mosquitto) ◀─�
  Kaggle：托管同一份网页 + 隧道网址 + MQTT 原始 CSI 落盘 + T4×2 GPU 离线分析（kaggle/kaggle_cell.py）
 ```
 
+## v5 · 2.5D 概率成像（Imager25D）+ Kaggle 稳定性修复
+
+| 项目 | 说明 |
+| --- | --- |
+| `src/lib/tri/imager25d.ts` | 网格后验成像器：64×64 精确贝叶斯网格滤波（预测=可分离高斯运动先验，更新=双基地幅度似然 + 公共增益边缘化，与 pf.ts 同模型）。确定性、无随机数。输出 grid / MAP / 均值 / 协方差 / 熵 / spread / fit / conf25d / 50%·90% 可信区域 / 降级原因 |
+| `src/lib/tri/scene.ts` | 2.5D 曲面：DataTexture + 顶点着色器位移（高度 = 概率强度），热力色、光照浮雕、50%/90% 等高线、MAP 标记；渲染端每帧指数平滑 → 60fps 丝滑；无数据/无运动自动淡出 |
+| `src/components/TriApp.tsx` | 「🗺️ 2.5D 概率成像」面板：conf25d、熵、spread、MAP/均值、降级原因、图层开关、俯视热力图；右上角「🔌 连接 ESP32 / 🩺 检测日志 / 📋 复制代码」保持不变 |
+| `tools/tri_imager_test.ts` | `npx tsx tools/tri_imager_test.ts 3`：同模型/失配/空房/单路退化/重复观测不重复计权/完整流水线/确定性，**全部标注 SIMULATION_ONLY**，失败 exit(1) |
+| `kaggle/kaggle_cell.py` | 修复 Kaggle 弹窗 *Oops something went wrong / Draft Session Fatal*：构建与 node_modules 放 `/tmp/bzm`（不在 `/kaggle/working`）；CSI 原始数据落 `/kaggle/temp`（上限 500MB）；输出框用 `clear_output` 恒定大小；torch/CUDA 放独立子进程；MQTT client_id 随机；cloudflared 强制 http2；新增 `/api/health` |
+
+**诚实边界**：2.5D 的「高度」=后验概率强度，不是人体/物体高度；只有运动目标可见（静止物体与空房不可区分）；两路接收只有 2 个标量约束，MAP 峰值会出现弧形歧义，所以界面同时给出均值、不确定度和可信区域；conf25d 是启发式分数，未经独立实测校准。三块普通 ESP32-S3 不能做照片级点云。Kaggle GPU 只做离线特征分析：没有带真值标签的实测数据前，不把未训练模型放进检测路径（提示词 6.9）。
+
+
 ## 本版做了什么（对照仓库「提示词」文件）
 
 | 提示词要求 | v4 做法 |
