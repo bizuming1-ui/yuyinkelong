@@ -1,6 +1,7 @@
 // 文件清单（复制代码界面使用）。路径 = 仓库内相对路径。
-import dataRaw from "./manifest-data.ts?raw";
-import { RAW } from "./manifest-data";
+// 数据来自 src/lib/manifest.generated.json —— 由 tools/gen_manifest.mjs 在 npm run dev / build 之前自动生成，
+// 里面是仓库真实文件的原文，所以复制代码界面展示的永远是当前这份源码本身。
+import raw from "./manifest.generated.json";
 
 export type FileGroup = "github" | "esp32-a" | "esp32-b" | "esp32-c" | "kaggle" | "legacy";
 
@@ -10,16 +11,6 @@ export interface CodeFile {
   lines: number;
   bytes: number;
   group: FileGroup;
-}
-
-// 把 import.meta.glob 的相对键（相对 src/lib/）还原成仓库根相对路径
-function norm(key: string) {
-  const parts = ["src", "lib"];
-  for (const seg of key.split("/")) {
-    if (seg === "..") parts.pop();
-    else if (seg !== "." && seg !== "") parts.push(seg);
-  }
-  return parts.join("/");
 }
 
 function groupOf(p: string): FileGroup {
@@ -32,9 +23,7 @@ function groupOf(p: string): FileGroup {
 }
 
 const enc = new TextEncoder();
-const merged: Record<string, string> = {};
-for (const [k, v] of Object.entries(RAW)) merged[norm(k)] = v;
-merged["src/lib/manifest-data.ts"] = dataRaw;
+const merged = raw as Record<string, string>;
 
 export const FILES: CodeFile[] = Object.keys(merged)
   .sort((a, b) => a.localeCompare(b))
