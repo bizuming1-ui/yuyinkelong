@@ -45,4 +45,8 @@ export const OLD_FILE_HINTS: string[] = [
   "tools/test_scene_server.py",
   "提示词",
   "检测日志",
+  // v8 删除的 Kaggle 守护进程方案（隧道就是 Kaggle 崩溃的根因）
+  "kaggle/bzm_daemon.py",
+  "tools/make_kaggle_cell.py",
+  "src/lib/manifest-data.ts",
 ];
