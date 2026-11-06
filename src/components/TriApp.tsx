@@ -4,11 +4,13 @@ import { makeGeometry } from "@/lib/tri/geometry";
 import { ParticleFilter } from "@/lib/tri/pf";
 import { Imager25D, type GridEstimate } from "@/lib/tri/imager25d";
 import { TriScene, type SceneOptions } from "@/lib/tri/scene";
+import { PassageEngine } from "@/lib/tri/passage";
+import PassageView from "@/components/PassageView";
 import { TriHub, loadCustomBrokers, type LinkState, type TriStatus } from "@/lib/tri/hub";
 import { NODE_TITLE, TRI_BROKERS, TRI_ROOT } from "@/lib/tri/config";
 import type { TriFrame } from "@/lib/tri/protocol";
 import { PAGES_URL } from "@/lib/config";
-import { SimPerson, linkW, rng, synthCsi } from "@/lib/tri/sim";
+import { SimMix, linkW, rng, synthCsi } from "@/lib/tri/sim";
 
 type Mode = "idle" | "live" | "demo";
 interface LogItem {
@@ -121,6 +123,14 @@ export default function TriApp() {
   const [detector] = useState(() => new FusedDetector());
   const [pf] = useState(() => new ParticleFilter(makeGeometry(0.25), 2600, 20240607));
   const [imager] = useState(() => new Imager25D(makeGeometry(0.25), 6, 6, 64));
+  const [passage] = useState(() => new PassageEngine(makeGeometry(0.25), 6, 6));
+  const [view, setView] = useState<"passage" | "tomo">(() => {
+    try {
+      return localStorage.getItem("bzm.tri.view") === "tomo" ? "tomo" : "passage";
+    } catch {
+      return "passage";
+    }
+  });
   const [mode, setMode] = useState<Mode>("idle");
   const [root, setRoot] = useState(TRI_ROOT);
   const [rootDraft, setRootDraft] = useState(TRI_ROOT);
@@ -224,8 +234,9 @@ export default function TriApp() {
     analyzers.C.reset();
     detector.reset();
     imager.reset();
+    passage.reset();
     const g = makeGeometry(side);
-    const person = new SimPerson(roomW, roomD);
+    const person = new SimMix(roomW, roomD);
     const r = rng(777);
     const t0 = performance.now();
     let cnt = 0;
@@ -283,15 +294,16 @@ export default function TriApp() {
     modeRef.current = "demo";
     setMode("demo");
     addLog("info", "SIMULATION 演示已启动：合成 CSI 经完整特征/检测/2.5D层析/粒子滤波流水线实时运行。");
-  }, [addLog, analyzers, detector, feed, imager, roomD, roomW, side, stopAll]);
+  }, [addLog, analyzers, detector, feed, imager, passage, roomD, roomW, side, stopAll]);
 
   const applyLayout = useCallback(
     (s: number, W: number, D: number) => {
       pf.setRoom(W, D);
       imager.setLayout(makeGeometry(s), W, D);
+      passage.setLayout(makeGeometry(s), W, D);
       sceneRef.current?.setLayout(makeGeometry(s), W, D);
     },
-    [pf, imager],
+    [pf, imager, passage],
   );
 
   // 挂载 3D 场景
@@ -404,6 +416,19 @@ export default function TriApp() {
         noData,
       );
       gridRef.current = ge;
+      passage.update({
+        zB: obs.zB ?? null,
+        zC: obs.zC ?? null,
+        sB: "staticB" in obs ? (obs.staticB ?? null) : null,
+        sC: "staticC" in obs ? (obs.staticC ?? null) : null,
+        linkB: okB,
+        linkC: okC,
+        staticActive: f.hasStaticObject,
+        dt,
+        now,
+        noData,
+        sens: detector.sens,
+      });
       const sc = sceneRef.current;
       if (sc) {
         sc.state = {
@@ -468,12 +493,13 @@ export default function TriApp() {
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#02060d] text-slate-200 select-none">
-      <div ref={boxRef} className="absolute inset-0" />
+      <div ref={boxRef} className="absolute inset-0" style={{ visibility: view === "tomo" ? "visible" : "hidden" }} />
+      {view === "passage" && <PassageView engine={passage} state={f.state} simulation={mode === "demo"} links={{ B: nodeOn(2), C: nodeOn(3) }} />}
 
       {/* 左上角标题 */}
       <div className="pointer-events-none absolute top-3 left-3 z-10">
         <div className="text-sm font-bold text-cyan-300 drop-shadow">
-          三 ESP32-S3 N16R8（三角阵列）· WiFi CSI 实时 2.5D 概率层析成像模拟器
+          三 ESP32-S3 N16R8（三角阵列）· WiFi CSI 实时 2.5D 过路成像模拟器
         </div>
         <div className="text-[11px] text-slate-400">
           ESP32-1(A) 发射 → ESP32-B / ESP32-C 接收 · 多服务器并联 + USB 串口零断连 · 鼠标左键旋转 / 右键平移 / 滚轮缩放
@@ -510,7 +536,7 @@ export default function TriApp() {
       </div>
 
       {/* SIMULATION 横幅 */}
-      {mode === "demo" && (
+      {mode === "demo" && view === "tomo" && (
         <div className="pointer-events-none absolute top-16 left-1/2 z-10 -translate-x-1/2 rounded-full border border-amber-400/60 bg-amber-500/20 px-5 py-1.5 text-sm font-extrabold tracking-widest text-amber-300 backdrop-blur">
           SIMULATION · 合成 CSI 实时 2.5D 演示中（可随时切回真实 ESP32）
         </div>
@@ -541,6 +567,27 @@ export default function TriApp() {
           </div>
         </div>
       )}
+
+      {/* 视图切换：过路成像（默认，易读） / 概率层析（原版，功能不变） */}
+      <div className="absolute top-14 left-44 z-20 flex overflow-hidden rounded-md border border-slate-700 text-xs font-bold backdrop-blur">
+        {(
+          [
+            ["passage", "👁 过路成像（推荐）"],
+            ["tomo", "🗺 概率层析（原版）"],
+          ] as const
+        ).map(([k, t]) => (
+          <button
+            key={k}
+            onClick={() => {
+              setView(k);
+              save("bzm.tri.view", k);
+            }}
+            className={`px-2.5 py-1 ${view === k ? "bg-cyan-400 text-slate-900" : "bg-slate-900/80 text-slate-300 hover:bg-slate-800"}`}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
 
       {/* 侧边栏开关 */}
       <button className="absolute top-14 left-3 z-20 rounded-md bg-slate-900/80 px-2.5 py-1 text-xs font-bold text-slate-200 border border-slate-700 backdrop-blur hover:bg-slate-800" onClick={() => setPanel(!panel)}>
