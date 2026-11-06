@@ -8,6 +8,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { Geometry } from "./geometry";
 import type { ParticleFilter } from "./pf";
+import type { Imager25D } from "./imager25d";
 
 export interface SceneState {
   active: boolean; // 融合检测器判定有运动目标
@@ -16,6 +17,7 @@ export interface SceneState {
   actC: number;
   simulation: boolean;
   noData: boolean; // 真实模式下没有数据 → 画面压暗并提示
+  conf25d?: number; // Imager25D 启发式置信度分数 0..1（低置信度时曲面变淡，不假装可靠）
 }
 
 export interface SceneOptions {
@@ -24,6 +26,9 @@ export interface SceneOptions {
   trail: boolean;
   room: boolean;
   autoRotate: boolean;
+  surface?: boolean; // 2.5D 后验曲面（高度 = 概率强度，不是真实高度）
+  contour?: boolean; // 50% / 90% 可信区域等高线
+  marker?: boolean; // MAP 峰值标记
 }
 
 const VERT = `
@@ -54,6 +59,55 @@ interface PointSet {
   size: Float32Array;
   alpha: Float32Array;
 }
+
+
+// ---- 2.5D 后验曲面：高度场 = 概率强度（Imager25D.view），热力色 + 光照浮雕 + 50%/90% 可信区域等高线 ----
+const SURF_COMMON = `
+uniform sampler2D uTex; uniform float uN;
+float hs(vec2 uv){
+  vec2 e = vec2(0.5 / uN);
+  return 0.25 * (texture2D(uTex, uv + vec2(e.x, e.y)).r + texture2D(uTex, uv + vec2(-e.x, e.y)).r
+               + texture2D(uTex, uv + vec2(e.x, -e.y)).r + texture2D(uTex, uv + vec2(-e.x, -e.y)).r);
+}`;
+const SURF_VERT = SURF_COMMON + `
+uniform float uH; varying vec2 vUv; varying float vV;
+void main(){
+  vUv = vec2(uv.x, 1.0 - uv.y);
+  float v = hs(vUv);
+  vV = v;
+  vec3 p = position; p.y += pow(v, 0.85) * uH + 0.004;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+}`;
+const SURF_FRAG = SURF_COMMON + `
+uniform float uH; uniform float uAlpha; uniform vec2 uCell; uniform float uT50; uniform float uT90; uniform float uContour;
+varying vec2 vUv; varying float vV;
+vec3 ramp(float t){
+  vec3 c0 = vec3(0.02, 0.06, 0.20); vec3 c1 = vec3(0.05, 0.45, 0.80); vec3 c2 = vec3(0.10, 0.85, 0.75);
+  vec3 c3 = vec3(0.98, 0.85, 0.25); vec3 c4 = vec3(1.0, 0.35, 0.18);
+  if (t < 0.25) return mix(c0, c1, t / 0.25);
+  if (t < 0.50) return mix(c1, c2, (t - 0.25) / 0.25);
+  if (t < 0.75) return mix(c2, c3, (t - 0.50) / 0.25);
+  return mix(c3, c4, (t - 0.75) / 0.25);
+}
+float iso(float v, float t){ float w = fwidth(v) * 1.3 + 1e-4; return 1.0 - smoothstep(0.0, w, abs(v - t)); }
+void main(){
+  float v = vV;
+  vec2 e = vec2(1.0 / uN);
+  float dx = hs(vUv + vec2(e.x, 0.0)) - hs(vUv - vec2(e.x, 0.0));
+  float dz = hs(vUv + vec2(0.0, e.y)) - hs(vUv - vec2(0.0, e.y));
+  vec3 n = normalize(vec3(-dx * uH / (2.0 * uCell.x), 1.0, -dz * uH / (2.0 * uCell.y)));
+  float diff = clamp(dot(n, normalize(vec3(0.4, 0.9, 0.3))), 0.0, 1.0);
+  vec3 col = ramp(clamp(v * 1.05, 0.0, 1.0)) * (0.55 + 0.6 * diff);
+  vec2 g = abs(fract(vUv * uN) - 0.5);
+  float gl = smoothstep(0.46, 0.5, max(g.x, g.y));
+  col += vec3(0.04, 0.10, 0.16) * gl * (0.3 + v);
+  float l50 = iso(v, uT50) * uContour;
+  float l90 = iso(v, uT90) * uContour;
+  col = mix(col, vec3(1.0, 0.95, 0.55), l50 * 0.95);
+  col = mix(col, vec3(0.65, 0.95, 1.0), l90 * 0.8);
+  float a = smoothstep(0.012, 0.16, v) * 0.88 + max(l50, l90) * 0.7;
+  gl_FragColor = vec4(col, clamp(a, 0.0, 1.0) * uAlpha);
+}`;
 
 function makePointSet(n: number, uAlpha = 1): PointSet {
   const geo = new THREE.BufferGeometry();
@@ -100,7 +154,7 @@ function label(text: string, color: string, scale = 0.5) {
 
 export class TriScene {
   state: SceneState = { active: false, conf: 0, actB: 0, actC: 0, simulation: false, noData: true };
-  opts: SceneOptions = { cloud: true, terrain: true, trail: true, room: true, autoRotate: false };
+  opts: SceneOptions = { cloud: true, terrain: true, trail: true, room: true, autoRotate: false, surface: true, contour: true, marker: true };
   fps = 0;
 
   private renderer: THREE.WebGLRenderer;
@@ -114,6 +168,15 @@ export class TriScene {
   private roomGroup = new THREE.Group();
   private cloud: PointSet;
   private terrain: PointSet | null = null;
+  private imager: Imager25D | null = null;
+  private surf: THREE.Mesh | null = null;
+  private surfTex: THREE.DataTexture | null = null;
+  private surfBytes = new Uint8Array(0);
+  private dv = new Float32Array(0); // 渲染端时间平滑后的高度场（60fps 丝滑）
+  private mapMarker: THREE.Mesh;
+  private mapX = 0;
+  private mapZ = 0;
+  private mapV = 0;
   private TN = 36;
   private occ = new Float32Array(36 * 36);
   private rp: Float32Array; // 渲染平滑后的粒子位置
@@ -183,6 +246,10 @@ export class TriScene {
     this.trailLine = new THREE.Line(tg, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
     this.trailLine.frustumCulled = false;
     this.scene.add(this.trailLine);
+    this.mapMarker = new THREE.Mesh(new THREE.OctahedronGeometry(0.07), new THREE.MeshBasicMaterial({ color: 0xfff1a8, transparent: true, opacity: 0.95, depthTest: false }));
+    this.mapMarker.renderOrder = 12;
+    this.mapMarker.visible = false;
+    this.scene.add(this.mapMarker);
 
     this.setLayout(pf.geom, pf.W, pf.D);
     this.ro = new ResizeObserver(() => this.resize());
@@ -194,6 +261,59 @@ export class TriScene {
       this.frame();
     };
     loop();
+  }
+
+  /** 接入 Imager25D：曲面/地形/MAP 标记都由它的后验网格驱动（粒子滤波只做跟踪与云可视化） */
+  attachImager(im: Imager25D) {
+    this.imager = im;
+    this.buildSurface();
+  }
+
+  private buildSurface() {
+    if (this.surf) {
+      this.scene.remove(this.surf);
+      this.surf.geometry.dispose();
+      (this.surf.material as THREE.Material).dispose();
+      this.surf = null;
+    }
+    this.surfTex?.dispose();
+    this.surfTex = null;
+    const im = this.imager;
+    if (!im) return;
+    const n = im.n;
+    this.dv = new Float32Array(n * n);
+    this.surfBytes = new Uint8Array(n * n);
+    const tex = new THREE.DataTexture(this.surfBytes, n, n, THREE.RedFormat, THREE.UnsignedByteType);
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.generateMipmaps = false;
+    tex.needsUpdate = true;
+    this.surfTex = tex;
+    const geo = new THREE.PlaneGeometry(this.W, this.D, 127, 127);
+    geo.rotateX(-Math.PI / 2);
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: SURF_VERT,
+      fragmentShader: SURF_FRAG,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      uniforms: {
+        uTex: { value: tex },
+        uN: { value: n },
+        uH: { value: Math.min(1.8, Math.max(0.6, Math.min(this.W, this.D) * 0.28)) },
+        uAlpha: { value: 0 },
+        uCell: { value: new THREE.Vector2(this.W / n, this.D / n) },
+        uT50: { value: 2 },
+        uT90: { value: 2 },
+        uContour: { value: 1 },
+      },
+    });
+    this.surf = new THREE.Mesh(geo, mat);
+    this.surf.frustumCulled = false;
+    this.surf.renderOrder = 3;
+    this.surf.visible = false;
+    this.scene.add(this.surf);
   }
 
   resetView() {
@@ -370,6 +490,7 @@ export class TriScene {
         this.terrain.size[k] = Math.max(0.02, Math.min(W, D) / TN / 2.2);
       }
     this.scene.add(this.terrain.pts);
+    this.buildSurface();
     this.rpInit = false;
     this.trail = [];
     this.resize();
@@ -495,17 +616,68 @@ export class TriScene {
       this.trailLine.geometry.attributes.color.needsUpdate = true;
     }
 
-    // ---- 地形（10Hz 更新）----
+    // ---- 2.5D 后验曲面（高度 = 概率强度）：每帧对 Imager25D.view 做指数平滑 → 60fps 丝滑 ----
+    const im = this.imager;
+    const est = im ? im.est : null;
+    const S = this.surf;
+    if (S && im && est && this.surfTex) {
+      const showS = (o.surface ?? true) && this.presence > 0.01 && !st.noData;
+      S.visible = showS;
+      this.mapMarker.visible = false;
+      if (showS) {
+        const ks = 1 - Math.exp(-dt * 11);
+        const src = est.available ? im.view : this.dv; // 不可用（无运动/单路过期）时不再被新数据驱动，保持上一帧并随 presence 淡出
+        const dv = this.dv;
+        const bytes = this.surfBytes;
+        for (let k = 0; k < dv.length; k++) {
+          dv[k] += (src[k] - dv[k]) * ks;
+          bytes[k] = dv[k] * 255 + 0.5;
+        }
+        this.surfTex.needsUpdate = true;
+        const u = (S.material as THREE.ShaderMaterial).uniforms;
+        const conf = st.conf25d ?? est.conf25d;
+        u.uAlpha.value = this.presence * (est.mode === "stale" ? 0.55 : 1) * (0.5 + 0.5 * Math.min(1, conf * 2.2));
+        u.uT50.value = Math.min(1, (est.hpd50 * im.n * im.n) / im.densityRef);
+        u.uT90.value = Math.min(1, (est.hpd90 * im.n * im.n) / im.densityRef);
+        u.uContour.value = (o.contour ?? true) && est.available ? 1 : 0;
+        // MAP 标记（平滑）
+        if (est.available && (o.marker ?? true)) {
+          const km = 1 - Math.exp(-dt * 9);
+          this.mapX += (est.peakX - this.mapX) * km;
+          this.mapZ += (est.peakZ - this.mapZ) * km;
+          this.mapV += (Math.min(1, est.pmaxDensity / im.densityRef) - this.mapV) * km;
+          const uh = u.uH.value as number;
+          this.mapMarker.position.set(this.mapX, Math.pow(this.mapV, 0.85) * uh + 0.1, this.mapZ);
+          this.mapMarker.rotation.y += dt * 1.6;
+          (this.mapMarker.material as THREE.MeshBasicMaterial).opacity = 0.95 * this.presence;
+          this.mapMarker.visible = true;
+        }
+      }
+    }
+
+    // ---- 地形点集（10Hz 更新；由 Imager25D.view 驱动，无 imager 时回退粒子占据）----
     const T = this.terrain;
     if (T) {
       T.pts.visible = o.terrain && this.presence > 0.02;
       T.mat.uniforms.uAlpha.value = this.presence;
       if (T.pts.visible && now - this.lastOcc > 100) {
         this.lastOcc = now;
-        pf.occupancy(this.TN, this.occ);
+        const TN = this.TN;
+        if (im) {
+          const n = im.n;
+          const v = this.dv.length === n * n ? this.dv : im.view;
+          for (let j = 0; j < TN; j++)
+            for (let i = 0; i < TN; i++) {
+              const gi = Math.min(n - 1, Math.floor(((i + 0.5) / TN) * n));
+              const gj = Math.min(n - 1, Math.floor(((j + 0.5) / TN) * n));
+              this.occ[j * TN + i] = v[gj * n + gi];
+            }
+        } else {
+          pf.occupancy(TN, this.occ);
+        }
         for (let k = 0; k < this.occ.length; k++) {
           const v = this.occ[k];
-          const tgt = v * v;
+          const tgt = im ? Math.min(1, v * 1.4) : v * v;
           T.pos[k * 3 + 1] += (tgt * 0.55 + 0.01 - T.pos[k * 3 + 1]) * 0.5;
           T.alpha[k] = Math.min(1, tgt * 1.6);
           T.col[k * 3] = 0.2 + 0.5 * v;
@@ -524,6 +696,7 @@ export class TriScene {
     cancelAnimationFrame(this.raf);
     this.ro.disconnect();
     this.controls.dispose();
+    this.surfTex?.dispose();
     this.scene.traverse((o) => {
       const a = o as THREE.Mesh;
       a.geometry?.dispose?.();
