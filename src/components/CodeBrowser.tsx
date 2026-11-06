@@ -1,7 +1,7 @@
 // 复制代码界面：每个文件都有「在 GitHub 编辑」+「复制此文件」，并实时检测 GitHub (https://github.com/bizuming1-ui/yuyinkelong) 上是否已是最新。
 // 分类：GitHub 全部文件 / PlatformIO · ESP32-1（ESP32-A 发射端）/ ESP32-B（接收端1）/ ESP32-C（接收端2） / Kaggle（粘贴到 Notebook 运行）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { GITHUB_BRANCH, GITHUB_REPO, OLD_FILE_HINTS } from "@/lib/config";
+import { GITHUB_BRANCH, GITHUB_REPO, OLD_FILE_HINTS, PAGES_URL } from "@/lib/config";
 import { gitShaVariants } from "@/lib/sha1";
 import { FILES, type CodeFile } from "@/lib/manifest";
 
@@ -131,6 +131,8 @@ export default function CodeBrowser() {
   const [pass, setPass] = useState("");
   const [q, setQ] = useState("");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 永久网址（GitHub Pages）是否已经开通：Pages 返回 Access-Control-Allow-Origin: *，所以可以直接读到状态码
+  const [pages, setPages] = useState<"checking" | "online" | "offline">("checking");
 
   useEffect(() => {
     try {
@@ -224,6 +226,24 @@ export default function CodeBrowser() {
       setCheckedAt(new Date().toLocaleTimeString("zh-CN", { hour12: false }));
     }
   }, [files]);
+
+  useEffect(() => {
+    let dead = false;
+    const probe = async () => {
+      try {
+        const r = await fetch(`${PAGES_URL}?t=${Date.now()}`, { cache: "no-store" });
+        if (!dead) setPages(r.ok ? "online" : "offline");
+      } catch {
+        if (!dead) setPages("offline");
+      }
+    };
+    probe();
+    const id = setInterval(probe, 60_000);
+    return () => {
+      dead = true;
+      clearInterval(id);
+    };
+  }, []);
 
   // 进入页面检测 + 每 45 秒 + 每次回到本页（你在 GitHub 提交完切回来时）立刻检测
   useEffect(() => {
@@ -402,6 +422,29 @@ export default function CodeBrowser() {
                 新标签页打开
               </a>
             </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-950/10 p-3 text-xs">
+              <span className="font-bold text-emerald-300">🌍 永久网址（GitHub Pages · 不依赖 Kaggle / 你的电脑）</span>
+              <code className="min-w-0 flex-1 break-all rounded bg-slate-900 px-2 py-1 text-emerald-100 select-all">{PAGES_URL}</code>
+              <span
+                className={`rounded-full border px-2.5 py-0.5 font-semibold ${
+                  pages === "online" ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300" : pages === "offline" ? "border-rose-500/40 bg-rose-500/15 text-rose-300" : "border-slate-500/40 bg-slate-500/15 text-slate-300"
+                }`}
+              >
+                {pages === "online" ? "✅ 在线" : pages === "offline" ? "❌ 未开通（见下方说明）" : "… 检测中"}
+              </span>
+              <button className="rounded-lg bg-emerald-400 px-3 py-1.5 font-bold text-slate-900 hover:bg-emerald-300" onClick={async () => say((await copyText(PAGES_URL)) ? "已复制永久网址" : "复制失败")}>
+                复制网址
+              </button>
+              <a className="rounded-lg border border-slate-600 bg-slate-800 px-3 py-1.5 font-bold text-slate-100 hover:bg-slate-700" href={PAGES_URL} target="_blank" rel="noreferrer">
+                新标签页打开
+              </a>
+              {pages === "offline" && (
+                <div className="w-full text-[11px] leading-relaxed text-amber-300">
+                  一次性设置：打开 <a className="underline" href={`${REPO_URL}/settings/pages`} target="_blank" rel="noreferrer">GitHub → Settings → Pages</a>，Build and deployment 的 Source 选 <b>GitHub Actions</b>；再到{" "}
+                  <a className="underline" href={`${REPO_URL}/actions`} target="_blank" rel="noreferrer">Actions</a> 页面确认 “Deploy simulator to GitHub Pages” 为绿色（约 1~2 分钟），这里就会变成 ✅ 在线。
+                </div>
+              )}
+            </div>
             {pending.length > 0 ? (
               <div className="mt-3 rounded-xl border border-orange-500/40 bg-orange-950/20 p-3">
                 <div className="mb-2 text-sm font-bold text-orange-300">
@@ -417,7 +460,7 @@ export default function CodeBrowser() {
               </div>
             ) : counts.unknown === 0 && files.length > 0 ? (
               <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-950/20 p-3 text-sm font-bold text-emerald-300">
-                🎉 所有文件都已和 GitHub ({GITHUB_REPO}) 100% 同步一致！现在可以直接去 Kaggle 运行 `kaggle/kaggle_cell.py` 了。
+                🎉 所有文件都已和 GitHub ({GITHUB_REPO}) 100% 同步一致！现在可以直接去 Kaggle 运行 kaggle/kaggle_cell.py (v8) 了。
               </div>
             ) : null}
             <div className="mt-3 flex flex-wrap gap-2">
@@ -447,6 +490,11 @@ export default function CodeBrowser() {
                   ⬇️ {PIO_TABS[k].shortLabel} PlatformIO 工程 ZIP
                 </button>
               ))}
+              {typeof window !== "undefined" && /^https?:$/.test(window.location.protocol) && !window.location.hostname.endsWith("github.io") && (
+                <a className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700" href="/api/repo-zip" download>
+                  ⬇️ 备用下载：服务器 ZIP（普通链接）
+                </a>
+              )}
               <button
                 className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700 border border-slate-700"
                 onClick={() => files.filter((f) => f.path === "kaggle/kaggle_cell.py").forEach((f) => downloadText("kaggle_cell.py", f.content))}
@@ -461,7 +509,7 @@ export default function CodeBrowser() {
             {tabBtn("esp32-a", "🔵 PlatformIO · ESP32-1 (ESP32-A 发射端)")}
             {tabBtn("esp32-b", "🟢 PlatformIO · ESP32-B (接收端1)")}
             {tabBtn("esp32-c", "🟢 PlatformIO · ESP32-C (接收端2)")}
-            {tabBtn("kaggle", "🟠 Kaggle 运行代码 (v7)")}
+            {tabBtn("kaggle", "🟠 Kaggle 运行代码 (v8 · 无隧道)")}
             {tabBtn("clean", "🗑 GitHub 上多余的旧文件", <span className="opacity-70">({obsolete.length})</span>)}
           </div>
 
@@ -521,14 +569,18 @@ export default function CodeBrowser() {
 
           {tab === "kaggle" && (
             <section className="rounded-2xl border border-amber-500/30 bg-amber-950/10 p-4 text-sm">
-              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle（GPU T4×2）v7.0 运行步骤（Draft Session Fatal 根因修复：输出框只保留纯文本）</div>
+              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle v8.0 · 彻底不再出现 “Oops something went wrong / Draft Session Fatal / status code 44”</div>
+              <div className="mb-2 rounded-lg border border-amber-500/30 bg-slate-900/60 p-2 text-xs leading-relaxed text-amber-100">
+                <b>根因（换了思路）</b>：v5/v6/v7 都在 Kaggle 里拉起了 cloudflared / localhost.run 公网隧道并长时间运行；你的截图里网址已经打印出来（隧道已建立）之后才弹窗，v7 把输出换成纯文本也照样崩。
+                社区公开反馈 Kaggle 会终止除 ngrok 以外的隧道，表现就是会话突然 Fatal。所以 v8 把 Kaggle 里的隧道、守护进程、GPU 初始化、MQTT 长连接全部删除：
+                网站放在 GitHub Pages（永久网址），ESP32 数据经 MQTT 直连浏览器，Kaggle 只做几秒钟的检测并自己结束。
+              </div>
               <ol className="list-decimal space-y-1 pl-5 text-xs text-slate-300">
-                <li>先在「📁 GitHub 全部代码文件」标签页确认所有修改的文件已更新到 <code>https://github.com/{GITHUB_REPO}</code>（Kaggle 会从 GitHub 拉取最新源码构建）。</li>
-                <li>打开 Kaggle → New Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 × 2</b>，<b>Internet 打开 (On)</b>。</li>
-                <li>只需复制下方 <code>kaggle/kaggle_cell.py</code>（已内嵌守护进程），粘贴进 Notebook 的<b>第一个代码单元</b>并点击 Run。<code>bzm_daemon.py</code> 只是它的可读源码，不用单独复制。</li>
-                <li>
-                  输出框只会出现几行纯文本和一个 <code>https://xxxx.trycloudflare.com</code> 网址，随后保持静默。构建/隧道/采集全部在独立后台进程里运行，日志在 <code>/tmp/bzm/logs/daemon.log</code>；这样就不再向 Kaggle 前端推送富输出（上一版崩溃正是发生在 display/update 输出的瞬间）。
-                </li>
+                <li>先在「📁 GitHub 全部代码文件」标签页确认所有文件已更新到 <code>https://github.com/{GITHUB_REPO}</code>（上方显示 🎉 即可）。</li>
+                <li>打开 Kaggle → New Notebook → 右侧 Settings：Accelerator 选 <b>None（CPU）</b>即可，<b>Internet 打开 (On)</b>。</li>
+                <li>复制下方 <code>kaggle/kaggle_cell.py</code>，粘贴进 Notebook 的<b>第一个代码单元</b>并 Run（几秒完成；GitHub Pages 未开通时会自动本机构建，约 1~3 分钟）。</li>
+                <li>输出框会给出 <code>https://bizuming1-ui.github.io/yuyinkelong/</code> 永久网址，并把单文件版保存为 <code>/kaggle/working/simulator.html</code>（右侧 Output 面板可下载，双击即用）。</li>
+                <li>单元会提示你粘贴的是不是 GitHub 上的最新版、网页部署是否落后于最新提交。单元结束后没有任何后台进程。</li>
               </ol>
             </section>
           )}
