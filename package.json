@@ -1,12 +1,16 @@
 {
-  "name": "react-vite-tailwind",
+  "name": "yuyinkelong-esp32s3-csi",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "predev": "node tools/gen_manifest.mjs",
     "dev": "vite",
+    "prebuild": "node tools/gen_manifest.mjs",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "tsx tools/tri_sim_test.ts 1 && tsx tools/tri_imager_test.ts 1",
+    "check:kaggle": "python3 -m py_compile kaggle/kaggle_cell.py"
   },
   "dependencies": {
     "clsx": "2.1.1",
