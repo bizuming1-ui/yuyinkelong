@@ -266,7 +266,7 @@ export default function CodeBrowser() {
     const local = new Set(files.map((f) => f.path));
     if (!remote) return (hintOld ?? []).filter((p) => !local.has(p));
     return Array.from(remote.keys())
-      .filter((p) => !local.has(p) && !/^(LICENSE|\.github\/)/i.test(p))
+      .filter((p) => !local.has(p) && !/^(LICENSE|\.github\/|docs\/index\.html$)/i.test(p))
       .sort();
   }, [remote, files, hintOld]);
 
@@ -286,7 +286,7 @@ export default function CodeBrowser() {
     if (isPio || tab === "kaggle") return f.group === tab;
     return false;
   });
-  const list = isPio ? [...visible].sort((a, b) => pioOrder(a.path) - pioOrder(b.path)) : visible;
+  const list = isPio ? [...visible].sort((a, b) => pioOrder(a.path) - pioOrder(b.path)) : tab === "kaggle" ? [...visible].sort((a, b) => Number(b.path.endsWith("kaggle_cell.py")) - Number(a.path.endsWith("kaggle_cell.py"))) : visible;
 
   const badge = (s: Sync) => {
     const map: Record<Sync, [string, string]> = {
@@ -449,7 +449,7 @@ export default function CodeBrowser() {
               ))}
               <button
                 className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700 border border-slate-700"
-                onClick={() => files.filter((f) => f.group === "kaggle").forEach((f) => downloadText(f.path.split("/").pop() || "kaggle_cell.py", f.content))}
+                onClick={() => files.filter((f) => f.path === "kaggle/kaggle_cell.py").forEach((f) => downloadText("kaggle_cell.py", f.content))}
               >
                 ⬇️ 下载 Kaggle 代码 (kaggle_cell.py)
               </button>
@@ -461,7 +461,7 @@ export default function CodeBrowser() {
             {tabBtn("esp32-a", "🔵 PlatformIO · ESP32-1 (ESP32-A 发射端)")}
             {tabBtn("esp32-b", "🟢 PlatformIO · ESP32-B (接收端1)")}
             {tabBtn("esp32-c", "🟢 PlatformIO · ESP32-C (接收端2)")}
-            {tabBtn("kaggle", "🟠 Kaggle 零崩溃运行代码")}
+            {tabBtn("kaggle", "🟠 Kaggle 运行代码 (v7)")}
             {tabBtn("clean", "🗑 GitHub 上多余的旧文件", <span className="opacity-70">({obsolete.length})</span>)}
           </div>
 
@@ -521,13 +521,13 @@ export default function CodeBrowser() {
 
           {tab === "kaggle" && (
             <section className="rounded-2xl border border-amber-500/30 bg-amber-950/10 p-4 text-sm">
-              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle（GPU T4×2）v6.0 零崩溃运行步骤（已彻底修复 Draft Session Fatal 弹窗）</div>
+              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle（GPU T4×2）v7.0 运行步骤（Draft Session Fatal 根因修复：输出框只保留纯文本）</div>
               <ol className="list-decimal space-y-1 pl-5 text-xs text-slate-300">
-                <li>先在「📁 GitHub 全部代码文件」标签页确认所有修改的文件已更新到 <code>https://github.com/{GITHUB_REPO}</code>。</li>
+                <li>先在「📁 GitHub 全部代码文件」标签页确认所有修改的文件已更新到 <code>https://github.com/{GITHUB_REPO}</code>（Kaggle 会从 GitHub 拉取最新源码构建）。</li>
                 <li>打开 Kaggle → New Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 × 2</b>，<b>Internet 打开 (On)</b>。</li>
-                <li>点击下方 <code>kaggle/kaggle_cell.py</code> 的「📋 复制此文件」，粘贴进 Kaggle Notebook 的<b>第一个代码单元</b>并点击 Run。</li>
+                <li>只需复制下方 <code>kaggle/kaggle_cell.py</code>（已内嵌守护进程），粘贴进 Notebook 的<b>第一个代码单元</b>并点击 Run。<code>bzm_daemon.py</code> 只是它的可读源码，不用单独复制。</li>
                 <li>
-                  运行后，Kaggle 输出框会直接显示一个可视化的<b>「🚀 点击在新标签页打开 3D/2.5D 浏览器模拟器」</b>大按钮与 <code>https://xxxx.trycloudflare.com</code> 网址，且彻底消除了后台线程并发写 ZMQ 与 <code>/kaggle/working</code> 小文件风暴导致的 <i>Oops something went wrong</i> 崩溃。
+                  输出框只会出现几行纯文本和一个 <code>https://xxxx.trycloudflare.com</code> 网址，随后保持静默。构建/隧道/采集全部在独立后台进程里运行，日志在 <code>/tmp/bzm/logs/daemon.log</code>；这样就不再向 Kaggle 前端推送富输出（上一版崩溃正是发生在 display/update 输出的瞬间）。
                 </li>
               </ol>
             </section>
