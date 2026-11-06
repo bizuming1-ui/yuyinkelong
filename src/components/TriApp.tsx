@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FusedDetector, LinkAnalyzer, type Fused } from "@/lib/tri/features";
 import { makeGeometry } from "@/lib/tri/geometry";
 import { ParticleFilter } from "@/lib/tri/pf";
+import { Imager25D, type GridEstimate } from "@/lib/tri/imager25d";
 import { TriScene, type SceneOptions } from "@/lib/tri/scene";
 import { TriHub, loadCustomBrokers, type LinkState, type TriStatus } from "@/lib/tri/hub";
 import { NODE_TITLE, TRI_BROKERS, TRI_ROOT } from "@/lib/tri/config";
@@ -87,6 +88,7 @@ export default function TriApp() {
   const [analyzers] = useState(() => ({ B: new LinkAnalyzer(2), C: new LinkAnalyzer(3) }));
   const [detector] = useState(() => new FusedDetector());
   const [pf] = useState(() => new ParticleFilter(makeGeometry(0.3), 2600, 20240607));
+  const [imager] = useState(() => new Imager25D(makeGeometry(0.3), 6, 6, 64));
   const [mode, setMode] = useState<Mode>("idle");
   const [root, setRoot] = useState(TRI_ROOT);
   const [rootDraft, setRootDraft] = useState(TRI_ROOT);
@@ -101,17 +103,19 @@ export default function TriApp() {
   const [showConnect, setShowConnect] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [panel, setPanel] = useState(true);
-  const [opts, setOpts] = useState<SceneOptions>({ cloud: true, terrain: true, trail: true, room: true, autoRotate: false });
+  const [opts, setOpts] = useState<SceneOptions>({ cloud: true, terrain: true, trail: true, room: true, autoRotate: false, surface: true, contour: true, marker: true });
   const [fps, setFps] = useState(0);
   const [toast, setToast] = useState("");
   const [customUrl, setCustomUrl] = useState("");
   const [, setTick] = useState(0);
+  const [kg, setKg] = useState<{ gpu: string[]; up: number; msgs: number } | null>(null);
 
   const hubRef = useRef<TriHub | null>(null);
   const sceneRef = useRef<TriScene | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const timers = useRef<ReturnType<typeof setInterval>[]>([]);
   const nodesRef = useRef<Record<number, TriStatus | undefined>>({});
+  const gridRef = useRef<GridEstimate | null>(null);
   const fusedRef = useRef<Fused>({ state: "offline", S: 0, conf: 0, quality: 0, reason: "" });
   const lastFrameAt = useRef<Record<number, number>>({ 2: 0, 3: 0 });
   const frameCount = useRef<Record<number, number>>({ 2: 0, 3: 0 });
@@ -187,6 +191,7 @@ export default function TriApp() {
     analyzers.B.reset();
     analyzers.C.reset();
     detector.reset();
+    imager.reset();
     const g = makeGeometry(side);
     const person = new SimPerson(roomW, roomD);
     const r = rng(777);
@@ -230,14 +235,15 @@ export default function TriApp() {
     modeRef.current = "demo";
     setMode("demo");
     addLog("info", "SIMULATION 已启动：合成 CSI（空房 8s → 行走 22s → 离开 10s 循环）走与真实数据相同的特征/检测/粒子滤波流水线。这不是真实成像。");
-  }, [addLog, analyzers, detector, feed, roomD, roomW, side, stopAll]);
+  }, [addLog, analyzers, detector, feed, imager, roomD, roomW, side, stopAll]);
 
   const applyLayout = useCallback(
     (s: number, W: number, D: number) => {
       pf.setRoom(W, D);
+      imager.setLayout(makeGeometry(s), W, D);
       sceneRef.current?.setLayout(makeGeometry(s), W, D);
     },
-    [pf],
+    [pf, imager],
   );
 
   // 挂载 3D 场景
@@ -246,6 +252,7 @@ export default function TriApp() {
     const sc = new TriScene(boxRef.current, pf);
     sceneRef.current = sc;
     sc.setLayout(makeGeometry(side), roomW, roomD);
+    sc.attachImager(imager);
     const id = setInterval(() => setFps(sc.fps), 500);
     return () => {
       clearInterval(id);
@@ -261,6 +268,30 @@ export default function TriApp() {
   useEffect(() => {
     detector.sens = sens;
   }, [detector, sens]);
+
+  // Kaggle 托管时（http/https）轮询 /api/health：显示 GPU 与采集器状态；失败静默（模拟器本身不依赖 Kaggle）
+  useEffect(() => {
+    if (!/^https?:$/.test(window.location.protocol)) return;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const ctl = new AbortController();
+        const to = setTimeout(() => ctl.abort(), 4000);
+        const r = await fetch("/api/health", { cache: "no-store", signal: ctl.signal });
+        clearTimeout(to);
+        const j = await r.json();
+        if (alive && j && j.ok) setKg({ gpu: j.gpu?.names ?? [], up: j.uptime ?? 0, msgs: j.stats?.msgs ?? 0 });
+      } catch {
+        if (alive) setKg(null);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 8000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
 
   // 启动：恢复设置 → 自动连接
   useEffect(() => {
@@ -297,10 +328,30 @@ export default function TriApp() {
       const okC = mc.valid && now - mc.lastAt < 1500 && mc.rate >= 5;
       const fresh = (okB && mb.win !== lastWin.current.B) || (okC && mc.win !== lastWin.current.C);
       lastWin.current = { B: mb.win, C: mc.win };
-      pf.step(dt, fresh ? { zB: okB ? mb.z : null, zC: okC ? mc.z : null } : { zB: null, zC: null }, f.state === "motion");
+      const obs = fresh ? { zB: okB ? mb.z : null, zC: okC ? mc.z : null } : { zB: null, zC: null };
+      pf.step(dt, obs, f.state === "motion");
+      // 2.5D 网格后验成像器（主地图）：只在「有新窗口」时带观测，旧观测不会被重复计权
+      const noData = f.state === "offline" || f.state === "calibrating";
+      const onl = [okB ? mb : null, okC ? mc : null].filter((m): m is typeof mb => m !== null);
+      const ge = imager.update(
+        obs,
+        f.state === "motion",
+        {
+          presenceConf: f.conf,
+          dataQuality: f.quality,
+          linksOnline: onl.length,
+          pairedPct: onl.length ? Math.min(...onl.map((m) => m.pairedPct)) : 0,
+          rate: onl.length ? Math.min(...onl.map((m) => m.rate)) : 0,
+          lossPct: onl.length ? Math.max(...onl.map((m) => m.lossPct)) : 0,
+        },
+        dt,
+        now,
+        noData,
+      );
+      gridRef.current = ge;
       const sc = sceneRef.current;
       if (sc) {
-        sc.state = { active: f.state === "motion", conf: f.conf, actB: mb.act, actC: mc.act, simulation: modeRef.current === "demo", noData: f.state === "offline" || f.state === "calibrating" };
+        sc.state = { active: f.state === "motion", conf: f.conf, actB: mb.act, actC: mc.act, simulation: modeRef.current === "demo", noData, conf25d: ge.conf25d };
       }
     }, 50);
     // UI 刷新 5Hz
@@ -347,6 +398,7 @@ export default function TriApp() {
   };
   const [stTxt, stCls] = stateText[f.state];
   const est = pf.est;
+  const ge = gridRef.current;
   const compact = side < 0.8;
   const paintEst = f.state === "motion";
 
@@ -356,8 +408,8 @@ export default function TriApp() {
 
       {/* 左上角标题 */}
       <div className="pointer-events-none absolute top-3 left-3 z-10">
-        <div className="text-sm font-bold text-cyan-300 drop-shadow">三 ESP32-S3 · WiFi CSI 三维感知模拟器</div>
-        <div className="text-[11px] text-slate-400">A 发射 → B / C 接收 · MQTT 实时 · 概率云（非摄像头式成像）</div>
+        <div className="text-sm font-bold text-cyan-300 drop-shadow">三 ESP32-S3 · WiFi CSI 2.5D 概率成像模拟器</div>
+        <div className="text-[11px] text-slate-400">A 发射 → B / C 接收 · MQTT 实时 · 2.5D 概率占据成像（高度 = 概率强度，非摄像头式成像）</div>
       </div>
 
       {/* 右上角按键 */}
@@ -463,7 +515,59 @@ export default function TriApp() {
             </div>
           </Card>
 
-          <Card title="📍 位置估计（概率云）">
+          <Card
+            title="🗺️ 2.5D 概率成像（Imager25D）"
+            right={
+              <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${ge && ge.available ? (ge.tier === "高" ? "bg-emerald-500/20 text-emerald-300" : ge.tier === "中" ? "bg-amber-500/20 text-amber-300" : "bg-rose-500/20 text-rose-300") : "bg-slate-700/60 text-slate-400"}`}>
+                {ge && ge.available ? `置信度 ${ge.tier}` : "不可用"}
+              </span>
+            }
+          >
+            {ge && ge.available ? (
+              <div className="space-y-1 text-xs text-slate-300">
+                <div className="grid grid-cols-2 gap-x-2 text-[11px]">
+                  <span>conf25d {(ge.conf25d * 100).toFixed(0)}%</span>
+                  <span>熵 {ge.entropy.toFixed(2)} nat ({(ge.entropyNorm * 100).toFixed(0)}%)</span>
+                  <span>spread ± {ge.spread.toFixed(2)} m</span>
+                  <span>模型自洽 {(ge.fit * 100).toFixed(0)}%</span>
+                  <span className="col-span-2">
+                    MAP 峰值 ({ge.peakX.toFixed(2)}, {ge.peakZ.toFixed(2)}) m · 均值 ({ge.meanX.toFixed(2)}, {ge.meanZ.toFixed(2)}) m
+                  </span>
+                  <span className="col-span-2">
+                    σx {ge.sx.toFixed(2)} · σz {ge.sz.toFixed(2)} · ρ {ge.rho.toFixed(2)} · 数据新鲜度 {ge.age < 90 ? ge.age.toFixed(1) + "s" : "—"}
+                  </span>
+                </div>
+                <Bar v={ge.conf25d} max={1} color="linear-gradient(90deg,#f43f5e,#f59e0b,#22c55e)" />
+                <div className={`text-[11px] ${ge.mode === "ok" ? "text-emerald-300/90" : "text-amber-300"}`}>{ge.reason}</div>
+              </div>
+            ) : (
+              <div className="text-xs text-slate-500">{ge ? ge.reason : "等待数据"}（不会用默认动画冒充成像）</div>
+            )}
+            <div className="mt-2 grid grid-cols-3 gap-1 text-[11px]">
+              {(
+                [
+                  ["surface", "高度场"],
+                  ["contour", "50/90%等高线"],
+                  ["marker", "MAP 标记"],
+                ] as const
+              ).map(([k, n]) => (
+                <label key={k} className="flex items-center gap-1">
+                  <input type="checkbox" checked={opts[k] ?? true} onChange={(e) => setOpts({ ...opts, [k]: e.target.checked })} /> {n}
+                </label>
+              ))}
+            </div>
+            <div className="mt-2 flex gap-1.5">
+              <Btn className="!px-2 !py-1 text-xs" onClick={() => sceneRef.current?.topView()}>
+                俯视热力图
+              </Btn>
+              <Btn className="!px-2 !py-1 text-xs" onClick={() => sceneRef.current?.resetView()}>
+                2.5D 视角
+              </Btn>
+            </div>
+            <div className="mt-2 text-[10px] leading-snug text-amber-300/80">2.5D 的「高度」= 后验概率强度，不是人体/物体的真实高度；图是地面 (x,z) 的概率占据场（估计，不是测量）。只有运动目标会出现；静止物体不可观测。conf25d 是启发式分数，未经独立数据校准。</div>
+          </Card>
+
+          <Card title="📍 位置估计（粒子滤波 · 概率云/后验采样）">
             {paintEst ? (
               <div className="space-y-1 text-xs text-slate-300">
                 <div>
@@ -577,6 +681,7 @@ export default function TriApp() {
                     analyzers.B.reset();
                     analyzers.C.reset();
                     detector.reset();
+                    imager.reset();
                     say("已重新校准，请保持安静 8 秒");
                   }}
                 >
@@ -597,6 +702,12 @@ export default function TriApp() {
                   复制
                 </Btn>
               </div>
+              {kg && (
+                <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 p-2 text-[11px] text-emerald-200">
+                  ☁ Kaggle 托管中 · 运行 {Math.round(kg.up / 60)} 分钟 · GPU：{kg.gpu.length ? kg.gpu.join(" / ") : "无"} · 已落盘 CSI 包 {kg.msgs}
+                  <div className="text-[10px] text-emerald-300/70">GPU 仅做离线特征分析（Kaggle 输出框可见）；实时 2.5D 成像在你的浏览器里计算，不依赖 Kaggle 延迟。</div>
+                </div>
+              )}
               <Btn tone="green" className="w-full" onClick={() => (window.location.hash = "#/code")}>
                 进入复制代码界面
               </Btn>
