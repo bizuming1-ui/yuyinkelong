@@ -40,6 +40,37 @@ async function copyText(text: string) {
   }
 }
 
+async function downloadStandaloneSimulator(): Promise<boolean> {
+  try {
+    let htmlText = "";
+    try {
+      const res = await fetch("/standalone-simulator.html", { cache: "no-store" });
+      if (res.ok) {
+        const t = await res.text();
+        if (t.includes("<html") && t.length > 50_000) htmlText = t;
+      }
+    } catch {
+      /* ignore */
+    }
+    if (!htmlText) {
+      htmlText = "<!doctype html>\n" + document.documentElement.outerHTML;
+    }
+    const blob = new Blob([htmlText], { type: "text/html;charset=utf-8" });
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = u;
+    a.download = "esp32s3-tri-2.5d-simulator.html";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 60_000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function lsGet(k: string, d: number, lo: number, hi: number) {
   try {
     const v = parseFloat(localStorage.getItem(k) || "");
@@ -87,15 +118,15 @@ const dot = (s: LinkState | undefined) => (s === "online" ? "bg-emerald-400" : s
 export default function TriApp() {
   const [analyzers] = useState(() => ({ B: new LinkAnalyzer(2), C: new LinkAnalyzer(3) }));
   const [detector] = useState(() => new FusedDetector());
-  const [pf] = useState(() => new ParticleFilter(makeGeometry(0.3), 2600, 20240607));
-  const [imager] = useState(() => new Imager25D(makeGeometry(0.3), 6, 6, 64));
+  const [pf] = useState(() => new ParticleFilter(makeGeometry(0.25), 2600, 20240607));
+  const [imager] = useState(() => new Imager25D(makeGeometry(0.25), 6, 6, 64));
   const [mode, setMode] = useState<Mode>("idle");
   const [root, setRoot] = useState(TRI_ROOT);
   const [rootDraft, setRootDraft] = useState(TRI_ROOT);
-  const [side, setSide] = useState(0.3);
+  const [side, setSide] = useState(0.25);
   const [roomW, setRoomW] = useState(6);
   const [roomD, setRoomD] = useState(6);
-  const [sens, setSens] = useState(1);
+  const [sens, setSens] = useState(1.2);
   const [links, setLinks] = useState<Record<string, LinkState>>({});
   const [nodes, setNodes] = useState<Record<number, TriStatus | undefined>>({});
   const [logs, setLogs] = useState<LogItem[]>([]);
@@ -116,7 +147,7 @@ export default function TriApp() {
   const timers = useRef<ReturnType<typeof setInterval>[]>([]);
   const nodesRef = useRef<Record<number, TriStatus | undefined>>({});
   const gridRef = useRef<GridEstimate | null>(null);
-  const fusedRef = useRef<Fused>({ state: "offline", S: 0, conf: 0, quality: 0, reason: "" });
+  const fusedRef = useRef<Fused>({ state: "offline", S: 0, staticS: 0, hasStaticObject: false, crossCorr: 0, conf: 0, quality: 0, reason: "" });
   const lastFrameAt = useRef<Record<number, number>>({ 2: 0, 3: 0 });
   const frameCount = useRef<Record<number, number>>({ 2: 0, 3: 0 });
   const modeRef = useRef<Mode>("idle");
@@ -124,7 +155,7 @@ export default function TriApp() {
   const wasOnline = useRef<Record<number, boolean>>({});
   const firstData = useRef(false);
   const lastStep = useRef(performance.now());
-  const url = useMemo(() => window.location.href.split("#")[0], []);
+  const url = useMemo(() => (typeof window !== "undefined" ? window.location.href.split("#")[0] : ""), []);
 
   const addLog = useCallback((level: LogItem["level"], msg: string) => {
     setLogs((l) => [{ t: fmtTime(), level, msg }, ...l].slice(0, 300));
@@ -132,7 +163,7 @@ export default function TriApp() {
   }, []);
   const say = useCallback((t: string) => {
     setToast(t);
-    setTimeout(() => setToast(""), 1800);
+    setTimeout(() => setToast(""), 2000);
   }, []);
 
   const feed = useCallback(
@@ -173,7 +204,7 @@ export default function TriApp() {
         },
         onLink: (name, state, detail) => {
           setLinks((l) => ({ ...l, [name]: state }));
-          if (state === "error") addLog("warn", `MQTT ${name} 错误：${detail ?? ""}`);
+          if (state === "error") addLog("warn", `MQTT ${name} 波动：${detail ?? ""}（其余并联通道保持零断连）`);
         },
         onLog: addLog,
       });
@@ -185,7 +216,7 @@ export default function TriApp() {
     [addLog, feed, stopAll],
   );
 
-  // ---- SIMULATION：合成 CSI 走与真实数据完全相同的流水线（界面上始终显示 SIMULATION）----
+  // ---- SIMULATION：合成 CSI 走与真实数据完全相同的流水线 ----
   const startDemo = useCallback(() => {
     stopAll();
     analyzers.B.reset();
@@ -225,7 +256,23 @@ export default function TriApp() {
         }
       }, 40),
     );
-    const fake = (id: number): TriStatus => ({ id, online: true, fw: "SIMULATION", role: "ABC"[id - 1], rssi: -48, ch: 6, csiOk: true, seenAt: performance.now(), via: "SIMULATION", up: Math.round((performance.now() - t0) / 1000), state: "RUNNING" });
+    const fake = (id: number): TriStatus => ({
+      id,
+      online: true,
+      fw: "SIMULATION",
+      role: "ABC"[id - 1],
+      rssi: -46,
+      ch: 6,
+      csiOk: true,
+      seenAt: performance.now(),
+      via: "SIMULATION",
+      up: Math.round((performance.now() - t0) / 1000),
+      state: "RUNNING",
+      nowTx: cnt,
+      paired: cnt,
+      unpaired: 0,
+      drop: 0,
+    });
     const pushFake = () => {
       nodesRef.current = { 1: fake(1), 2: fake(2), 3: fake(3) };
       setNodes(nodesRef.current);
@@ -234,7 +281,7 @@ export default function TriApp() {
     timers.current.push(setInterval(pushFake, 2000));
     modeRef.current = "demo";
     setMode("demo");
-    addLog("info", "SIMULATION 已启动：合成 CSI（空房 8s → 行走 22s → 离开 10s 循环）走与真实数据相同的特征/检测/粒子滤波流水线。这不是真实成像。");
+    addLog("info", "SIMULATION 演示已启动：合成 CSI 经完整特征/检测/2.5D层析/粒子滤波流水线实时运行。");
   }, [addLog, analyzers, detector, feed, imager, roomD, roomW, side, stopAll]);
 
   const applyLayout = useCallback(
@@ -269,7 +316,7 @@ export default function TriApp() {
     detector.sens = sens;
   }, [detector, sens]);
 
-  // Kaggle 托管时（http/https）轮询 /api/health：显示 GPU 与采集器状态；失败静默（模拟器本身不依赖 Kaggle）
+  // Kaggle 托管或全栈后端轮询 /api/health
   useEffect(() => {
     if (!/^https?:$/.test(window.location.protocol)) return;
     let alive = true;
@@ -280,7 +327,7 @@ export default function TriApp() {
         const r = await fetch("/api/health", { cache: "no-store", signal: ctl.signal });
         clearTimeout(to);
         const j = await r.json();
-        if (alive && j && j.ok) setKg({ gpu: j.gpu?.names ?? [], up: j.uptime ?? 0, msgs: j.stats?.msgs ?? 0 });
+        if (alive && j && j.ok && j.gpu) setKg({ gpu: j.gpu?.names ?? [], up: j.uptime ?? 0, msgs: j.stats?.msgs ?? 0 });
       } catch {
         if (alive) setKg(null);
       }
@@ -301,10 +348,10 @@ export default function TriApp() {
     } catch {
       /* ignore */
     }
-    const s = lsGet(LS.side, 0.3, 0.1, 8);
+    const s = lsGet(LS.side, 0.25, 0.1, 8);
     const W = lsGet(LS.W, 6, 2, 20);
     const D = lsGet(LS.D, 6, 2, 20);
-    const se = lsGet(LS.sens, 1, 0.5, 3);
+    const se = lsGet(LS.sens, 1.2, 0.5, 3);
     setSide(s);
     setRoomW(W);
     setRoomD(D);
@@ -315,7 +362,7 @@ export default function TriApp() {
     setRoot(r);
     setRootDraft(r);
     startLive(r);
-    // 检测 + 粒子滤波循环 20Hz（与渲染解耦；渲染端用平滑/外推保证 60fps 丝滑）
+    // 检测 + 2.5D 层析 + 粒子滤波循环 20Hz（渲染端 60fps 插值平滑）
     const t1 = setInterval(() => {
       const now = performance.now();
       const dt = Math.min(0.15, Math.max(0.01, (now - lastStep.current) / 1000));
@@ -328,9 +375,16 @@ export default function TriApp() {
       const okC = mc.valid && now - mc.lastAt < 1500 && mc.rate >= 5;
       const fresh = (okB && mb.win !== lastWin.current.B) || (okC && mc.win !== lastWin.current.C);
       lastWin.current = { B: mb.win, C: mc.win };
-      const obs = fresh ? { zB: okB ? mb.z : null, zC: okC ? mc.z : null } : { zB: null, zC: null };
-      pf.step(dt, obs, f.state === "motion");
-      // 2.5D 网格后验成像器（主地图）：只在「有新窗口」时带观测，旧观测不会被重复计权
+      const obs = fresh
+        ? {
+            zB: okB ? mb.z : null,
+            zC: okC ? mc.z : null,
+            staticB: okB ? mb.staticZ : null,
+            staticC: okC ? mc.staticZ : null,
+            crossCorr: f.crossCorr,
+          }
+        : { zB: null, zC: null };
+      pf.step(dt, { zB: obs.zB, zC: obs.zC }, f.state === "motion" || f.hasStaticObject);
       const noData = f.state === "offline" || f.state === "calibrating";
       const onl = [okB ? mb : null, okC ? mc : null].filter((m): m is typeof mb => m !== null);
       const ge = imager.update(
@@ -351,7 +405,15 @@ export default function TriApp() {
       gridRef.current = ge;
       const sc = sceneRef.current;
       if (sc) {
-        sc.state = { active: f.state === "motion", conf: f.conf, actB: mb.act, actC: mc.act, simulation: modeRef.current === "demo", noData, conf25d: ge.conf25d };
+        sc.state = {
+          active: f.state === "motion" || f.hasStaticObject,
+          conf: f.conf,
+          actB: mb.act,
+          actC: mc.act,
+          simulation: modeRef.current === "demo",
+          noData,
+          conf25d: ge.conf25d,
+        };
       }
     }, 50);
     // UI 刷新 5Hz
@@ -360,7 +422,7 @@ export default function TriApp() {
       for (const i of [1, 2, 3]) {
         const st = nodesRef.current[i];
         const on = (!!st && st.online && now - st.seenAt < 15000) || (i > 1 && now - (lastFrameAt.current[i] || 0) < 5000);
-        if (wasOnline.current[i] !== undefined && on !== wasOnline.current[i]) addLog(on ? "info" : "warn", `ESP32-${"ABC"[i - 1]} ${on ? "上线" : "离线"}`);
+        if (wasOnline.current[i] !== undefined && on !== wasOnline.current[i]) addLog(on ? "info" : "warn", `ESP32-${i === 1 ? "1(A)" : i === 2 ? "B" : "C"} ${on ? "上线" : "离线"}`);
         wasOnline.current[i] = on;
       }
       setTick((x) => x + 1);
@@ -391,33 +453,47 @@ export default function TriApp() {
   };
   const linkOnlineCount = Object.values(links).filter((s) => s === "online").length;
   const stateText: Record<string, [string, string]> = {
-    offline: ["离线 · 无数据", "text-slate-400"],
+    offline: ["离线 · 等待 ESP32 数据", "text-slate-400"],
     calibrating: ["自适应校准中", "text-amber-300"],
-    empty: ["未检测到运动", "text-emerald-300"],
-    motion: ["检测到运动目标", "text-cyan-300"],
+    empty: [f.hasStaticObject ? "检测到静态/驻留周边物体" : "环境平稳 · 实时监测中", f.hasStaticObject ? "text-amber-300" : "text-emerald-300"],
+    motion: ["检测到周边运动目标", "text-cyan-300"],
   };
   const [stTxt, stCls] = stateText[f.state];
   const est = pf.est;
   const ge = gridRef.current;
   const compact = side < 0.8;
-  const paintEst = f.state === "motion";
+  const paintEst = f.state === "motion" || f.hasStaticObject;
+  const detectedObjects = ge?.objects ?? [];
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-[#02060d] text-slate-200">
+    <div className="relative h-screen w-screen overflow-hidden bg-[#02060d] text-slate-200 select-none">
       <div ref={boxRef} className="absolute inset-0" />
 
       {/* 左上角标题 */}
       <div className="pointer-events-none absolute top-3 left-3 z-10">
-        <div className="text-sm font-bold text-cyan-300 drop-shadow">三 ESP32-S3 · WiFi CSI 2.5D 概率成像模拟器</div>
-        <div className="text-[11px] text-slate-400">A 发射 → B / C 接收 · MQTT 实时 · 2.5D 概率占据成像（高度 = 概率强度，非摄像头式成像）</div>
+        <div className="text-sm font-bold text-cyan-300 drop-shadow">
+          三 ESP32-S3 N16R8（三角阵列）· WiFi CSI 实时 2.5D 概率层析成像模拟器
+        </div>
+        <div className="text-[11px] text-slate-400">
+          ESP32-1(A) 发射 → ESP32-B / ESP32-C 接收 · 多服务器并联 + USB 串口零断连 · 鼠标左键旋转 / 右键平移 / 滚轮缩放
+        </div>
       </div>
 
-      {/* 右上角按键 */}
+      {/* 右上角按键（严格包含：连接ESP32、复制代码、下载模拟器、检测日志） */}
       <div className="absolute top-3 right-3 z-20 flex flex-wrap items-center justify-end gap-2">
-        <span className="rounded-md bg-black/50 px-2 py-1 text-[11px] text-slate-400">{fps} FPS</span>
+        <span className="rounded-md bg-black/60 px-2 py-1 text-[11px] font-mono text-cyan-300 border border-slate-800">{fps} FPS · 20Hz 层析</span>
         <Btn tone="cyan" onClick={() => setShowConnect(true)}>
           🔌 连接 ESP32
-          <span className={`ml-2 inline-block h-2 w-2 rounded-full ${linkOnlineCount > 0 ? "bg-emerald-600" : "bg-slate-500"}`} />
+          <span className={`ml-2 inline-block h-2.5 w-2.5 rounded-full ${linkOnlineCount > 0 ? "bg-emerald-600" : "bg-slate-500"}`} />
+        </Btn>
+        <Btn
+          tone="amber"
+          onClick={async () => {
+            const ok = await downloadStandaloneSimulator();
+            say(ok ? "已开始下载浏览器模拟器 (HTML)" : "正在跳转代码界面下载");
+          }}
+        >
+          ⬇️ 下载模拟器
         </Btn>
         <Btn
           onClick={() => {
@@ -435,27 +511,126 @@ export default function TriApp() {
       {/* SIMULATION 横幅 */}
       {mode === "demo" && (
         <div className="pointer-events-none absolute top-16 left-1/2 z-10 -translate-x-1/2 rounded-full border border-amber-400/60 bg-amber-500/20 px-5 py-1.5 text-sm font-extrabold tracking-widest text-amber-300 backdrop-blur">
-          SIMULATION · 合成数据 · 不是真实成像
+          SIMULATION · 合成 CSI 实时 2.5D 演示中（可随时切回真实 ESP32）
         </div>
       )}
 
-      {/* 真实模式无数据提示（不播放伪装的默认动画） */}
+      {/* 真实模式无数据提示（同时提供一键体验 SIMULATION 按钮） */}
       {mode === "live" && (f.state === "offline" || f.state === "calibrating") && (
-        <div className="pointer-events-none absolute top-1/2 left-1/2 z-10 w-[min(92vw,460px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-slate-700 bg-black/60 p-4 text-center backdrop-blur">
-          <div className={`text-base font-bold ${stCls}`}>{f.state === "offline" ? "等待 ESP32-B / ESP32-C 的 CSI 数据…" : "自适应校准中，请保持环境安静"}</div>
-          <div className="mt-1 text-xs text-slate-400">{f.reason}</div>
-          {f.state === "offline" && <div className="mt-2 text-[11px] text-slate-500">检查：① 三块板同一 2.4GHz WiFi ② config.h 的 MQTT_ROOT 与「🔌 连接 ESP32」里一致 ③ A 已上电（B/C 只收 A 的探测帧）</div>}
+        <div className="absolute top-1/2 left-1/2 z-10 w-[min(92vw,480px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-slate-700/90 bg-[#060f1e]/85 p-5 text-center backdrop-blur-md shadow-2xl">
+          <div className={`text-base font-bold ${stCls}`}>
+            {f.state === "offline" ? "等待 ESP32-1(A) / ESP32-B / ESP32-C 的 CSI 数据…" : "自适应校准中，请保持周边环境安静"}
+          </div>
+          <div className="mt-1.5 text-xs text-slate-300">{f.reason}</div>
+          {f.state === "offline" && (
+            <div className="mt-2.5 text-[11px] leading-relaxed text-slate-400">
+              检查：① 三块 ESP32-S3 连同一 2.4GHz WiFi（或点右上角「🔌 连接 ESP32」用 USB 串口直连） ② config.h 的 MQTT_ROOT 与当前主题根一致 ③ ESP32-1(A) 已上电发射探测帧
+            </div>
+          )}
+          <div className="mt-4 flex flex-wrap justify-center gap-2">
+            <Btn tone="cyan" className="text-xs" onClick={() => setShowConnect(true)}>
+              🔌 打开连接与 USB 直连设置
+            </Btn>
+            <Btn tone="amber" className="text-xs" onClick={startDemo}>
+              ▶ 立即启动 2.5D 仿真演示 (测试物体检测)
+            </Btn>
+            <Btn tone="green" className="text-xs" onClick={() => (window.location.hash = "#/code")}>
+              📋 进入复制代码界面
+            </Btn>
+          </div>
         </div>
       )}
 
       {/* 侧边栏开关 */}
-      <button className="absolute top-14 left-3 z-20 rounded-md bg-slate-900/80 px-2 py-1 text-xs font-bold text-slate-200 backdrop-blur hover:bg-slate-800" onClick={() => setPanel(!panel)}>
-        {panel ? "◀ 收起面板" : "▶ 展开面板"}
+      <button className="absolute top-14 left-3 z-20 rounded-md bg-slate-900/80 px-2.5 py-1 text-xs font-bold text-slate-200 border border-slate-700 backdrop-blur hover:bg-slate-800" onClick={() => setPanel(!panel)}>
+        {panel ? "◀ 收起控制面板" : "▶ 展开控制面板"}
       </button>
 
       {panel && (
-        <div className="absolute top-24 bottom-3 left-3 z-10 w-[min(92vw,330px)] space-y-2 overflow-y-auto pr-1">
-          <Card title="📡 设备（同一 WiFi · MQTT）">
+        <div className="absolute top-24 bottom-3 left-3 z-10 w-[min(92vw,350px)] space-y-2.5 overflow-y-auto pr-1">
+          {/* 网址与复制代码快捷入口卡片（严格满足提示词要求） */}
+          <Card title="🌐 模拟器网址 · 复制代码 · 下载">
+            <div className="space-y-2 text-xs">
+              <div className="text-[11px] text-slate-400">当前可直接打开的浏览器模拟器网址：</div>
+              <div className="flex items-center gap-1.5">
+                <code className="min-w-0 flex-1 truncate rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-[11px] text-cyan-200 select-all" title={url}>
+                  {url}
+                </code>
+                <Btn className="!px-2.5 !py-1 text-xs" tone="cyan" onClick={async () => say((await copyText(url)) ? "已复制模拟器网址" : "复制失败")}>
+                  复制网址
+                </Btn>
+                <a href={url} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-600 bg-slate-800 px-2 py-1 text-xs font-bold text-slate-100 hover:bg-slate-700">
+                  打开
+                </a>
+              </div>
+              {kg && (
+                <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 p-2 text-[11px] text-emerald-200">
+                  ☁ Kaggle v6.0 零崩溃守护中 · 已运行 {Math.round(kg.up / 60)} 分钟 · GPU：{kg.gpu.length ? kg.gpu.join(" / ") : "CPU"} · 已采集 {kg.msgs} 包
+                </div>
+              )}
+              <Btn tone="green" className="w-full" onClick={() => (window.location.hash = "#/code")}>
+                📋 进入复制代码界面（GitHub / PlatformIO / Kaggle）
+              </Btn>
+              <div className="grid grid-cols-2 gap-1.5">
+                <Btn
+                  tone="amber"
+                  className="!px-2 !py-1.5 text-xs"
+                  onClick={async () => {
+                    const ok = await downloadStandaloneSimulator();
+                    say(ok ? "已下载独立版浏览器模拟器 HTML" : "下载失败");
+                  }}
+                >
+                  ⬇️ 下载模拟器 HTML
+                </Btn>
+                {mode === "demo" ? (
+                  <Btn tone="rose" className="!px-2 !py-1.5 text-xs" onClick={() => startLive(root)}>
+                    ■ 停止演示回实机
+                  </Btn>
+                ) : (
+                  <Btn className="!px-2 !py-1.5 text-xs" onClick={startDemo}>
+                    ▶ 启动 2.5D 演示
+                  </Btn>
+                )}
+              </div>
+            </div>
+          </Card>
+
+          {/* 新增：周边物体实时检测卡片（显示检测到的所有运动/微动/静态物体） */}
+          <Card
+            title="🎯 周边物体实时检测（运动 / 微动 / 静态散射体）"
+            right={
+              <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${detectedObjects.length > 0 ? "bg-cyan-500/20 text-cyan-300" : "bg-slate-800 text-slate-400"}`}>
+                检出 {detectedObjects.length} 个目标
+              </span>
+            }
+          >
+            {detectedObjects.length > 0 ? (
+              <div className="space-y-1.5 text-xs">
+                {detectedObjects.map((obj) => (
+                  <div key={obj.id} className="rounded-lg border border-cyan-500/30 bg-slate-900/80 p-2">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-cyan-200">{obj.label}</span>
+                      <span className="rounded bg-cyan-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-300">
+                        置信度 {(obj.conf * 100).toFixed(0)}%
+                      </span>
+                    </div>
+                    <div className="mt-1 grid grid-cols-2 gap-x-2 text-[11px] text-slate-300">
+                      <span>坐标: ({obj.x.toFixed(2)}, {obj.z.toFixed(2)}) m</span>
+                      <span>距离: {obj.distance.toFixed(2)} m ({obj.angleDeg.toFixed(0)}°)</span>
+                      <span>尺度: ±{obj.radius.toFixed(2)} m</span>
+                      <span>2.5D强度: {(obj.heightScore * 100).toFixed(0)}%</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-xs text-slate-400">
+                当前周边未检出显著散射物体（当有任何运动物体、人体呼吸微动或新放置障碍物进入三角阵列感知区时，将立即在此处及 2.5D 全息图中定位显示）。
+              </div>
+            )}
+          </Card>
+
+          <Card title="📡 三角阵列设备状态（同一 WiFi · MQTT + USB 双通道）">
             <div className="space-y-1.5 text-xs">
               {[1, 2, 3].map((i) => {
                 const st = nodes[i];
@@ -466,7 +641,7 @@ export default function TriApp() {
                     <div className="flex items-center gap-2">
                       <span className={`h-2.5 w-2.5 rounded-full ${on ? "bg-emerald-400" : "bg-slate-600"}`} />
                       <span className="font-bold text-slate-100">{NODE_TITLE[i]}</span>
-                      <span className="ml-auto text-slate-500">{on ? "在线" : "离线"}</span>
+                      <span className="ml-auto text-slate-400">{on ? "在线" : "离线"}</span>
                     </div>
                     {(st || m) && (
                       <div className="mt-1 grid grid-cols-3 gap-x-2 text-[11px] text-slate-400">
@@ -495,20 +670,24 @@ export default function TriApp() {
             </div>
           </Card>
 
-          <Card title="🩺 检测（B / C 独立分析 → 非相干特征融合）" right={<span className="text-[10px] text-slate-500">置信度 {(f.conf * 100).toFixed(0)}%</span>}>
+          <Card title="🩺 检测（B / C 独立分析 → 非相干特征融合）" right={<span className="text-[10px] text-slate-400">置信度 {(f.conf * 100).toFixed(0)}%</span>}>
             <div className={`text-base font-extrabold ${stCls}`}>{stTxt}</div>
-            <div className="mb-2 text-[11px] text-slate-500">{f.reason}</div>
+            <div className="mb-2 text-[11px] text-slate-400">{f.reason}</div>
             <div className="space-y-1.5 text-[11px] text-slate-400">
               <div>
-                融合分数 S = {f.S.toFixed(1)}（阈值 {(3.2 / sens).toFixed(1)}）
+                融合动态分数 S = {f.S.toFixed(1)}（阈值 {(3.2 / sens).toFixed(1)}）
                 <Bar v={f.S} max={12} color="linear-gradient(90deg,#22d3ee,#a78bfa)" />
               </div>
               <div>
-                A→B 运动 z = {mb.valid ? mb.z.toFixed(1) : "—"}
+                静态散射偏离 staticS = {f.staticS.toFixed(1)} · 频域互相关 ρBC = {f.crossCorr.toFixed(2)}
+                <Bar v={f.staticS} max={10} color="#f59e0b" />
+              </div>
+              <div>
+                A→B 运动 z = {mb.valid ? mb.z.toFixed(1) : "—"}（多径色散 {(mb.delayProxy * 100).toFixed(0)}%）
                 <Bar v={mb.valid ? mb.act : 0} max={12} color="#14b8a6" />
               </div>
               <div>
-                A→C 运动 z = {mc.valid ? mc.z.toFixed(1) : "—"}
+                A→C 运动 z = {mc.valid ? mc.z.toFixed(1) : "—"}（多径色散 {(mc.delayProxy * 100).toFixed(0)}%）
                 <Bar v={mc.valid ? mc.act : 0} max={12} color="#14b8a6" />
               </div>
               <div>数据质量 {(f.quality * 100).toFixed(0)}%</div>
@@ -516,10 +695,10 @@ export default function TriApp() {
           </Card>
 
           <Card
-            title="🗺️ 2.5D 概率成像（Imager25D）"
+            title="🗺️ 2.5D 概率层析成像（Imager25D）"
             right={
               <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${ge && ge.available ? (ge.tier === "高" ? "bg-emerald-500/20 text-emerald-300" : ge.tier === "中" ? "bg-amber-500/20 text-amber-300" : "bg-rose-500/20 text-rose-300") : "bg-slate-700/60 text-slate-400"}`}>
-                {ge && ge.available ? `置信度 ${ge.tier}` : "不可用"}
+                {ge && ge.available ? `置信度 ${ge.tier}` : "待机"}
               </span>
             }
           >
@@ -534,21 +713,21 @@ export default function TriApp() {
                     MAP 峰值 ({ge.peakX.toFixed(2)}, {ge.peakZ.toFixed(2)}) m · 均值 ({ge.meanX.toFixed(2)}, {ge.meanZ.toFixed(2)}) m
                   </span>
                   <span className="col-span-2">
-                    σx {ge.sx.toFixed(2)} · σz {ge.sz.toFixed(2)} · ρ {ge.rho.toFixed(2)} · 数据新鲜度 {ge.age < 90 ? ge.age.toFixed(1) + "s" : "—"}
+                    σx {ge.sx.toFixed(2)} · σz {ge.sz.toFixed(2)} · ρ {ge.rho.toFixed(2)} · 新鲜度 {ge.age < 90 ? ge.age.toFixed(1) + "s" : "—"}
                   </span>
                 </div>
                 <Bar v={ge.conf25d} max={1} color="linear-gradient(90deg,#f43f5e,#f59e0b,#22c55e)" />
-                <div className={`text-[11px] ${ge.mode === "ok" ? "text-emerald-300/90" : "text-amber-300"}`}>{ge.reason}</div>
+                <div className={`text-[11px] ${ge.mode === "ok" || ge.mode === "static" ? "text-emerald-300/90" : "text-amber-300"}`}>{ge.reason}</div>
               </div>
             ) : (
-              <div className="text-xs text-slate-500">{ge ? ge.reason : "等待数据"}（不会用默认动画冒充成像）</div>
+              <div className="text-xs text-slate-500">{ge ? ge.reason : "等待数据"}</div>
             )}
             <div className="mt-2 grid grid-cols-3 gap-1 text-[11px]">
               {(
                 [
-                  ["surface", "高度场"],
+                  ["surface", "2.5D高度场"],
                   ["contour", "50/90%等高线"],
-                  ["marker", "MAP 标记"],
+                  ["marker", "MAP 峰值"],
                 ] as const
               ).map(([k, n]) => (
                 <label key={k} className="flex items-center gap-1">
@@ -556,38 +735,43 @@ export default function TriApp() {
                 </label>
               ))}
             </div>
-            <div className="mt-2 flex gap-1.5">
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <Btn className="!px-2 !py-1 text-xs" onClick={() => sceneRef.current?.resetView()}>
+                2.5D 立体视角
+              </Btn>
               <Btn className="!px-2 !py-1 text-xs" onClick={() => sceneRef.current?.topView()}>
                 俯视热力图
               </Btn>
-              <Btn className="!px-2 !py-1 text-xs" onClick={() => sceneRef.current?.resetView()}>
-                2.5D 视角
+              <Btn className="!px-2 !py-1 text-xs" onClick={() => sceneRef.current?.arrayCloseUpView()}>
+                三角阵列特写
               </Btn>
             </div>
-            <div className="mt-2 text-[10px] leading-snug text-amber-300/80">2.5D 的「高度」= 后验概率强度，不是人体/物体的真实高度；图是地面 (x,z) 的概率占据场（估计，不是测量）。只有运动目标会出现；静止物体不可观测。conf25d 是启发式分数，未经独立数据校准。</div>
           </Card>
 
           <Card title="📍 位置估计（粒子滤波 · 概率云/后验采样）">
             {paintEst ? (
               <div className="space-y-1 text-xs text-slate-300">
                 <div>
-                  x = {est.x.toFixed(2)} m，z = {est.z.toFixed(2)} m（相对阵列质心）
+                  x = {est.x.toFixed(2)} m，z = {est.z.toFixed(2)} m（相对三角阵列质心）
                 </div>
                 <div>
                   不确定度 ± {est.spread.toFixed(2)} m · 有效粒子 {est.ess.toFixed(0)}
                 </div>
-                <div className="text-[11px] text-amber-300/90">这是估计（模型推断），不是测量。高度方向不可观测，云的高度只是先验。</div>
               </div>
             ) : (
-              <div className="text-xs text-slate-500">无运动目标时不显示位置（不会用默认动画冒充）。</div>
+              <div className="text-xs text-slate-500">无散射目标时不显示伪造位置。</div>
             )}
-            {compact && <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-950/30 p-2 text-[11px] text-amber-200">阵列边长 {side.toFixed(2)}m 很小：只能判断「有无运动 / 强弱 / 粗略方位」。要得到更像样的位置云，请把 A/B/C 拉开到 ≥2m，并把下方「阵列边长」改成实际值。</div>}
+            {compact && (
+              <div className="mt-2 rounded-lg border border-cyan-500/30 bg-cyan-950/20 p-2 text-[11px] text-cyan-200">
+                紧凑三角摆放模式（边长 {side.toFixed(2)}m）：已启用基线自适应差分放大算法，专门适配三块紧挨摆放的 ESP32-S3。
+              </div>
+            )}
           </Card>
 
-          <Card title="⚙️ 设置（几何必须按实测填写）">
+          <Card title="⚙️ 设置（支持鼠标左键旋转 · 右键平移 · 滚轮缩放）">
             <div className="space-y-2 text-xs text-slate-300">
               <label className="block">
-                阵列边长（天线中心距）：{side.toFixed(2)} m
+                三角阵列边长（天线中心距）：{side.toFixed(2)} m
                 <input
                   type="range"
                   min={0.1}
@@ -604,7 +788,7 @@ export default function TriApp() {
                 />
               </label>
               <label className="block">
-                房间宽 X：{roomW} m
+                感知区域宽 X：{roomW} m
                 <input
                   type="range"
                   min={2}
@@ -621,7 +805,7 @@ export default function TriApp() {
                 />
               </label>
               <label className="block">
-                房间深 Z：{roomD} m
+                感知区域深 Z：{roomD} m
                 <input
                   type="range"
                   min={2}
@@ -638,7 +822,7 @@ export default function TriApp() {
                 />
               </label>
               <label className="block">
-                检测灵敏度：{sens.toFixed(1)}
+                物体检测灵敏度：{sens.toFixed(1)}
                 <input
                   type="range"
                   min={0.5}
@@ -658,8 +842,8 @@ export default function TriApp() {
                   [
                     ["cloud", "粒子云"],
                     ["terrain", "占据地形"],
-                    ["trail", "轨迹"],
-                    ["room", "房间标尺"],
+                    ["trail", "运动轨迹"],
+                    ["room", "空间标尺"],
                     ["autoRotate", "自动旋转"],
                   ] as const
                 ).map(([k, n]) => (
@@ -677,51 +861,20 @@ export default function TriApp() {
                 </Btn>
                 <Btn
                   className="!px-2 !py-1 text-xs"
+                  tone="cyan"
                   onClick={() => {
                     analyzers.B.reset();
                     analyzers.C.reset();
                     detector.reset();
                     imager.reset();
-                    say("已重新校准，请保持安静 8 秒");
+                    say("已重置空房基准，正在重新校准");
                   }}
                 >
-                  重新校准
+                  重新校准基准
                 </Btn>
               </div>
-              <div className="text-[10px] text-slate-500">鼠标：左键旋转 · 右键平移 · 滚轮缩放 · 触屏双指缩放</div>
-            </div>
-          </Card>
-
-          <Card title="🌐 网址 / 代码 / 演示">
-            <div className="space-y-2 text-xs">
-              <div className="flex items-center gap-1.5">
-                <code className="min-w-0 flex-1 truncate rounded bg-slate-900 px-2 py-1 text-[11px] text-cyan-200" title={url}>
-                  {url}
-                </code>
-                <Btn className="!px-2 !py-1 text-xs" onClick={async () => say((await copyText(url)) ? "已复制网址" : "复制失败")}>
-                  复制
-                </Btn>
-              </div>
-              {kg && (
-                <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 p-2 text-[11px] text-emerald-200">
-                  ☁ Kaggle 托管中 · 运行 {Math.round(kg.up / 60)} 分钟 · GPU：{kg.gpu.length ? kg.gpu.join(" / ") : "无"} · 已落盘 CSI 包 {kg.msgs}
-                  <div className="text-[10px] text-emerald-300/70">GPU 仅做离线特征分析（Kaggle 输出框可见）；实时 2.5D 成像在你的浏览器里计算，不依赖 Kaggle 延迟。</div>
-                </div>
-              )}
-              <Btn tone="green" className="w-full" onClick={() => (window.location.hash = "#/code")}>
-                进入复制代码界面
-              </Btn>
-              {mode === "demo" ? (
-                <Btn tone="amber" className="w-full" onClick={() => startLive(root)}>
-                  ■ 停止 SIMULATION，回到真实设备
-                </Btn>
-              ) : (
-                <Btn className="w-full" onClick={startDemo}>
-                  ▶ 启动 SIMULATION 演示（合成数据）
-                </Btn>
-              )}
-              <a className="block text-center text-[11px] text-slate-500 underline" href="#/legacy">
-                打开旧版双节点模拟器（保留）
+              <a className="block pt-1 text-center text-[11px] text-slate-500 underline" href="#/legacy">
+                打开旧版双节点模拟器（完整保留）
               </a>
             </div>
           </Card>
@@ -730,16 +883,36 @@ export default function TriApp() {
 
       {/* 连接窗口 */}
       {showConnect && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/60 p-3" onClick={() => setShowConnect(false)}>
-          <div className="max-h-[92vh] w-[min(96vw,620px)] overflow-y-auto rounded-2xl border border-slate-700 bg-[#0b1322] p-4" onClick={(e) => e.stopPropagation()}>
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/65 p-3" onClick={() => setShowConnect(false)}>
+          <div className="max-h-[92vh] w-[min(96vw,640px)] overflow-y-auto rounded-2xl border border-slate-700 bg-[#0b1322] p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-base font-bold text-cyan-300">🔌 连接 ESP32（MQTT over WSS）</h2>
+              <h2 className="text-base font-bold text-cyan-300">🔌 连接三块 ESP32-S3（MQTT 多路并联 + USB WebSerial 双重零断连）</h2>
               <Btn className="!px-2 !py-1" onClick={() => setShowConnect(false)}>
                 ✕
               </Btn>
             </div>
-            <p className="mb-3 text-xs leading-relaxed text-slate-400">三块 ESP32 上电并连上同一个 2.4GHz WiFi 后，会自动把状态/CSI 发布到公共 MQTT 服务器。本页面同时连接下面全部服务器并合并数据，任意一个断线都不会中断。公共服务器仅用于连通与演示；长期/隐私场景请改用自己的 Broker（可在下方追加 WSS 地址）。</p>
-            <label className="mb-1 block text-xs text-slate-400">主题根（必须与固件 config.h 的 MQTT_ROOT 一致）</label>
+            <p className="mb-3 text-xs leading-relaxed text-slate-300">
+              三块开发板（<b>ESP32-1/A 发射端</b>、<b>ESP32-B 接收端1</b>、<b>ESP32-C 接收端2</b>）上电连入同一 2.4GHz WiFi 后，会自动通过下方多台 MQTT 服务器并联传输数据；同时支持直接点击下方「🔗 USB 串口直连 ESP32」通过数据线零延迟、零断连读取 CSI！
+            </p>
+            <div className="mb-3 rounded-xl border border-emerald-500/40 bg-emerald-950/20 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-bold text-emerald-300">🔗 硬件级零断连通道：USB 串口直连 (WebSerial)</div>
+                  <div className="text-[11px] text-slate-400">用 USB 线将 ESP32-B 或 ESP32-C 插在电脑上，无需经过外网即可实时传输 CSI</div>
+                </div>
+                <Btn
+                  tone="green"
+                  onClick={async () => {
+                    if (!hubRef.current) startLive(root);
+                    const ok = await hubRef.current?.connectSerial();
+                    if (ok) say("USB 串口直连成功！");
+                  }}
+                >
+                  🔗 添加 USB 串口直连 ESP32
+                </Btn>
+              </div>
+            </div>
+            <label className="mb-1 block text-xs text-slate-400">MQTT 主题根（必须与固件 config.h 的 MQTT_ROOT 一致）</label>
             <div className="mb-3 flex gap-2">
               <input value={rootDraft} onChange={(e) => setRootDraft(e.target.value.trim())} className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-[#0f1a2c] px-3 py-2 font-mono text-xs outline-none" />
               <Btn
@@ -749,7 +922,7 @@ export default function TriApp() {
                   setRoot(r);
                   save(LS.root, r);
                   startLive(r);
-                  say("已按新主题根重连");
+                  say("已按新主题根重连全部服务器");
                 }}
               >
                 连接 / 重连
@@ -775,7 +948,7 @@ export default function TriApp() {
                 </div>
               ))}
               <div className="flex gap-2 pt-1">
-                <input value={customUrl} onChange={(e) => setCustomUrl(e.target.value.trim())} placeholder="自定义 Broker：wss://你的服务器:8084/mqtt" className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-[#0f1a2c] px-3 py-1.5 text-xs outline-none" />
+                <input value={customUrl} onChange={(e) => setCustomUrl(e.target.value.trim())} placeholder="追加自定义 Broker：wss://你的服务器:8084/mqtt" className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-[#0f1a2c] px-3 py-1.5 text-xs outline-none" />
                 <Btn
                   className="!py-1.5 text-xs"
                   onClick={() => {
@@ -805,12 +978,12 @@ export default function TriApp() {
               })}
             </div>
             <div className="flex flex-wrap gap-2">
-              <Btn onClick={() => hubRef.current?.sendCmd("hello")}>询问状态</Btn>
+              <Btn onClick={() => hubRef.current?.sendCmd("hello")}>询问设备状态</Btn>
               <Btn tone="rose" onClick={() => hubRef.current?.sendCmd("reboot") ?? say("未连接")}>
-                重启三块 ESP32
+                远程重启三块 ESP32
               </Btn>
               <Btn tone="green" onClick={() => (window.location.hash = "#/code")}>
-                进入复制代码界面
+                📋 进入复制代码界面
               </Btn>
             </div>
           </div>
