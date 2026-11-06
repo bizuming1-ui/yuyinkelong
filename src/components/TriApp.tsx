@@ -7,6 +7,7 @@ import { TriScene, type SceneOptions } from "@/lib/tri/scene";
 import { TriHub, loadCustomBrokers, type LinkState, type TriStatus } from "@/lib/tri/hub";
 import { NODE_TITLE, TRI_BROKERS, TRI_ROOT } from "@/lib/tri/config";
 import type { TriFrame } from "@/lib/tri/protocol";
+import { PAGES_URL } from "@/lib/config";
 import { SimPerson, linkW, rng, synthCsi } from "@/lib/tri/sim";
 
 type Mode = "idle" | "live" | "demo";
@@ -139,7 +140,7 @@ export default function TriApp() {
   const [toast, setToast] = useState("");
   const [customUrl, setCustomUrl] = useState("");
   const [, setTick] = useState(0);
-  const [kg, setKg] = useState<{ gpu: string[]; up: number; msgs: number } | null>(null);
+  const [kg, setKg] = useState<{ gpu: string[]; up: number; msgs: number; ver: string } | null>(null);
 
   const hubRef = useRef<TriHub | null>(null);
   const sceneRef = useRef<TriScene | null>(null);
@@ -327,7 +328,7 @@ export default function TriApp() {
         const r = await fetch("/api/health", { cache: "no-store", signal: ctl.signal });
         clearTimeout(to);
         const j = await r.json();
-        if (alive && j && j.ok && j.gpu) setKg({ gpu: j.gpu?.names ?? [], up: j.uptime ?? 0, msgs: j.stats?.msgs ?? 0 });
+        if (alive && j && j.ok && j.gpu) setKg({ gpu: j.gpu?.names ?? [], up: j.uptime ?? 0, msgs: j.stats?.msgs ?? 0, ver: typeof j.version === "string" ? j.version : "" });
       } catch {
         if (alive) setKg(null);
       }
@@ -565,9 +566,23 @@ export default function TriApp() {
               </div>
               {kg && (
                 <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/30 p-2 text-[11px] text-emerald-200">
-                  ☁ Kaggle v6.0 零崩溃守护中 · 已运行 {Math.round(kg.up / 60)} 分钟 · GPU：{kg.gpu.length ? kg.gpu.join(" / ") : "CPU"} · 已采集 {kg.msgs} 包
+                  ☁ Kaggle {kg.ver || "v7"} 后台守护中 · 已运行 {Math.round(kg.up / 60)} 分钟 · GPU：{kg.gpu.length ? kg.gpu.join(" / ") : "CPU"} · 已采集 {kg.msgs} 包
                 </div>
               )}
+              <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-2 text-[11px] text-slate-300">
+                <div className="mb-1 text-slate-400">永久网址（GitHub Pages，推送到 GitHub 后自动构建，不依赖 Kaggle）：</div>
+                <div className="flex items-center gap-1.5">
+                  <code className="min-w-0 flex-1 truncate select-all text-emerald-200" title={PAGES_URL}>
+                    {PAGES_URL}
+                  </code>
+                  <Btn className="!px-2 !py-1 text-xs" tone="cyan" onClick={async () => say((await copyText(PAGES_URL)) ? "已复制永久网址" : "复制失败")}>
+                    复制
+                  </Btn>
+                  <a href={PAGES_URL} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-600 bg-slate-800 px-2 py-1 text-xs font-bold text-slate-100 hover:bg-slate-700">
+                    打开
+                  </a>
+                </div>
+              </div>
               <Btn tone="green" className="w-full" onClick={() => (window.location.hash = "#/code")}>
                 📋 进入复制代码界面（GitHub / PlatformIO / Kaggle）
               </Btn>
