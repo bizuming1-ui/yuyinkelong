@@ -13,3 +13,4 @@ work/
 .shots/
 __pycache__/
 dist/
+src/lib/manifest.generated.json
