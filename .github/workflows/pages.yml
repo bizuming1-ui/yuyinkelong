@@ -1,0 +1,51 @@
+# 每次推送到 main：自动构建单文件 2.5D 浏览器模拟器并发布到 GitHub Pages（永久网址，不依赖 Kaggle / 你的电脑）。
+# 一次性设置：仓库 Settings → Pages → Build and deployment → Source 选择 "GitHub Actions"。
+# 发布后网址：https://bizuming1-ui.github.io/yuyinkelong/
+name: Deploy simulator to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install and build
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+      - name: Verify Kaggle cell is in sync with daemon
+        run: python3 tools/make_kaggle_cell.py --check
+      - name: Prepare site
+        run: |
+          mkdir -p _site
+          cp dist/index.html _site/index.html
+          touch _site/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
