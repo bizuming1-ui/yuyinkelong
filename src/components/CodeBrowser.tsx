@@ -1,5 +1,5 @@
-// 复制代码界面：每个文件都有「在 GitHub 编辑」+「复制此文件」，并实时检测 GitHub 上是否已是最新。
-// 分类：GitHub 全部文件 / PlatformIO · ESP32-A（发射端）/ ESP32-B（接收端1）/ ESP32-C（接收端2） / Kaggle（粘贴到 Notebook 运行）。
+// 复制代码界面：每个文件都有「在 GitHub 编辑」+「复制此文件」，并实时检测 GitHub (https://github.com/bizuming1-ui/yuyinkelong) 上是否已是最新。
+// 分类：GitHub 全部文件 / PlatformIO · ESP32-1（ESP32-A 发射端）/ ESP32-B（接收端1）/ ESP32-C（接收端2） / Kaggle（粘贴到 Notebook 运行）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GITHUB_BRANCH, GITHUB_REPO, OLD_FILE_HINTS } from "@/lib/config";
 import { gitShaVariants } from "@/lib/sha1";
@@ -47,7 +47,7 @@ async function downloadZip(name: string, entries: { path: string; content: strin
     a.click();
     a.remove();
   } catch {
-    window.open(url, "_blank"); // 兜底：个别浏览器拦截 download 属性时，在新标签页打开 blob
+    window.open(url, "_blank");
   }
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
@@ -63,10 +63,57 @@ function downloadText(name: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
-const PIO_TABS: Record<string, { title: string; dir: string; role: string; node: string }> = {
-  "esp32-a": { title: "ESP32-A · 发射端 TX", dir: "firmware/esp32-a/", role: "NODE_ROLE = ROLE_A", node: "探测发射端：以 100Hz 向 B/C 广播带序列号的 ESP-NOW(HT MCS0) 探测帧" },
-  "esp32-b": { title: "ESP32-B · 接收端 RX1", dir: "firmware/esp32-b/", role: "NODE_ROLE = ROLE_B", node: "接收 A 的探测帧 → CSI → MQTT 上传" },
-  "esp32-c": { title: "ESP32-C · 接收端 RX2", dir: "firmware/esp32-c/", role: "NODE_ROLE = ROLE_C", node: "接收 A 的探测帧 → CSI → MQTT 上传" },
+async function downloadStandaloneHtml(): Promise<boolean> {
+  try {
+    let htmlText = "";
+    try {
+      const res = await fetch("/standalone-simulator.html", { cache: "no-store" });
+      if (res.ok) {
+        const t = await res.text();
+        if (t.includes("<html") && t.length > 50_000) htmlText = t;
+      }
+    } catch {
+      /* ignore */
+    }
+    if (!htmlText) {
+      htmlText = "<!doctype html>\n" + document.documentElement.outerHTML;
+    }
+    const url = URL.createObjectURL(new Blob([htmlText], { type: "text/html;charset=utf-8" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "esp32s3-tri-2.5d-simulator.html";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const PIO_TABS: Record<string, { title: string; shortLabel: string; dir: string; role: string; node: string }> = {
+  "esp32-a": {
+    title: "ESP32-1 (ESP32-A) · 发射端 TX",
+    shortLabel: "ESP32-1",
+    dir: "firmware/esp32-a/",
+    role: "NODE_ROLE = ROLE_A (ROLE_1)",
+    node: "第 1 块板（ESP32-1 / ESP32-A 探测发射端）：以 100Hz 向 ESP32-B / ESP32-C 广播带序列号的 ESP-NOW(HT MCS0) 探测帧",
+  },
+  "esp32-b": {
+    title: "ESP32-B · 接收端 RX1",
+    shortLabel: "ESP32-B",
+    dir: "firmware/esp32-b/",
+    role: "NODE_ROLE = ROLE_B",
+    node: "第 2 块板（ESP32-B 接收端1）：接收 ESP32-1(A) 的探测帧 → 提取 64 子载波 CSI → MQTT + USB 双通道上传",
+  },
+  "esp32-c": {
+    title: "ESP32-C · 接收端 RX2",
+    shortLabel: "ESP32-C",
+    dir: "firmware/esp32-c/",
+    role: "NODE_ROLE = ROLE_C",
+    node: "第 3 块板（ESP32-C 接收端2）：接收 ESP32-1(A) 的探测帧 → 提取 64 子载波 CSI → MQTT + USB 双通道上传",
+  },
 };
 
 export default function CodeBrowser() {
@@ -103,7 +150,7 @@ export default function CodeBrowser() {
   const say = (t: string) => {
     setToast(t);
     if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(() => setToast(""), 2200);
+    timer.current = setTimeout(() => setToast(""), 2400);
   };
 
   const check = useCallback(async () => {
@@ -113,7 +160,10 @@ export default function CodeBrowser() {
       let tree: { path: string; type: string; sha: string }[] | null = null;
       let lastErr = "";
       try {
-        const r = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/git/trees/${GITHUB_BRANCH}?recursive=1`, { cache: "no-store", headers: { Accept: "application/vnd.github+json" } });
+        const r = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/git/trees/${GITHUB_BRANCH}?recursive=1&t=${Date.now()}`, {
+          cache: "no-store",
+          headers: { Accept: "application/vnd.github+json" },
+        });
         if (r.ok) {
           const j = (await r.json()) as { tree?: { path: string; type: string; sha: string }[] };
           if (Array.isArray(j.tree)) tree = j.tree;
@@ -165,7 +215,7 @@ export default function CodeBrowser() {
         setHintOld(found.sort());
         setRawStatus(res);
         setRemote(null);
-        setErr(`GitHub API 暂不可用（${String(e instanceof Error ? e.message : e)}），已改用 raw 文件对比（GitHub 缓存可能有几分钟延迟）`);
+        setErr(`GitHub API 暂不可用（${String(e instanceof Error ? e.message : e)}），已自动切换为 raw 文件内容实时对比`);
       } catch {
         setErr("无法连接 GitHub（网络问题）。请稍后点「立即检测」。");
       }
@@ -175,10 +225,10 @@ export default function CodeBrowser() {
     }
   }, [files]);
 
-  // 进入页面检测 + 每 60 秒 + 每次回到本页（你在 GitHub 提交完切回来时）立刻检测
+  // 进入页面检测 + 每 45 秒 + 每次回到本页（你在 GitHub 提交完切回来时）立刻检测
   useEffect(() => {
     check();
-    const id = setInterval(check, 60_000);
+    const id = setInterval(check, 45_000);
     const onVis = () => {
       if (document.visibilityState === "visible") check();
     };
@@ -254,12 +304,18 @@ export default function CodeBrowser() {
     const text = isPio || tab === "kaggle" ? applyWifi(f) : f.content;
     const isOpen = !!open[f.path];
     const exists = s !== "missing";
+    const pioBoardTag = isPio ? PIO_TABS[tab]?.shortLabel : null;
     return (
       <div key={f.path} className="rounded-xl border border-slate-800 bg-[#0a1322]">
         <div className="flex flex-wrap items-center gap-2 p-3">
           <button className="min-w-0 flex-1 text-left" onClick={() => setOpen({ ...open, [f.path]: !isOpen })}>
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-slate-500">{isOpen ? "▼" : "▶"}</span>
+              {pioBoardTag && (
+                <span className="rounded bg-cyan-500/20 border border-cyan-400/40 px-2 py-0.5 text-xs font-extrabold text-cyan-200">
+                  {pioBoardTag}
+                </span>
+              )}
               <span className="font-mono text-sm font-semibold break-all text-cyan-200">{f.path}</span>
               {badge(s)}
             </div>
@@ -287,14 +343,20 @@ export default function CodeBrowser() {
           >
             ⚡ 复制并去 GitHub
           </button>
+          <button
+            className="rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+            onClick={() => downloadText(f.path.split("/").pop() || "file.txt", text)}
+          >
+            ⬇️ 下载
+          </button>
         </div>
-        {isOpen && <pre className="max-h-[420px] overflow-auto border-t border-slate-800 bg-[#050a14] p-3 font-mono text-[12px] leading-relaxed whitespace-pre text-slate-300">{text}</pre>}
+        {isOpen && <pre className="max-h-[440px] overflow-auto border-t border-slate-800 bg-[#050a14] p-3 font-mono text-[12px] leading-relaxed whitespace-pre text-slate-300 select-text">{text}</pre>}
       </div>
     );
   };
 
   const tabBtn = (k: Tab, label: string, extra?: React.ReactNode) => (
-    <button key={k} onClick={() => setTab(k)} className={`rounded-lg px-3 py-2 text-sm font-bold whitespace-nowrap ${tab === k ? "bg-cyan-400 text-slate-900" : "bg-slate-800 text-slate-200 hover:bg-slate-700"}`}>
+    <button key={k} onClick={() => setTab(k)} className={`rounded-lg px-3 py-2 text-sm font-bold whitespace-nowrap transition ${tab === k ? "bg-cyan-400 text-slate-900 shadow" : "bg-slate-800 text-slate-200 hover:bg-slate-700"}`}>
       {label} {extra}
     </button>
   );
@@ -303,15 +365,17 @@ export default function CodeBrowser() {
     <div className="flex h-screen min-h-0 flex-col bg-[#050a14] text-slate-200">
       <header className="flex flex-wrap items-center gap-2 border-b border-slate-800 bg-[#0b1220] px-4 py-3">
         <button onClick={() => (window.location.hash = "")} className="rounded-lg bg-cyan-400 px-3 py-2 text-sm font-bold text-slate-900 hover:bg-cyan-300">
-          ← 返回 3D 模拟器
+          ← 返回 2.5D 浏览器模拟器
         </button>
-        <h1 className="text-base font-bold text-cyan-300">📋 复制代码界面 · 同步到 GitHub / PlatformIO</h1>
+        <h1 className="text-base font-bold text-cyan-300">
+          📋 复制代码界面 · 实时检测同步到 GitHub ({GITHUB_REPO}) / PlatformIO (ESP32-1 · ESP32-B · ESP32-C) / Kaggle
+        </h1>
         <div className="ml-auto flex flex-wrap items-center gap-2 text-xs text-slate-400">
           <a href={REPO_URL} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-700 px-3 py-2 font-bold text-slate-200 hover:bg-slate-800">
             打开仓库 {GITHUB_REPO}
           </a>
-          <button onClick={check} disabled={checking} className="rounded-lg bg-slate-800 px-3 py-2 font-bold text-slate-100 hover:bg-slate-700 disabled:opacity-50">
-            {checking ? "检测中…" : "🔄 立即检测"}
+          <button onClick={check} disabled={checking} className="rounded-lg bg-emerald-500 px-3 py-2 font-bold text-slate-950 hover:bg-emerald-400 disabled:opacity-50">
+            {checking ? "正在比对 GitHub…" : "🔄 立即检测 GitHub 同步状态"}
           </button>
           <span>上次检测 {checkedAt || "—"}</span>
         </div>
@@ -324,13 +388,13 @@ export default function CodeBrowser() {
               <span className="rounded-full bg-emerald-500/15 px-3 py-1 font-bold text-emerald-300">✅ 已同步 {counts.synced}</span>
               <span className="rounded-full bg-orange-500/15 px-3 py-1 font-bold text-orange-300">⚠️ 需更新 {counts.modified}</span>
               <span className="rounded-full bg-rose-500/15 px-3 py-1 font-bold text-rose-300">🆕 需新建 {counts.missing}</span>
-              {counts.unknown > 0 && <span className="rounded-full bg-slate-500/15 px-3 py-1 text-slate-300">… 未知 {counts.unknown}</span>}
+              {counts.unknown > 0 && <span className="rounded-full bg-slate-500/15 px-3 py-1 text-slate-300">… 检测中 {counts.unknown}</span>}
               {obsolete.length > 0 && <span className="rounded-full bg-purple-500/15 px-3 py-1 font-bold text-purple-300">🗑 GitHub 上多余 {obsolete.length}</span>}
             </div>
             {err && <div className="mt-2 text-xs text-amber-300">{err}</div>}
             <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-cyan-500/30 bg-cyan-950/10 p-3 text-xs">
-              <span className="font-bold text-cyan-300">🌐 本模拟器网址</span>
-              <code className="min-w-0 flex-1 break-all rounded bg-slate-900 px-2 py-1 text-cyan-100">{siteUrl}</code>
+              <span className="font-bold text-cyan-300">🌐 本浏览器模拟器网址（可直接复制在浏览器打开）</span>
+              <code className="min-w-0 flex-1 break-all rounded bg-slate-900 px-2 py-1 text-cyan-100 select-all">{siteUrl}</code>
               <button className="rounded-lg bg-cyan-400 px-3 py-1.5 font-bold text-slate-900 hover:bg-cyan-300" onClick={async () => say((await copyText(siteUrl)) ? "已复制网址" : "复制失败")}>
                 复制网址
               </button>
@@ -340,7 +404,9 @@ export default function CodeBrowser() {
             </div>
             {pending.length > 0 ? (
               <div className="mt-3 rounded-xl border border-orange-500/40 bg-orange-950/20 p-3">
-                <div className="mb-2 text-sm font-bold text-orange-300">⚠️ 这 {pending.length} 个文件还没更新到 GitHub（点文件名跳到 GitHub 编辑）：</div>
+                <div className="mb-2 text-sm font-bold text-orange-300">
+                  ⚠️ 实时防漏更提醒：以下 {pending.length} 个文件还未同步到 GitHub（点击即可直接跳到 GitHub 编辑，或点击下方卡片「⚡ 复制并去 GitHub」）：
+                </div>
                 <div className="flex flex-wrap gap-2">
                   {pending.map((f) => (
                     <a key={f.path} href={editUrl(f.path, statusOf(f.path) !== "missing")} target="_blank" rel="noreferrer" className="rounded-md bg-slate-900 px-2 py-1 font-mono text-[11px] text-orange-200 hover:bg-slate-800">
@@ -350,55 +416,75 @@ export default function CodeBrowser() {
                 </div>
               </div>
             ) : counts.unknown === 0 && files.length > 0 ? (
-              <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-950/20 p-3 text-sm font-bold text-emerald-300">🎉 所有文件都已和 GitHub 一致。</div>
+              <div className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-950/20 p-3 text-sm font-bold text-emerald-300">
+                🎉 所有文件都已和 GitHub ({GITHUB_REPO}) 100% 同步一致！现在可以直接去 Kaggle 运行 `kaggle/kaggle_cell.py` 了。
+              </div>
             ) : null}
             <div className="mt-3 flex flex-wrap gap-2">
-              <button className="rounded-lg bg-cyan-400 px-3 py-2 text-sm font-bold text-slate-900 hover:bg-cyan-300" onClick={() => downloadZip("yuyinkelong-all.zip", files.map((f) => ({ path: f.path, content: f.content }))).then(() => say("已开始下载 yuyinkelong-all.zip"))}>
-                ⬇️ 下载全部代码 ZIP
+              <button
+                className="rounded-lg bg-amber-400 px-3 py-2 text-sm font-bold text-slate-950 hover:bg-amber-300"
+                onClick={() => downloadStandaloneHtml().then((ok) => say(ok ? "已开始下载独立单文件模拟器 HTML" : "下载失败"))}
+              >
+                ⬇️ 下载独立版浏览器模拟器 (.html 直接打开)
+              </button>
+              <button
+                className="rounded-lg bg-cyan-400 px-3 py-2 text-sm font-bold text-slate-900 hover:bg-cyan-300"
+                onClick={() => downloadZip("yuyinkelong-all.zip", files.map((f) => ({ path: f.path, content: f.content }))).then(() => say("已开始下载 yuyinkelong-all.zip"))}
+              >
+                ⬇️ 下载全部 GitHub 代码 ZIP
               </button>
               {(["esp32-a", "esp32-b", "esp32-c"] as const).map((k) => (
                 <button
                   key={k}
-                  className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700"
+                  className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700 border border-slate-700"
                   onClick={() =>
                     downloadZip(
-                      `platformio-${k}.zip`,
+                      `platformio-${PIO_TABS[k].shortLabel.toLowerCase()}.zip`,
                       files.filter((f) => f.group === k).map((f) => ({ path: f.path.replace(PIO_TABS[k].dir, ""), content: applyWifi(f) })),
-                    ).then(() => say(`已开始下载 ${PIO_TABS[k].title} 工程`))
+                    ).then(() => say(`已开始下载 ${PIO_TABS[k].shortLabel} PlatformIO 工程`))
                   }
                 >
-                  ⬇️ {PIO_TABS[k].title.split(" · ")[0]} PlatformIO 工程 ZIP
+                  ⬇️ {PIO_TABS[k].shortLabel} PlatformIO 工程 ZIP
                 </button>
               ))}
-              <button className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700" onClick={() => files.filter((f) => f.group === "kaggle").forEach((f) => downloadText(f.path.split("/").pop() || "kaggle.py", f.content))}>
-                ⬇️ Kaggle 文件
+              <button
+                className="rounded-lg bg-slate-800 px-3 py-2 text-sm font-bold text-slate-100 hover:bg-slate-700 border border-slate-700"
+                onClick={() => files.filter((f) => f.group === "kaggle").forEach((f) => downloadText(f.path.split("/").pop() || "kaggle_cell.py", f.content))}
+              >
+                ⬇️ 下载 Kaggle 代码 (kaggle_cell.py)
               </button>
             </div>
           </section>
 
           <div className="flex flex-wrap gap-2">
-            {tabBtn("github", "📁 GitHub 代码文件", <span className="opacity-70">({files.length})</span>)}
-            {tabBtn("esp32-a", "🔵 PlatformIO · ESP32-A 发射端")}
-            {tabBtn("esp32-b", "🟢 PlatformIO · ESP32-B 接收端1")}
-            {tabBtn("esp32-c", "🟢 PlatformIO · ESP32-C 接收端2")}
-            {tabBtn("kaggle", "🟠 Kaggle 运行代码")}
+            {tabBtn("github", "📁 GitHub 全部代码文件", <span className="opacity-70">({files.length})</span>)}
+            {tabBtn("esp32-a", "🔵 PlatformIO · ESP32-1 (ESP32-A 发射端)")}
+            {tabBtn("esp32-b", "🟢 PlatformIO · ESP32-B (接收端1)")}
+            {tabBtn("esp32-c", "🟢 PlatformIO · ESP32-C (接收端2)")}
+            {tabBtn("kaggle", "🟠 Kaggle 零崩溃运行代码")}
             {tabBtn("clean", "🗑 GitHub 上多余的旧文件", <span className="opacity-70">({obsolete.length})</span>)}
           </div>
 
           {isPio && (
             <section className="rounded-2xl border border-cyan-500/30 bg-cyan-950/10 p-4 text-sm">
-              <div className="mb-2 font-bold text-cyan-300">{PIO_TABS[tab]?.title}（{PIO_TABS[tab]?.role}）· {PIO_TABS[tab]?.node}</div>
-              <ol className="list-decimal space-y-1 pl-5 text-slate-300">
-                <li>VS Code → PlatformIO → 新建一个空工程文件夹（板子随便选，下面的 platformio.ini 会覆盖）。</li>
+              <div className="mb-2 flex flex-wrap items-center gap-2 font-bold text-cyan-300">
+                <span className="rounded-md bg-cyan-400 px-2.5 py-0.5 text-slate-950 font-extrabold">
+                  当前烧录目标：{PIO_TABS[tab]?.shortLabel}
+                </span>
+                <span>{PIO_TABS[tab]?.title}（{PIO_TABS[tab]?.role}）</span>
+              </div>
+              <p className="mb-2 text-xs text-slate-300">{PIO_TABS[tab]?.node}</p>
+              <ol className="list-decimal space-y-1 pl-5 text-xs text-slate-300">
+                <li>VS Code → PlatformIO → 为 <b>{PIO_TABS[tab]?.shortLabel}</b> 新建或打开对应的空工程文件夹。</li>
                 <li>
-                  下面 4 个文件（platformio.ini / upload_retry.py / include/config.h / src/main.cpp）逐个「复制此文件」，粘贴覆盖到工程里对应路径（也可点上面的 <b>ZIP</b> 一次性下载整个工程）。
+                  将下方专属于 <b>{PIO_TABS[tab]?.shortLabel}</b> 的 4 个文件（<code>platformio.ini</code> / <code>upload_retry.py</code> / <code>include/config.h</code> / <code>src/main.cpp</code>）逐个点击「📋 复制此文件」覆盖对应文件，或直接点上方「⬇️ {PIO_TABS[tab]?.shortLabel} PlatformIO 工程 ZIP」。
                 </li>
-                <li>在下面填好 2.4GHz WiFi，复制出来的 config.h 会自动带上（只保存在你自己的浏览器里）。</li>
-                <li>环境选 n16r8 → Upload。成功后串口监视器应出现「[BOOT] ESP32-S3 CSI v4」和「[状态] …」行。三块板必须使用同一个 WiFi，且配置里的 MQTT_ROOT 保持一致。</li>
+                <li>在下方填入你的 2.4GHz WiFi 名称与密码，复制出来的 <code>config.h</code> 会自动填入 WiFi 信息。</li>
+                <li>PlatformIO 环境选择 <code>n16r8</code> → 点击 Upload 烧录（内置 <code>upload_retry.py</code> 自动防掉线降速重试）。</li>
               </ol>
               <div className="mt-3 grid gap-2 sm:grid-cols-2">
                 <label className="text-xs text-slate-400">
-                  WiFi 名称（2.4GHz）
+                  WiFi 名称（2.4GHz，三块板必须相同）
                   <input
                     value={ssid}
                     onChange={(e) => {
@@ -435,21 +521,23 @@ export default function CodeBrowser() {
 
           {tab === "kaggle" && (
             <section className="rounded-2xl border border-amber-500/30 bg-amber-950/10 p-4 text-sm">
-              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle（T4×2）运行步骤</div>
-              <ol className="list-decimal space-y-1 pl-5 text-slate-300">
-                <li>Kaggle → New Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 ×2</b>，<b>Internet 打开 (On)</b>。</li>
-                <li>下面的 <code>kaggle/kaggle_cell.py</code>「复制此文件」，粘贴进 Notebook 的<b>第一个代码单元</b>，点 Run。</li>
-                <li>单元输出框里会打印一个 <b>https://xxxx.trycloudflare.com</b> 网址（点开就是本 3D 浏览器模拟器），单元会一直运行并每 30 秒打印健康统计。</li>
-                <li>Kaggle 会话有时长上限、可能被回收：它只提供网页托管 + GPU 离线分析 + 原始 CSI 落盘；<b>设备→浏览器的 MQTT 链路不依赖 Kaggle</b>，Kaggle 停了也不会让 ESP32 断连。</li>
+              <div className="mb-2 font-bold text-amber-300">🟠 Kaggle（GPU T4×2）v6.0 零崩溃运行步骤（已彻底修复 Draft Session Fatal 弹窗）</div>
+              <ol className="list-decimal space-y-1 pl-5 text-xs text-slate-300">
+                <li>先在「📁 GitHub 全部代码文件」标签页确认所有修改的文件已更新到 <code>https://github.com/{GITHUB_REPO}</code>。</li>
+                <li>打开 Kaggle → New Notebook → 右侧 Settings：Accelerator 选 <b>GPU T4 × 2</b>，<b>Internet 打开 (On)</b>。</li>
+                <li>点击下方 <code>kaggle/kaggle_cell.py</code> 的「📋 复制此文件」，粘贴进 Kaggle Notebook 的<b>第一个代码单元</b>并点击 Run。</li>
+                <li>
+                  运行后，Kaggle 输出框会直接显示一个可视化的<b>「🚀 点击在新标签页打开 3D/2.5D 浏览器模拟器」</b>大按钮与 <code>https://xxxx.trycloudflare.com</code> 网址，且彻底消除了后台线程并发写 ZMQ 与 <code>/kaggle/working</code> 小文件风暴导致的 <i>Oops something went wrong</i> 崩溃。
+                </li>
               </ol>
             </section>
           )}
 
           {tab === "github" && (
             <>
-              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="🔍 搜索文件路径…" className="w-full rounded-lg border border-slate-700 bg-[#0f1a2c] px-3 py-2 text-sm outline-none" />
+              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="🔍 搜索文件路径（如 TriApp.tsx / kaggle_cell.py / main.cpp）…" className="w-full rounded-lg border border-slate-700 bg-[#0f1a2c] px-3 py-2 text-sm outline-none" />
               <div className="rounded-xl border border-slate-800 bg-[#0a1322] p-3 text-xs leading-relaxed text-slate-400">
-                提示：GitHub 编辑页没有「上传」按钮时，可用「⚡ 复制并去 GitHub」→ 在编辑框 Ctrl+A、Ctrl+V → 右上角 Commit changes。新文件会自动打开「新建文件」页并带好路径。上方也可以一次性下载整个仓库 ZIP，解压后用 GitHub Desktop / 网页「Upload files」整体上传。
+                每个文件都提供 <b>「✏️ 在 GitHub 编辑」</b> 和 <b>「📋 复制此文件」</b> 两个按键（也可直接点「⚡ 复制并去 GitHub」一键完成复制并打开对应 GitHub 编辑页）。你在 GitHub 提交保存后切回本页面，系统会自动重新检测并变为「✅ GitHub 已是最新」。
               </div>
             </>
           )}
@@ -459,7 +547,7 @@ export default function CodeBrowser() {
           {tab === "clean" && (
             <section className="space-y-2">
               <div className="rounded-xl border border-purple-500/30 bg-purple-950/10 p-3 text-sm text-slate-300">
-                下面这些文件在 GitHub 上存在，但已不属于本项目（例如旧的 Next.js 版本文件 / 旧 Kaggle 方案）。需要的话逐个点「🗑 在 GitHub 删除」。<b>不删也不影响运行</b>，只是仓库会比较乱。
+                下面这些文件在 GitHub 上存在，但已不属于本项目。需要的话可逐个点「🗑 在 GitHub 删除」。
               </div>
               {obsolete.length === 0 && <div className="text-sm text-emerald-300">没有多余文件 ✅</div>}
               {obsolete.map((p) => (
