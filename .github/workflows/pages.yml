@@ -29,8 +29,8 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           npm run build
-      - name: Verify Kaggle cell is in sync with daemon
-        run: python3 tools/make_kaggle_cell.py --check
+      - name: Verify Kaggle cell compiles (v8 has no tunnel / daemon)
+        run: python3 -m py_compile kaggle/kaggle_cell.py
       - name: Prepare site
         run: |
           mkdir -p _site
