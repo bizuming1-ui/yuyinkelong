@@ -12,3 +12,4 @@ next-env.d.ts
 work/
 .shots/
 __pycache__/
+dist/
