@@ -328,6 +328,13 @@ export class TriScene {
     this.controls.update();
   }
 
+  arrayCloseUpView() {
+    const d = Math.max(1.2, this.geom.side * 3.2);
+    this.camera.position.set(d * 0.8, this.geom.h + d * 0.75, d * 1.1);
+    this.controls.target.set(0, this.geom.h * 0.8, 0);
+    this.controls.update();
+  }
+
   private resize() {
     const w = Math.max(1, this.container.clientWidth);
     const h = Math.max(1, this.container.clientHeight);
@@ -423,9 +430,9 @@ export class TriScene {
     const h = g.h;
     const P = (v: [number, number]) => new THREE.Vector3(v[0], h, v[1]);
     const nodeCfg: { v: [number, number]; color: number; css: string; name: string }[] = [
-      { v: g.A, color: 0x2563eb, css: "#3b82f6", name: "A 发射端" },
-      { v: g.B, color: 0x0d9488, css: "#14b8a6", name: "B 接收端1" },
-      { v: g.C, color: 0x0d9488, css: "#14b8a6", name: "C 接收端2" },
+      { v: g.A, color: 0x2563eb, css: "#3b82f6", name: "ESP32-1(A) 发射" },
+      { v: g.B, color: 0x0d9488, css: "#14b8a6", name: "ESP32-B 接收1" },
+      { v: g.C, color: 0x0d9488, css: "#14b8a6", name: "ESP32-C 接收2" },
     ];
     const rad = Math.max(0.05, Math.min(0.12, g.side * 0.09));
     nodeCfg.forEach((n) => {
@@ -516,7 +523,8 @@ export class TriScene {
     this.controls.update();
 
     // 淡入淡出：有目标 → 快速出现；无目标 → 缓慢淡出（不是动画造假：没有目标就不画云）
-    const target = st.active && !st.noData ? 1 : 0;
+    const hasObj = !!(this.imager && this.imager.est && this.imager.est.available);
+    const target = (st.active || hasObj) && !st.noData ? 1 : 0;
     this.presence += (target - this.presence) * (1 - Math.exp(-dt * (target > this.presence ? 7 : 1.4)));
     if (this.presence < 0.004) this.presence = 0;
     const dim = st.noData ? 0.35 : 1;
