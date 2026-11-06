@@ -286,7 +286,7 @@ export default function CodeBrowser() {
     const local = new Set(files.map((f) => f.path));
     if (!remote) return (hintOld ?? []).filter((p) => !local.has(p));
     return Array.from(remote.keys())
-      .filter((p) => !local.has(p) && !/^(LICENSE|\.github\/|docs\/index\.html$)/i.test(p))
+      .filter((p) => !local.has(p) && !/^(LICENSE|\.github\/|docs\/index\.html$)/i.test(p) && !/\.(jpe?g|png|gif|webp|mp4|mov|webm|pdf|zip)$/i.test(p))
       .sort();
   }, [remote, files, hintOld]);
 
