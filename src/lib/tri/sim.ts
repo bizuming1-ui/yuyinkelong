@@ -36,6 +36,35 @@ export class SimPerson {
   }
 }
 
+/** 过路演示：周期 12s —— 空 2.5s → 近处从 B 侧走到 C 侧 3s → 空 2.5s → 稍远处从 C 侧走回 B 侧 3s → 空 1s */
+export class SimPass {
+  constructor(
+    public W: number,
+    public D: number,
+  ) {}
+  at(t: number): SimState {
+    const u = ((t % 12) + 12) % 12;
+    const hx = this.W * 0.42;
+    if (u >= 2.5 && u < 5.5) return { x: -hx + (2 * hx * (u - 2.5)) / 3, z: this.D * 0.2, moving: true };
+    if (u >= 8 && u < 11) return { x: hx - (2 * hx * (u - 8)) / 3, z: this.D * 0.32, moving: true };
+    return { x: 0, z: 0, moving: false };
+  }
+}
+
+/** 演示组合：先 36s 的过路演示（3 个周期），再 40s 的原版 SimPerson 行走循环 */
+export class SimMix {
+  private a: SimPass;
+  private b: SimPerson;
+  constructor(W: number, D: number) {
+    this.a = new SimPass(W, D);
+    this.b = new SimPerson(W, D);
+  }
+  at(t: number): SimState {
+    const u = ((t % 76) + 76) % 76;
+    return u < 36 ? this.a.at(u) : this.b.at(u - 36);
+  }
+}
+
 export function linkW(g: Geometry, rx: "B" | "C", x: number, z: number, r0 = 0.6) {
   const r = rx === "B" ? g.B : g.C;
   const dA = Math.max(0.25, Math.hypot(x - g.A[0], z - g.A[1]));
