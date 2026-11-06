@@ -16,6 +16,8 @@ export const BROKERS: BrokerDef[] = [
 
 export const GITHUB_REPO = "bizuming1-ui/yuyinkelong";
 export const GITHUB_BRANCH = "main";
+// 永久网址：推送到 GitHub 后由 .github/workflows/pages.yml 自动构建并发布（需在仓库 Settings → Pages → Source 选 GitHub Actions）
+export const PAGES_URL = "https://bizuming1-ui.github.io/yuyinkelong/";
 
 // 旧版（Kaggle + Vite 方案）遗留文件：GitHub API 被限流(403)时，复制代码界面用 raw 逐个探测它们是否还在仓库里。
 export const OLD_FILE_HINTS: string[] = [
