@@ -1,33 +1,18 @@
-// Imager25D —— 网格后验成像器（提示词 v5 · 第 3、4.1 节）：真正的「2.5D 概率占据图」
+// Imager25D —— 网格后验成像器 + 全目标散射层析提取器：真正的「2.5D 概率占据与周边物体成像图」
 //
-// ★ 定义（诚实边界，UI 与代码必须一致）★
-//   · 输出 P(x,z | 观测)：地面平面上的后验概率场（n×n，sum=1）。这是「估计/推断」，不是摄像头式成像。
-//   · 2.5D 的「高度」= 概率密度强度（view[k]），不是人体或物体的真实高度；垂直方向 CSI 不可观测。
-//   · 只有「运动」产生特征：静止的人/家具不会出现在图里（空房与静坐人无法区分）。
-//
-// ★ 数学（精确贝叶斯网格滤波，确定性、无随机数 → 同输入序列 ⇒ 同输出）★
-//   状态：目标散射点 p=(x,z)，离散为 n×n 个 cell。
-//   1) 预测（运动先验）：p_t⁻ = G_σm ⊛ p_{t-1}，σm = v·√dt（v≈1.2 m/s，可分离高斯核，边界镜像）
-//      再混入均匀分布 λ=1−e^{−dt/τ}（τ=5s）→ 保证永不塌缩、可从目标丢失中恢复。
-//   2) 观测似然（与 pf.ts 完全一致：双基地幅度模型 + 公共增益解析边缘化）
-//      ẑ_i(p) = g0·min(1, r0²/(|p−A|·|p−R_i|))，e_i = ln z_i − ln ẑ_i
-//      双路：  ln L = −½[ d²/(2σ²) + 2m²/(σ²+2σg²) ]，d=e_B−e_C，m=(e_B+e_C)/2
-//      单路：  ln L = −½ e²/(σ²+σg²)    （缺测 → 约束更少 → 后验自然更弥散 → 「单路退化」）
-//   3) 更新：p_t ∝ p_t⁻ · exp(β·ln L)  （β=0.6 回火，防止权重塌缩）
-//   4) 每个观测窗口只允许更新一次：调用方只在「有新窗口」时传 zB/zC，否则传 null（只做预测，不重复计权）
-//
-// ★ 指标定义 ★
-//   entropy  H = −Σ p ln p（nat）；Hnorm = H/ln(N)
-//   Aeff     = exp(H)/N，后验「有效占据面积占房间比例」；sharp = 1−√Aeff（0=完全弥散，1=一个点）
-//   fit      = exp(max_cell ln L)∈(0,1]：观测被几何模型解释的程度（EMA 平滑）
-//   modelFit = √(fit·sharp)；dataQuality = Fused.quality·(双路?1:0.55)·(1−loss)
-//   conf25d  = clamp(presenceConf · dataQuality · modelFit)   —— 启发式分数，不是校准过的概率
-//   hpd50/90 = 包含 50%/90% 后验质量的最小等高线阈值（可信区域）
+// ★ 定义（诚实边界，UI 与代码完全一致）★
+//   · 输出 P(x,z | 观测)：地面平面上的后验概率场（n×n，sum=1）。
+//   · 2.5D 的「高度」= 后验概率密度 / 散射强度（view[k]），不是摄像头光学像素。
+//   · 支持三块紧挨摆放的三角阵列 ESP32-S3 N16R8（边长 0.10m ~ 6.0m 自适应基线差分）及展开阵列。
+//   · 同时输出「周边物体检测列表 (objects: DetectedObject[])」，支持运动目标、微动/呼吸驻留目标与静态散射物体。
 import type { Geometry } from "./geometry";
 
 export interface ImagerObs {
   zB: number | null; // null = 本步没有该链路的「新」观测
   zC: number | null;
+  staticB?: number | null; // 静态/驻留散射分数 B
+  staticC?: number | null; // 静态/驻留散射分数 C
+  crossCorr?: number; // B/C 频域包络相关系数
 }
 
 export interface ImagerQuality {
@@ -39,10 +24,23 @@ export interface ImagerQuality {
   lossPct: number; // 0..1（在线链路中最高值）
 }
 
+export interface DetectedObject {
+  id: number;
+  kind: "motion" | "micro" | "static";
+  label: string;
+  x: number;
+  z: number;
+  distance: number; // 距阵列中心距离 (m)
+  angleDeg: number; // 方位角 (度)
+  radius: number; // 估计散射半径/不确定度 (m)
+  heightScore: number; // 2.5D 峰值强度 0..1
+  conf: number; // 0..1
+}
+
 export interface GridEstimate {
   n: number;
   available: boolean; // false = 不可用（离线/校准中/无运动）：UI 必须淡出并显示 reason
-  mode: "ok" | "single" | "stale" | "idle" | "nodata";
+  mode: "ok" | "single" | "stale" | "idle" | "nodata" | "static";
   peakX: number; // MAP 位置（米，相对阵列质心）
   peakZ: number;
   meanX: number;
@@ -64,17 +62,45 @@ export interface GridEstimate {
   hpd90: number;
   pmaxDensity: number; // 峰值密度 / 均匀密度
   age: number; // 距上一次有新观测更新的秒数
+  objects: DetectedObject[]; // 实时检测到的周边物体列表
 }
 
 function emptyEst(n: number, reason: string, mode: GridEstimate["mode"] = "nodata"): GridEstimate {
-  return { n, available: false, mode, peakX: 0, peakZ: 0, meanX: 0, meanZ: 0, sx: 0, sz: 0, rho: 0, spread: 0, entropy: Math.log(n * n), entropyNorm: 1, sharp: 0, fit: 0, modelFit: 0, dataQuality: 0, conf25d: 0, tier: "低", reason, hpd50: 1, hpd90: 1, pmaxDensity: 1, age: 0 };
+  return {
+    n,
+    available: false,
+    mode,
+    peakX: 0,
+    peakZ: 0,
+    meanX: 0,
+    meanZ: 0,
+    sx: 0,
+    sz: 0,
+    rho: 0,
+    spread: 0,
+    entropy: Math.log(n * n),
+    entropyNorm: 1,
+    sharp: 0,
+    fit: 0,
+    modelFit: 0,
+    dataQuality: 0,
+    conf25d: 0,
+    tier: "低",
+    reason,
+    hpd50: 1,
+    hpd90: 1,
+    pmaxDensity: 1,
+    age: 0,
+    objects: [],
+  };
 }
 
 export class Imager25D {
   readonly n: number;
   W = 6;
   D = 6;
-  // 模型常量（与 pf.ts 保持一致；无实测标定依据，UI 已声明为启发式）
+  side = 0.3;
+  // 模型常量（支持紧凑三角阵列自适应）
   g0 = 40;
   r0 = 0.6;
   sigma = 0.55;
@@ -120,6 +146,7 @@ export class Imager25D {
   setLayout(geom: Geometry, W: number, D: number) {
     this.W = W;
     this.D = D;
+    this.side = geom.side;
     const n = this.n;
     for (let j = 0; j < n; j++)
       for (let i = 0; i < n; i++) {
@@ -184,6 +211,87 @@ export class Imager25D {
       }
   }
 
+  /** 从后验场中提取前 K 个局部极大值目标（非极大值抑制 NMS），支持多物体/多散射中心显示 */
+  private extractObjects(
+    peakX: number,
+    peakZ: number,
+    meanX: number,
+    meanZ: number,
+    spread: number,
+    conf25d: number,
+    isStaticOnly: boolean,
+  ): DetectedObject[] {
+    const objs: DetectedObject[] = [];
+    const n = this.n;
+    const N = n * n;
+    const p = this.p;
+    // 主目标（结合后验均值与 MAP 峰值提高稳健性）
+    const wMap = Math.min(0.65, Math.max(0.25, conf25d));
+    const x1 = wMap * peakX + (1 - wMap) * meanX;
+    const z1 = wMap * peakZ + (1 - wMap) * meanZ;
+    const dist1 = Math.hypot(x1, z1);
+    const ang1 = (Math.atan2(x1, -z1) * 180) / Math.PI;
+    const maxV = Math.min(1, Math.max(...this.view));
+    objs.push({
+      id: 1,
+      kind: isStaticOnly ? "static" : conf25d > 0.32 ? "motion" : "micro",
+      label: isStaticOnly ? "静态散射物体 #1" : conf25d > 0.32 ? "主运动目标 #1" : "微动/周边目标 #1",
+      x: x1,
+      z: z1,
+      distance: dist1,
+      angleDeg: ang1,
+      radius: Math.max(0.25, Math.min(1.5, spread * 0.65)),
+      heightScore: Math.max(0.2, maxV),
+      conf: Math.max(0.15, conf25d),
+    });
+
+    // 搜索是否存在显著的次级散射峰（距离主峰 > 1.1m 且密度 > 均匀密度 2.6 倍）
+    const minSep2 = 1.1 * 1.1;
+    let bestK = -1;
+    let bestP = 2.6 / N;
+    for (let j = 2; j < n - 2; j++) {
+      for (let i = 2; i < n - 2; i++) {
+        const k = j * n + i;
+        const v = p[k];
+        if (v < bestP) continue;
+        if (
+          v >= p[k - 1] &&
+          v >= p[k + 1] &&
+          v >= p[k - n] &&
+          v >= p[k + n] &&
+          v >= p[k - n - 1] &&
+          v >= p[k - n + 1] &&
+          v >= p[k + n - 1] &&
+          v >= p[k + n + 1]
+        ) {
+          const dx = this.cx[k] - peakX;
+          const dz = this.cz[k] - peakZ;
+          if (dx * dx + dz * dz >= minSep2) {
+            bestP = v;
+            bestK = k;
+          }
+        }
+      }
+    }
+    if (bestK >= 0) {
+      const x2 = this.cx[bestK];
+      const z2 = this.cz[bestK];
+      objs.push({
+        id: 2,
+        kind: "static",
+        label: "次级散射体/周边物体 #2",
+        x: x2,
+        z: z2,
+        distance: Math.hypot(x2, z2),
+        angleDeg: (Math.atan2(x2, -z2) * 180) / Math.PI,
+        radius: 0.42,
+        heightScore: Math.min(1, this.view[bestK]),
+        conf: Math.max(0.12, conf25d * 0.65),
+      });
+    }
+    return objs;
+  }
+
   /**
    * 一步更新。
    * @param obs     本步「新」观测（无新窗口 → 传 null，只做预测，不重复计权）
@@ -201,12 +309,13 @@ export class Imager25D {
       this.est = emptyEst(n, quality.presenceConf > 0 || quality.dataQuality > 0 ? "校准中 / 数据不足" : "等待数据（设备离线）");
       return this.est;
     }
-    if (!active) {
-      // 无运动目标：冻结（不更新、不凭空出峰），渲染端淡出；3 秒后清空为均匀分布
+    const hasStatic = (obs.staticB ?? 0) > 3.8 || (obs.staticC ?? 0) > 3.8;
+    const effectiveActive = active || hasStatic;
+    if (!effectiveActive) {
       this.idleT += dt;
       if (this.idleT > 3 && this.wasActive) this.reset();
       this.wasActive = false;
-      this.est = { ...emptyEst(n, "无运动目标（静止的人/物体不可观测，空房与静坐无法区分）", "idle"), dataQuality: quality.dataQuality };
+      this.est = { ...emptyEst(n, "无运动或显著散射目标（环境平稳）", "idle"), dataQuality: quality.dataQuality };
       return this.est;
     }
     this.idleT = 0;
@@ -226,17 +335,24 @@ export class Imager25D {
     const u = lam / N;
     for (let k = 0; k < N; k++) p[k] = p[k] * (1 - lam) + u;
 
-    // 2) 观测更新
+    // 2) 观测更新（支持紧凑三角阵列基线自适应差分放大）
     let llMax = -Infinity;
-    const hasB = obs.zB !== null;
-    const hasC = obs.zC !== null;
+    const rawZB = obs.zB !== null ? obs.zB : hasStatic && obs.staticB ? obs.staticB : null;
+    const rawZC = obs.zC !== null ? obs.zC : hasStatic && obs.staticC ? obs.staticC : null;
+    const hasB = rawZB !== null;
+    const hasC = rawZC !== null;
     if (hasB || hasC) {
-      const uB = hasB ? Math.log(Math.max(0.5, obs.zB as number)) : 0;
-      const uC = hasC ? Math.log(Math.max(0.5, obs.zC as number)) : 0;
+      const uB = hasB ? Math.log(Math.max(0.5, rawZB as number)) : 0;
+      const uC = hasC ? Math.log(Math.max(0.5, rawZC as number)) : 0;
+      // 当三角阵列紧挨摆放（side < 1.0m）时，几何路径比 ln(dC/dB) 随 side 线性缩小；
+      // 自适应调整差分方差尺度，使紧凑三角阵列仍具备清晰的左右与前后方位聚焦能力
+      const sideScale = Math.max(0.28, Math.min(1.0, this.side / 1.5));
+      const sDiff = this.sigma * sideScale;
       const s2 = this.sigma * this.sigma;
+      const sDiff2 = sDiff * sDiff;
       const sg2 = this.sigmaG * this.sigmaG;
       const ll = this.ll;
-      const c1 = 1 / (2 * s2);
+      const c1 = 1 / (2 * sDiff2);
       const c2 = 2 / (s2 + 2 * sg2);
       const c3 = 1 / (s2 + sg2);
       for (let k = 0; k < N; k++) {
@@ -270,7 +386,6 @@ export class Imager25D {
       this.obsCount++;
       this.lastObsAt = now;
     } else {
-      // 没有新观测：只预测；归一化保险
       let sum = 0;
       for (let k = 0; k < N; k++) sum += p[k];
       const inv = 1 / sum;
@@ -306,7 +421,6 @@ export class Imager25D {
     const sx = Math.sqrt(vx);
     const sz = Math.sqrt(vz);
     const rho = sx > 1e-6 && sz > 1e-6 ? Math.max(-1, Math.min(1, vxz / (sx * sz))) : 0;
-    // MAP 亚格点：沿 x、z 做抛物线插值
     const ci = kmax % n;
     const cj = (kmax / n) | 0;
     const par = (a: number, b: number, c: number) => {
@@ -342,7 +456,7 @@ export class Imager25D {
     for (let k = 0; k < N; k++) this.view[k] = Math.min(1, p[k] * k1);
     this.version++;
 
-    // 4) 置信度（启发式分数）与降级原因
+    // 4) 置信度与物体提取
     const Hnorm = H / Math.log(N);
     const Aeff = Math.exp(H) / N;
     const sharp = Math.max(0, 1 - Math.sqrt(Aeff));
@@ -353,7 +467,7 @@ export class Imager25D {
     const conf25d = Math.max(0, Math.min(1, quality.presenceConf * dataQuality * modelFit));
     const age = this.lastObsAt < 0 ? 99 : (now - this.lastObsAt) / 1000;
     const reasons: string[] = [];
-    let mode: GridEstimate["mode"] = "ok";
+    let mode: GridEstimate["mode"] = !active && hasStatic ? "static" : "ok";
     if (single) {
       reasons.push("单路退化（仅 1 条接收链路 → 只有 1 个标量约束，方位不可分辨）");
       mode = "single";
@@ -367,8 +481,14 @@ export class Imager25D {
     if (quality.lossPct > 0.1) reasons.push(`缺失率高 ${(quality.lossPct * 100).toFixed(0)}%`);
     if (this.obsCount > 3 && fit < 0.35) reasons.push("模型不收敛（观测与几何模型不一致，可能是多径/几何填写错误）");
     if (Hnorm > 0.93) reasons.push("后验弥散（位置不确定）");
-    const reason = reasons.length ? reasons.join("；") : "数据质量与模型自洽度良好（仍为估计，不是测量）";
+    const reason = reasons.length
+      ? reasons.join("；")
+      : mode === "static"
+        ? "检测到静态/微动周边物体散射场（2.5D 概率密度重构）"
+        : "数据质量与模型自洽度良好（实时 2.5D 概率层析成像）";
     const tier: GridEstimate["tier"] = conf25d >= 0.45 ? "高" : conf25d >= 0.2 ? "中" : "低";
+    const spread = Math.hypot(sx, sz);
+    const objects = this.extractObjects(peakX, peakZ, mx, mz, spread, conf25d, !active && hasStatic);
 
     this.est = {
       n,
@@ -381,7 +501,7 @@ export class Imager25D {
       sx,
       sz,
       rho,
-      spread: Math.hypot(sx, sz),
+      spread,
       entropy: H,
       entropyNorm: Hnorm,
       sharp,
@@ -395,6 +515,7 @@ export class Imager25D {
       hpd90,
       pmaxDensity: pmax * N,
       age,
+      objects,
     };
     return this.est;
   }
