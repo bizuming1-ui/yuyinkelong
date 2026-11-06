@@ -1,4 +1,4 @@
-## 📡 三 ESP32-S3 N16R8 · WiFi CSI 三维感知系统（v4：A 发射 / B、C 接收 · MQTT · 概率云 3D · Kaggle 托管）
+## 📡 三 ESP32-S3 N16R8 · WiFi CSI 三维感知系统（v7：A 发射 / B、C 接收 · MQTT · 2.5D 概率成像 · Kaggle 稳定托管 · GitHub Pages 永久网址）
 
 三块 ESP32-S3 摆成三角形：**A = 发射端 TX**，**B = 接收端 RX1**，**C = 接收端 RX2**。三块板只要供电 + 同一个 2.4GHz WiFi，数据经 MQTT 到浏览器；`dist/index.html` 是**单文件**，双击、任意静态托管、或在 Kaggle 里经隧道都能打开。
 
@@ -13,6 +13,18 @@ A/B/C ── WiFi ─▶ MQTT 公共服务器(hivemq / emqx / mosquitto) ◀─�
  浏览器：B/C 各自独立特征提取(features.ts) → 非相干特征级融合 → 双基地几何粒子滤波(pf.ts) → Three.js 概率点云
  Kaggle：托管同一份网页 + 隧道网址 + MQTT 原始 CSI 落盘 + T4×2 GPU 离线分析（kaggle/kaggle_cell.py）
 ```
+
+## v7 · Kaggle「Oops something went wrong / Draft Session Fatal」根因修复 + 永久网址
+
+| 项目 | 说明 |
+| --- | --- |
+| `kaggle/kaggle_cell.py` | **粘贴进 Kaggle 第一个单元的唯一文件**（内嵌守护进程）。单元里没有 `IPython.display / HTML / display_id / clear_output`，只有 < 40 行纯文本；打印一次网址后静默保活 |
+| `kaggle/bzm_daemon.py` | 守护进程可读源码：git 拉源码 → npm 构建 → 白名单 HTTP（gzip，`/api/health`）→ cloudflared ⇄ localhost.run 隧道（监督 + 公网回访自检 + 自动重建）→ MQTT 采集落盘 → GPU 离线分析子进程。**所有输出只写 `/tmp/bzm/logs`** |
+| `tools/make_kaggle_cell.py` | 把 `bzm_daemon.py` 内嵌进 `kaggle_cell.py`；`--check` 检查两者是否同步（CI 里也会检查） |
+| `.github/workflows/pages.yml` | 推送到 `main` 自动构建并发布到 GitHub Pages：`https://bizuming1-ui.github.io/yuyinkelong/`（一次性设置：Settings → Pages → Source 选 **GitHub Actions**）。这是**不依赖 Kaggle** 的永久网址，也是 Kaggle 构建失败时的兜底来源 |
+
+**根因分析（不是猜测）**：你保存的 notebook 的最后一条输出是 `display_data`（“正在初始化实时监控面板…”），崩溃就发生在 display + 周期性 update 的瞬间；v5 的高频 `clear_output()` 同样崩溃。两版共同点 = 长时间运行的单元持续向 Kaggle 前端推送富输出/可更新输出。v7 因此**移除整条输出通道**，而不是继续优化面板。另修复一个真实 bug：旧正则会把 cloudflared 日志中的 `api.trycloudflare.com` 误当成站点网址。
+沙盒实测（Linux + 真实 cloudflared 隧道）：单元输出 12 行纯文本；公网 `/api/health` 正常；手动杀掉隧道进程 → 约 30 秒内自动重建并输出新网址；SIGTERM 后干净退出、无残留进程。注意：我无法在你的 Kaggle 账号里实机运行，若仍弹窗，请把 `!tail -n 60 /tmp/bzm/logs/daemon.log` 的内容发给我。
 
 ## v5 · 2.5D 概率成像（Imager25D）+ Kaggle 稳定性修复
 
