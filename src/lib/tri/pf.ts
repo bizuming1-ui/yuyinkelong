@@ -1,14 +1,12 @@
-// 双基地几何 + 粒子滤波（提示词第 7 章：输出「概率云」而不是伪造精确人体表面）
+// 双基地几何 + 粒子滤波（输出「概率云」与后验估计，支持紧挨摆放的紧凑三角阵列与展开阵列）
 //
-// 几何：A=发射端 t，B/C=接收端 r_i，人体散射点 p（水平面 x,z；躯干高度≈天线高度）。
+// 几何：A=发射端 t，B/C=接收端 r_i，目标散射点 p（水平面 x,z；躯干高度≈天线高度）。
 // 双基地雷达方程（幅度）：反射路径相对强度  w_i(p) ∝ 1 / (|p−t|·|p−r_i|)
-//   → 预测链路扰动  ẑ_i = g·w_i(p)，g 为未知增益（人体 RCS、AGC、天线增益……）。
+//   → 预测链路扰动  ẑ_i = g·w_i(p)，g 为未知增益（RCS、AGC、天线增益……）。
 //   观测 z_B、z_C 来自各接收端独立的运动 z 分数（非相干特征级融合）。
 // 对数域残差  e_i = ln z_i − ln ẑ_i ，公共增益 ln g ~ N(0,σg²) 被解析边缘化：
-//     −2·lnL = d²/(2σ²) + 2m²/(σ²+2σg²)，  d = e_B−e_C ，m = (e_B+e_C)/2
-//   d 项给出「到 B / 到 C 的距离比」（Apollonius 圆 → 方位），m 项给出弱距离约束。
-// 诚实边界：2 个接收端只给出 2 个标量约束，所以得到的是弧形/团状「概率云」；高度方向完全不可观测，
-// 渲染时的高度只是先验（均匀分布 0~1.8m），不是测量。
+//     −2·lnL = d²/(2σ_diff²) + 2m²/(σ²+2σg²)，  d = e_B−e_C ，m = (e_B+e_C)/2
+//   其中 σ_diff 针对紧凑三角阵列基线边长 side 做自适应尺度匹配。
 import type { Geometry } from "./geometry";
 
 export interface Obs {
@@ -108,6 +106,9 @@ export class ParticleFilter {
     const dA = Math.max(0.25, Math.hypot(x - g.A[0], z - g.A[1]));
     let e1 = 0;
     let e2 = 0;
+    const sideScale = Math.max(0.28, Math.min(1.0, g.side / 1.5));
+    const sDiff = this.sigma * sideScale;
+    const sDiff2 = sDiff * sDiff;
     const s2 = this.sigma * this.sigma;
     const sg2 = this.sigmaG * this.sigmaG;
     if (o.zB !== null) {
@@ -121,7 +122,7 @@ export class ParticleFilter {
     if (o.zB !== null && o.zC !== null) {
       const m = 0.5 * (e1 + e2);
       const d = e1 - e2;
-      return -0.5 * ((d * d) / (2 * s2) + (2 * m * m) / (s2 + 2 * sg2));
+      return -0.5 * ((d * d) / (2 * sDiff2) + (2 * m * m) / (s2 + 2 * sg2));
     }
     const e = o.zB !== null ? e1 : e2;
     return -0.5 * ((e * e) / (s2 + sg2));
@@ -170,7 +171,7 @@ export class ParticleFilter {
     const uC = o.zC !== null ? Math.log(Math.max(0.5, o.zC)) : 0;
     let mx = -Infinity;
     for (let i = 0; i < N; i++) {
-      const l = this.lw[i] * 0.5 + this.beta * this.logLik(this.px[i], this.pz[i], o, uB, uC); // lw*0.5：遗忘旧证据
+      const l = this.lw[i] * 0.5 + this.beta * this.logLik(this.px[i], this.pz[i], o, uB, uC);
       this.lw[i] = l;
       if (l > mx) mx = l;
     }
@@ -187,7 +188,7 @@ export class ParticleFilter {
       s2 += this.w[i] * this.w[i];
     }
     const ess = 1 / s2;
-    this.summarize(Math.exp(mx / 1)); // mx<=0：越接近 0 说明某处被观测很好地解释
+    this.summarize(Math.exp(mx / 1));
     // 3) 重采样（系统重采样 + 小抖动 + 3% 随机注入以便目标丢失后恢复）
     if (ess < N * 0.5) this.resample();
   }
