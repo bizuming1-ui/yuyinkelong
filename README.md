@@ -1,4 +1,4 @@
-## 📡 三 ESP32-S3 N16R8 · WiFi CSI 三维感知系统（v7：A 发射 / B、C 接收 · MQTT · 2.5D 概率成像 · Kaggle 稳定托管 · GitHub Pages 永久网址）
+## 📡 三 ESP32-S3 N16R8 · WiFi CSI 三维感知系统（v8：A 发射 / B、C 接收 · MQTT · 2.5D 概率成像 · Kaggle 稳定方案(v8 无隧道) · GitHub Pages 永久网址）
 
 三块 ESP32-S3 摆成三角形：**A = 发射端 TX**，**B = 接收端 RX1**，**C = 接收端 RX2**。三块板只要供电 + 同一个 2.4GHz WiFi，数据经 MQTT 到浏览器；`dist/index.html` 是**单文件**，双击、任意静态托管、或在 Kaggle 里经隧道都能打开。
 
@@ -14,17 +14,23 @@ A/B/C ── WiFi ─▶ MQTT 公共服务器(hivemq / emqx / mosquitto) ◀─�
  Kaggle：托管同一份网页 + 隧道网址 + MQTT 原始 CSI 落盘 + T4×2 GPU 离线分析（kaggle/kaggle_cell.py）
 ```
 
-## v7 · Kaggle「Oops something went wrong / Draft Session Fatal」根因修复 + 永久网址
+## v8 · Kaggle「Oops something went wrong / Draft Session Fatal / status code 44」——换思路，删掉根因
 
 | 项目 | 说明 |
 | --- | --- |
-| `kaggle/kaggle_cell.py` | **粘贴进 Kaggle 第一个单元的唯一文件**（内嵌守护进程）。单元里没有 `IPython.display / HTML / display_id / clear_output`，只有 < 40 行纯文本；打印一次网址后静默保活 |
-| `kaggle/bzm_daemon.py` | 守护进程可读源码：git 拉源码 → npm 构建 → 白名单 HTTP（gzip，`/api/health`）→ cloudflared ⇄ localhost.run 隧道（监督 + 公网回访自检 + 自动重建）→ MQTT 采集落盘 → GPU 离线分析子进程。**所有输出只写 `/tmp/bzm/logs`** |
-| `tools/make_kaggle_cell.py` | 把 `bzm_daemon.py` 内嵌进 `kaggle_cell.py`；`--check` 检查两者是否同步（CI 里也会检查） |
-| `.github/workflows/pages.yml` | 推送到 `main` 自动构建并发布到 GitHub Pages：`https://bizuming1-ui.github.io/yuyinkelong/`（一次性设置：Settings → Pages → Source 选 **GitHub Actions**）。这是**不依赖 Kaggle** 的永久网址，也是 Kaggle 构建失败时的兜底来源 |
+| kaggle/kaggle_cell.py | **粘贴进 Kaggle 第一个单元的唯一文件（v8.0）**。纯 Python 标准库，几秒完成并自己结束：检测永久网址 → 打印网址 → 保存单文件模拟器到 `/kaggle/working/simulator.html` → 检测 GitHub 最新提交 / 你粘贴的单元是否最新。**没有隧道、没有守护进程、没有后台线程、没有 while 循环** |
+| .github/workflows/pages.yml | 推送到 main 自动构建并发布到 GitHub Pages：https://bizuming1-ui.github.io/yuyinkelong/ 。一次性设置：Settings → Pages → Source 选 **GitHub Actions** |
+| tools/gen_manifest.mjs | `npm run dev/build` 之前自动运行，把仓库真实文件原文收集进「复制代码界面」（`src/lib/manifest.generated.json`，已 gitignore） |
+| 已删除 | `kaggle/bzm_daemon.py`、`tools/make_kaggle_cell.py`、`src/lib/manifest-data.ts`（复制代码界面的「🗑 GitHub 上多余的旧文件」标签会提醒你在 GitHub 删除它们） |
 
-**根因分析（不是猜测）**：你保存的 notebook 的最后一条输出是 `display_data`（“正在初始化实时监控面板…”），崩溃就发生在 display + 周期性 update 的瞬间；v5 的高频 `clear_output()` 同样崩溃。两版共同点 = 长时间运行的单元持续向 Kaggle 前端推送富输出/可更新输出。v7 因此**移除整条输出通道**，而不是继续优化面板。另修复一个真实 bug：旧正则会把 cloudflared 日志中的 `api.trycloudflare.com` 误当成站点网址。
-沙盒实测（Linux + 真实 cloudflared 隧道）：单元输出 12 行纯文本；公网 `/api/health` 正常；手动杀掉隧道进程 → 约 30 秒内自动重建并输出新网址；SIGTERM 后干净退出、无残留进程。注意：我无法在你的 Kaggle 账号里实机运行，若仍弹窗，请把 `!tail -n 60 /tmp/bzm/logs/daemon.log` 的内容发给我。
+**根因（第一性原理，不是猜测）**：v5/v6/v7 的共同点不是“输出方式”，而是它们都在 Kaggle 里**拉起公网隧道（cloudflared / localhost.run）并长时间运行**。你的 v7 截图里，网址 `https://xxx.trycloudflare.com` 已经打印出来（= 隧道已建立）之后才弹出 Oops；而 v7 已经把输出改成纯文本，所以“富输出崩溃”的旧结论被证伪。社区公开反馈：Kaggle 会封禁/终止除 ngrok 以外的隧道（cloudflared、localtunnel、SSH 隧道），症状就是会话突然 Fatal 且没有有用报错。v8 因此直接删除 Kaggle 里的隧道 / 守护进程 / GPU 初始化 / MQTT 长连接：
+
+1. 网站托管在 **GitHub Pages**（永久网址，不依赖 Kaggle，也不依赖你的电脑）。
+2. ESP32 → MQTT → 浏览器 的数据链路本来就不经过 Kaggle，所以即使 Kaggle 掉线，实时检测也不会中断。
+3. GitHub Pages 还没开通时（目前就是 404），Kaggle 单元会自动从 GitHub 源码在本机构建同一个单文件网页（构建结束进程全部退出），保存到 `simulator.html`，从右侧 Output 面板下载后双击即可用。
+4. 可选：`ENABLE_NGROK = True` + Kaggle Secrets 里的 `NGROK_AUTHTOKEN` → 单元内启动 stdlib HTTP 服务 + ngrok（社区验证过可用的唯一隧道；默认关闭）。
+
+沙盒实测（Linux）：`python kaggle/kaggle_cell.py` 约 35 秒（含 npm 构建）完成，退出码 0，运行结束后没有残留进程；输出约 20 行纯文本。**诚实边界**：我无法登录你的 Kaggle 账号实机运行；若 v8 仍弹窗，请把弹窗前最后一次输出发给我——此时嫌疑只剩 Kaggle 平台本身（例如账号未验证手机号、Internet 开关、会话被网页闲置超时）。
 
 ## v5 · 2.5D 概率成像（Imager25D）+ Kaggle 稳定性修复
 
@@ -74,7 +80,7 @@ A/B/C ── WiFi ─▶ MQTT 公共服务器(hivemq / emqx / mosquitto) ◀─�
 2. 「PlatformIO · ESP32-A / B / C」三个标签：填 WiFi → 4 个文件覆盖进各自的 PlatformIO 工程（或下载工程 ZIP）→ 环境 `n16r8` → Upload。串口出现 `[BOOT] ESP32-S3 CSI v4.0` 与 `[状态] role=…` 即成功。三块板 WiFi 必须一致。
 3. 三块板上电后，网页自动连接（也可点「🔌 连接 ESP32」）。把「阵列边长」改成实际天线中心距。
 4. 想看效果但没硬件：左侧「▶ 启动 SIMULATION 演示」。
-5. Kaggle：Notebook 设置 GPU T4×2 + Internet On → 复制 `kaggle/kaggle_cell.py` 到第一个单元 → Run → 输出框里出现 `https://xxxx.trycloudflare.com`。
+5. Kaggle：Internet On（CPU 即可）→ 复制 `kaggle/kaggle_cell.py` 到第一个单元 → Run → 输出框里出现永久网址 `https://bizuming1-ui.github.io/yuyinkelong/`（并保存 `simulator.html`）。
 
 开发：`npm install && npm run dev`；`npm run build` 生成单文件 `dist/index.html`；`npx tsx tools/tri_sim_test.ts 3` 连续 3 轮验证。
 
