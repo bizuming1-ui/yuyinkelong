@@ -16,6 +16,7 @@ const globbed = import.meta.glob(
     "../../tsconfig.json",
     "../../vite.config.ts",
     "../../.gitignore",
+    "../../.github/workflows/*.yml",
     "../../提示词",
     "!../lib/manifest.ts",
   ],
